@@ -1,0 +1,16 @@
+; autolanding info
+; aerodrome/poi = type (heli,rwy), direction (n, w, s, e; x for don't care), altitude, runway length in meters (ignored for heli)
+; Minecraft coord convention:
+; North: Z-
+; East: X+
+; South: Z+
+; West: X-
+; Altitude: Y axis
+TMU=heli,n,69,0
+AGS=heli,n,73,0
+BZR=heli,w,69,0
+ZTP=heli,s,70,0
+KST=heli,w,71,0
+FRO=heli,s,73,0
+WAU=heli,s,120,0
+ARN=heli,s,70,0
