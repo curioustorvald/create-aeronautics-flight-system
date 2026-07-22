@@ -111,6 +111,18 @@ local SPEED_SLOW = 30   -- m/s "SLOW"; mirror of navcom.lua's APPROACH_SPEED
 -- Cycle order when the button is tapped.
 local NEXT_CRUISE = { full = "slow", slow = "coast", coast = "full" }
 
+-- RESUME MID-ROUTE -----------------------------------------------------------
+-- FLY ROUTE can join a plan at the nearest sensible waypoint instead of always flying it
+-- from the first point (see bestResumeIndex). "Nearest" is heading-aware: a waypoint behind
+-- the aircraft costs a U-turn, so its straight-line distance is inflated -- by this weight
+-- times the backward component of the displacement -- before the cheapest waypoint is
+-- chosen. So the penalty in metres = weight * (how far behind us the waypoint is): a
+-- waypoint dead astern at distance d is judged as costing d*(1+weight); one abeam or ahead
+-- pays nothing. At 1.0 a waypoint dead behind must be nearer than HALF the distance of one
+-- dead ahead to still win -- i.e. turning back has to be substantially cheaper. Raise it to
+-- lean harder toward "press on"; drop toward 0 to just pick the geometrically nearest.
+local RESUME_BACKTRACK_WEIGHT = 1.0
+
 -- GEOMETRY / HEADING HELPERS --------------------------------------------------
 
 local atan2 = math.atan2
@@ -930,7 +942,44 @@ local function setDirectTo(name, landAtEnd)
     return true
 end
 
-local function setRoute(name)
+-- Which waypoint of a route to start from when resuming mid-flight, given the aircraft's
+-- current fix and heading. Normally the nearest waypoint, but one BEHIND us is penalised: a
+-- U-turn costs distance we would rather not fly, so its straight-line range is inflated by
+-- RESUME_BACKTRACK_WEIGHT times its backward component before the cheapest is chosen. Result:
+-- when the nearest point is behind but the next is ahead, we press on to the one ahead --
+-- unless the one behind is close enough that turning back is genuinely cheaper. Evaluated over
+-- ALL waypoints (not just the two nearest), so a third point ahead can win too. Falls back to
+-- plain nearest with no heading fix, and to index 1 with no position fix at all.
+local function bestResumeIndex(pts)
+    if #pts == 0 then return 1 end
+    if not NAV.haveFix then return 1 end
+    -- Forward unit vector in the same (x,z) frame as bearing = atan2(dx,dz): heading th maps
+    -- to (sin th, cos th). nil when we have no heading -> no backtrack penalty (plain nearest).
+    local fwdX, fwdZ
+    if NAV.haveHeading then
+        fwdX, fwdZ = math.sin(NAV.heading), math.cos(NAV.heading)
+    end
+    local bestI, bestCost = 1, math.huge
+    for i, p in ipairs(pts) do
+        local dx, dz = p.x - NAV.posX, p.z - NAV.posZ
+        local d = math.sqrt(dx * dx + dz * dz)
+        local penalty = 0
+        if fwdX and d > 1e-6 then
+            local align = (fwdX * dx + fwdZ * dz) / d   -- cos(angle to wp): >0 ahead, <0 behind
+            if align < 0 then penalty = RESUME_BACKTRACK_WEIGHT * (-align) end
+        end
+        local cost = d * (1 + penalty)
+        if cost < bestCost then
+            bestCost, bestI = cost, i
+        end
+    end
+    return bestI
+end
+
+-- resume: join the plan at bestResumeIndex(pts) instead of the first point (mid-route
+-- resume). Everything downstream -- phase, pass radii, the PASSED/remaining status list --
+-- keys off NAV.index, so a resumed start at index i is identical to having advanced there.
+local function setRoute(name, resume)
     local c = COURSES[name]
     if not c then return false end
     local pts = {}
@@ -946,7 +995,7 @@ local function setRoute(name)
     NAV.cruiseMode = "full"   -- a fresh plan starts at full cruise, never a stale COAST
     NAV.planName = name
     NAV.points = pts
-    NAV.index = 1
+    NAV.index = resume and bestResumeIndex(pts) or 1
     NAV.active = true
     -- A route ending at a landing site auto-lands there on arrival (fully automatic).
     setLandFinal(pts[#pts].name, true)
@@ -1362,6 +1411,60 @@ local function drawPickRoute()
     renderList("FLY ROUTE - select course", itemsFromCourses(), pickRoutePage, false)
 end
 
+-- After a route is picked, ask whether to fly it from the start or resume mid-route (join
+-- at the best waypoint for our current position/heading). Blocking modal, same self-contained
+-- pattern as confirm(): it owns the screen until answered and is re-woken ~5x/s by navLoop's
+-- timer events, so the RESUME preview (join waypoint + range) stays live. Returns "start",
+-- "resume", or nil (cancelled).
+local function chooseRouteStart(name)
+    local c = COURSES[name]
+    if not c then return nil end
+    -- Same point list setRoute will build, so the preview matches what RESUME actually flies.
+    local pts = {}
+    for _, pname in ipairs(c.seq) do
+        local p = POINTS[pname]
+        if p then table.insert(pts, {name = p.name, x = p.x, z = p.z, kind = p.kind}) end
+    end
+    while true do
+        clearHitboxes()
+        term.setBackgroundColour(colours.black)
+        term.clear()
+        local w, h = term.getSize()
+        term.setTextColour(colours.orange)
+        term.setCursorPos(2, 1); term.write("FLY ROUTE  " .. name)
+
+        term.setTextColour(colours.white)
+        term.setCursorPos(2, 3); term.write("Start this plan from:")
+
+        local ri = bestResumeIndex(pts)
+        term.setTextColour(colours.green)
+        term.setCursorPos(2, 5)
+        term.write("Start:  " .. (pts[1] and pts[1].name or "?"))
+        term.setCursorPos(2, 6)
+        if not NAV.haveFix then
+            term.write("Resume: no fix")
+        elseif pts[ri] then
+            local dx, dz = pts[ri].x - NAV.posX, pts[ri].z - NAV.posZ
+            term.write(string.format("Resume: %s  (%.0fm)", pts[ri].name, math.sqrt(dx*dx + dz*dz)))
+        else
+            term.write("Resume: --")
+        end
+
+        button(2, 9, 22, 3, "START", "FROM START", true, colours.orange)
+        button(2, 13, 22, 3, "RESUME", "RESUME MID-ROUTE", NAV.haveFix, colours.lime)
+        button(w - 9, h - 1, 8, 1, "CANCEL", "CANCEL", true, colours.brown)
+
+        local ev = {os.pullEvent()}
+        local x, y = pointerXY(ev)
+        if x then
+            local id = hitTest(x, y)
+            if id == "START" then return "start"
+            elseif id == "RESUME" then return "resume"
+            elseif id == "CANCEL" then return nil end
+        end
+    end
+end
+
 local function touchPickRoute(id)
     if id == "PREV" then
         pickRoutePage = math.max(1, pickRoutePage - 1)
@@ -1371,8 +1474,11 @@ local function touchPickRoute(id)
         screen = "home"
     elseif id and id:sub(1, 5) == "ITEM:" then
         local name = id:sub(6)
-        statusManualTop = nil   -- fresh plan -> auto-scroll the en-route list
-        if setRoute(name) then screen = "status" end
+        local choice = chooseRouteStart(name)   -- FROM START / RESUME MID-ROUTE / cancel
+        if choice then
+            statusManualTop = nil   -- fresh plan -> auto-scroll the en-route list
+            if setRoute(name, choice == "resume") then screen = "status" end
+        end
     end
 end
 
@@ -1887,12 +1993,25 @@ local function overrideLoop()
 end
 
 -- ============================================================================
--- EXTERNAL MONITOR -- VOR / HSI: a HEADING-UP compass rose (the "squarised circle"),
--- a course-deviation needle for the active leg, and the heading number. Display-only;
--- reads NAV (filled by navTick every tick). Idles if no monitor is attached.
+-- EXTERNAL MONITOR -- HSI, in TWO modes (drawHSI dispatches on LND.active):
+--   * COURSE (drawCourseHSI): the classic heading-up VOR/HSI rose with a course-deviation
+--     needle for the active leg -- shown while navigating a course / direct-to.
+--   * LANDING (drawLandingHSI): a heading-up top-down moving map (aircraft fixed nose-up at
+--     centre, the pad/target rotating under it, a heading-error bar on top, numbers on the
+--     bottom) -- shown once an autoland/landing engages, for flying it down by hand or
+--     watching the autoland.
+-- Display-only; reads NAV/LND (filled every tick). Idles if no monitor is attached.
 -- ============================================================================
+-- COURSE mode (CDI):
 local CDI_FULLSCALE_M = 15    -- metres of cross-track at full needle deflection
 local CDI_ONCOURSE_M  = 1.5   -- inside this the needle turns green
+-- LANDING mode (map):
+local HDG_BAR_FS_DEG = 45     -- heading error (deg) at full-width bar deflection
+local HDG_ALIGN_DEG  = 5      -- within this the bar marker turns green
+-- Map range steps (metres to the ring edge): the smallest that still frames the target
+-- wins, so the target creeps inward as you close and the scale only jumps occasionally.
+local HSI_RANGES = {5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000}
+local HSI_DEFAULT_RANGE = 50  -- ring scale when there is no target to frame
 
 local hsiMon = peripheral.find("monitor")
 if hsiMon then
@@ -1932,7 +2051,13 @@ local function hLine(x0, y0, x1, y1, col)       -- Bresenham colour-cell line
     end
 end
 
-local function drawHSI()
+-- NAV.heading and the atan2(dx,dz) bearings live in a frame where North = 180; this maps
+-- any such angle (radians) to a true compass heading (deg, N=0 E=90 S=180 W=270).
+local function toCompass(rad) return (180 - math.deg(rad)) % 360 end
+
+-- COURSE mode: the classic heading-up compass rose + course-deviation needle for the
+-- active leg. Shown while a course/direct-to is being flown (no landing engaged).
+local function drawCourseHSI()
     local W, H = hsiMon.getSize()
     hsiMon.setBackgroundColour(colours.black); hsiMon.clear()
 
@@ -1968,7 +2093,7 @@ local function drawHSI()
 
     -- NAV.heading/dtk live in the atan2(dx,dz) frame (North = 180); convert to a true
     -- compass (N=0 E=90 S=180 W=270) so the number and the N/E/S/W letters read correctly.
-    local chdg = (180 - math.deg(heading)) % 360
+    local chdg = toCompass(heading)
 
     for a = 0, 357, 2 do local x, y = sp(a, 1.0); hFill(x, y, colours.grey) end     -- ring (bezel)
 
@@ -1981,7 +2106,7 @@ local function drawHSI()
 
     local cdtk
     if hasCourse then
-        cdtk = (180 - math.deg(dtk)) % 360
+        cdtk = toCompass(dtk)
         local cAng = cdtk - chdg
         local a1x, a1y = sp(cAng + 180, 0.95)
         local a2x, a2y = sp(cAng, 0.95)
@@ -2010,6 +2135,115 @@ local function drawHSI()
     else
         hText(2, H, "NO ACTIVE LEG", colours.grey)
     end
+end
+
+-- LANDING mode: a heading-up top-down moving map, shown once a landing engages.
+local function drawLandingHSI()
+    local W, H = hsiMon.getSize()
+    hsiMon.setBackgroundColour(colours.black); hsiMon.clear()
+
+    local haveHdg = NAV.haveHeading
+    local chdg    = haveHdg and toCompass(NAV.heading) or 0
+
+    -- Pick the target and the heading we WANT: the landing pad + its pad heading while
+    -- landing, otherwise the active waypoint + the bearing to it.
+    local landing = LND.active
+    local tgtX, tgtZ, tgtName, tgtGlyph, tgtCol, desired
+    if landing then
+        tgtX, tgtZ = LND.x, LND.z
+        tgtName    = LND.name
+        tgtGlyph   = (LND.siteType == "heli") and "H" or "+"
+        tgtCol     = colours.orange
+        if LND.holdHeading then desired = toCompass(LND.holdHeading) end
+    elseif NAV.active and NAV.points[NAV.index] then
+        local p = NAV.points[NAV.index]
+        tgtX, tgtZ, tgtName = p.x, p.z, p.name
+        tgtGlyph, tgtCol    = "o", colours.cyan
+        desired = toCompass(atan2(p.x - NAV.posX, p.z - NAV.posZ))
+    end
+
+    local haveTgt, dist, brg = (tgtX ~= nil) and NAV.haveFix, 0, 0
+    if haveTgt then
+        local dx, dz = tgtX - NAV.posX, tgtZ - NAV.posZ
+        dist = math.sqrt(dx*dx + dz*dz)
+        brg  = toCompass(atan2(dx, dz))
+    end
+
+    -- ---- top-down map (HEADING-UP, like the waypoint rose): aircraft fixed at centre and
+    -- always nose-up; the card, cardinals and target rotate by -heading so dead ahead is
+    -- the top row ----
+    local mapTop, mapBot = 2, H - 1
+    local cx = math.floor(W/2) + 1
+    local cy = math.floor((mapTop + mapBot) / 2 + 0.5)
+    local Ry = (mapBot - mapTop) / 2
+    local Rx = math.min((W - 1) / 2, Ry * 1.5)     -- char cells are ~1.5:1 -> keep it round
+
+    -- screen point for a HEADING-RELATIVE angle (deg, 0 = top = the nose, clockwise)
+    local function sp(deg, f)
+        local a = math.rad(deg)
+        return cx + f*Rx*math.sin(a), cy - f*Ry*math.cos(a)
+    end
+
+    local range = HSI_DEFAULT_RANGE
+    if haveTgt then
+        range = HSI_RANGES[#HSI_RANGES]
+        for _, r in ipairs(HSI_RANGES) do if dist <= r then range = r; break end end
+    end
+
+    for a = 0, 345, 15 do local x, y = sp(a, 1.0); hFill(x, y, colours.grey) end   -- ring
+
+    local card = {[0]="N", [90]="E", [180]="S", [270]="W"}       -- rotating heading-up card
+    for b = 0, 330, 30 do
+        local x, y = sp(b - chdg, card[b] and 0.82 or 0.92)
+        if card[b] then hText(x, y, card[b], colours.white) else hFill(x, y, colours.grey) end
+    end
+    hText(cx, cy - Ry, "v", colours.orange)                      -- fixed lubber: the nose points here
+    if haveTgt then hText(1, mapTop, "R" .. math.floor(range) .. "m", colours.grey) end
+
+    if haveTgt then
+        local sx, sy = sp(brg - chdg, math.min(dist / range, 1))
+        if landing and desired then                              -- pad's approach axis (landing heading)
+            local ax = desired - chdg
+            local ex, ey = Rx*0.16*math.sin(math.rad(ax)), -Ry*0.16*math.cos(math.rad(ax))
+            hLine(sx - ex, sy - ey, sx + ex, sy + ey, colours.orange)
+        end
+        hText(sx, sy, tgtGlyph, tgtCol)
+    end
+    hText(cx, cy, "^", colours.white)                            -- aircraft, always nose-up
+
+    -- ---- heading-error bar (top row): where the wanted heading sits vs the nose ----
+    for x = 1, W do hText(x, 1, "-", colours.grey) end
+    hText(cx, 1, "|", colours.white)               -- on-heading centre index
+    if haveHdg and desired then
+        local err  = ((desired - chdg + 540) % 360) - 180        -- +ve = wanted heading is to the right
+        local half = math.max(1, math.floor(W/2) - 1)
+        local mx   = cx + math.max(-1, math.min(1, err / HDG_BAR_FS_DEG)) * half
+        hFill(mx, 1, (math.abs(err) <= HDG_ALIGN_DEG) and colours.lime or colours.orange)
+    end
+
+    -- ---- numbers (bottom row) ----
+    local bottom, bcol
+    if landing then
+        bcol   = colours.orange
+        bottom = string.format("%-8s AGL%d VS%+.1f PE%.1f HE%+d%s",
+            (LND.phase or ""):sub(1, 8), math.floor((LND.agl or 0) + 0.5), LND.vs or 0,
+            LND.posErr or 0, math.floor((LND.hdgErrDeg or 0) + 0.5), LND.paused and " PSE" or "")
+    elseif haveTgt then
+        bcol   = tgtCol
+        bottom = string.format("%-6s D%d BRG%03d HDG%03d", (tgtName or ""):sub(1, 6),
+            math.floor(dist + 0.5), math.floor(brg + 0.5) % 360, math.floor(chdg + 0.5) % 360)
+    elseif NAV.haveFix then
+        bcol, bottom = colours.grey, string.format("HDG%03d  NO TARGET", math.floor(chdg + 0.5) % 360)
+    else
+        bcol, bottom = colours.grey, "NO FIX"
+    end
+    hText(1, H, bottom:sub(1, W), bcol)
+end
+
+-- The landing map only earns the screen once a landing is actually engaged; the rest of
+-- the time (flying a course/direct-to, or idle) it's the familiar CDI rose.
+local function drawHSI()
+    if LND.active then drawLandingHSI() else drawCourseHSI() end
 end
 
 local function hsiLoop()

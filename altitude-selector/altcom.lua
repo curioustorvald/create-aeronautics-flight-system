@@ -328,16 +328,49 @@ local function drawAI()
         mon.setCursorPos(1, row); mon.blit(spaces, fg, table.concat(bg))
     end
 
+    -- ---- outer rim: a bank (roll) indicator that ignores pitch --------------
+    -- A thin bezel painted over the horizon edges -- 2 cols each side, 1 row top & bottom
+    -- -- carrying a roll pointer that reads bank ALONE. Pitch never moves it, so the bank
+    -- stays readable even in a steep climb/dive when the horizon has slid off-screen, just
+    -- like a real AI's bank pointer against its fixed bezel scale.
+    mon.setBackgroundColour(colours.black)
+    for row = 1, H do
+        mon.setCursorPos(1, row);     mon.write("  ")          -- left rim (2 wide)
+        mon.setCursorPos(W - 1, row); mon.write("  ")          -- right rim (2 wide)
+    end
+    mon.setCursorPos(1, 1); mon.write(string.rep(" ", W))      -- top rim (1 tall)
+    mon.setCursorPos(1, H); mon.write(string.rep(" ", W))      -- bottom rim (1 tall)
+
+    -- A ray from centre at the bank angle lands on the rim: on the top row for |bank| up
+    -- to ~60 deg, then onto the side rims. 0 = straight up; +bank goes to the right.
+    local bcx, bcy = (1 + W) / 2, (1 + H) / 2
+    local function rimXY(theta)
+        local s, c = math.sin(theta), math.cos(theta)
+        local t = math.huge
+        if c >  1e-6 then t = math.min(t, (bcy - 1) / c) end   -- top edge
+        if s >  1e-6 then t = math.min(t, (W - bcx) / s) end   -- right edge
+        if s < -1e-6 then t = math.min(t, (1 - bcx) / s) end   -- left edge
+        if c < -1e-6 then t = math.min(t, (H - bcy) / c) end   -- bottom edge
+        return math.floor(bcx + t*s + 0.5), math.floor(bcy - t*c + 0.5)
+    end
+    for _, d in ipairs({-60, -30, 30, 60}) do                  -- fixed bank-scale ticks
+        local x, y = rimXY(math.rad(d)); box(x, y, "'", colours.grey)
+    end
+    do local x, y = rimXY(0); box(x, y, "|", colours.white) end -- fixed 0 index
+    -- Moving roll pointer. Flip the sign if it banks the wrong way (this file's one switch).
+    local px, py = rimXY(math.max(-1.4, math.min(1.4, roll)))
+    mon.setCursorPos(px, py); mon.setBackgroundColour(colours.orange); mon.write(" ")
+
     -- fixed aircraft reference wings at centre
     mon.setBackgroundColour(colours.black); mon.setTextColour(colours.orange)
     mon.setCursorPos(midX - 4, midY); mon.write("---")
     mon.setCursorPos(midX + 2, midY); mon.write("---")
     mon.setCursorPos(midX,     midY); mon.write("O")
 
-    -- readouts
-    box(1,     H, string.format("GS %3.0f", gs))
-    box(midX - 3, 1, string.format("ALT%4.0f", alt))
-    box(W - 5, H, string.format("VS%+4.1f", vs), vs >= 0.1 and colours.lime or (vs <= -0.1 and colours.orange or colours.white))
+    -- readouts (kept inside the rim)
+    box(3,        H - 1, string.format("GS %3.0f", gs))
+    box(midX - 3, 2,     string.format("ALT%4.0f", alt))
+    box(W - 8,    H - 1, string.format("VS%+4.1f", vs), vs >= 0.1 and colours.lime or (vs <= -0.1 and colours.orange or colours.white))
 end
 
 local function aiLoop()

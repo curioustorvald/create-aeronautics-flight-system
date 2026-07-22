@@ -38,15 +38,32 @@ local CFG = {}   -- tuning config, tabled to stay under Cobalt's 200-locals-per-
 CFG.APNAV_PROTOCOL    = 'aertogekiss_navap'      -- in : FMS target + phase
 CFG.ALTAP_PROTOCOL    = 'aertogekiss_altap'      -- in : ALT-AP panel setpoint
 CFG.AUTOLAND_PROTOCOL = 'aertogekiss_autoland'   -- in : FMS vertical channel
+CFG.APSWITCH_PROTOCOL = 'aertogekiss_apswitch'   -- in : pilot autopilot toggles (nav / altitude), #12
+CFG.MANCON_PROTOCOL   = 'aertogekiss_mancon'     -- in : manual wanted climb rate (m/s) from the VSC, #6
 CFG.STAB_PROTOCOL     = 'aertogekiss_stab'       -- out: pitch/roll thrusters
 CFG.NAVCTRL_PROTOCOL  = 'aertogekiss_navcontrol' -- out: yaw/thrust/strafe
 CFG.ALT_PROTOCOL      = 'aertogekiss_alt'        -- out: up/down thruster
 
 -- MASTER ENABLES -- bring the craft up one channel at a time (it is still ONE
--- file; these just zero a channel's output so you can isolate a problem).
+-- file; these just zero a channel's output so you can isolate a problem). These are
+-- the source-level debug isolators; the pilot's runtime mode is the AP switches below.
 CFG.ENABLE_ATTITUDE    = true
 CFG.ENABLE_TRANSLATION = true
 CFG.ENABLE_ALTITUDE    = true
+
+-- PILOT AUTOPILOT MODE (the #12 toggle switches, over aertogekiss_apswitch) ----
+-- Levelling/attitude is ALWAYS held. On top of that the two switches pick the mode:
+--   nav ON  + alt ON  -> navigate + hold altitude + level          (full autopilot)
+--   nav ON  + alt OFF -> navigate + level; altitude from the manual VSC (aertogekiss_mancon)
+--   nav OFF + alt ON  -> hold altitude + level; positional control handed to the pilot
+--   nav OFF + alt OFF -> just keep the craft level (altitude still manual via the VSC)
+-- An in-progress autoland overrides BOTH switches (it is a committed sequence with its
+-- own abort path) and keeps flying the craft down. The DEFAULTS below apply only until
+-- #12 is first heard; false/false = safe (hand-off + manual) so a craft with no switch
+-- computer wired does not fly itself off.
+CFG.AP_NAV_DEFAULT = false
+CFG.AP_ALT_DEFAULT = false
+CFG.MANCON_STALE_AFTER = 0.5   -- s; manual vertical older than this -> treat as neutral hover
 
 -- ATTITUDE LAW MODE -----------------------------------------------------------
 --  "PD"      : steps = KP*errVec - KD*angVel, straight to redstone. Simple,
@@ -208,6 +225,26 @@ CFG.ATT_I_RATE_GATE = 0.05   -- rad/s; FREEZE the integral on any axis rotating 
                                -- (the "pitches up/down greatly, then spins" on a nudge).
                                -- So the integral learns the steady trim only, at near-rest.
 
+-- IDLE / PARKED trim-freeze. The attitude integral above is a NEAR-REST learner, which makes
+-- a craft sitting on the ground -- engine master OFF, or simply parked with this computer left
+-- running -- the very condition under which it accumulates: it sees a small standing tilt (the
+-- craft resting askew, or the thrusters disabled so it cannot level itself) at zero rate and
+-- winds the trim to ATT_I_LIMIT chasing an error it has NO authority to null. That bogus trim
+-- then disturbs the NEXT flight. So detect "idle" -- quasi-stationary AND not under active
+-- guidance -- and while idle FREEZE the trims and BLEED the attitude integral back toward zero,
+-- so any parked wind-up has decayed by takeoff. Idle needs the craft both still (all three
+-- speeds under their thresholds) and unguided; a nav target, an autoland approach/descent, or
+-- an ALT-AP climb keeps it "active", so genuine in-flight trim learning (incl. a commanded
+-- hover/hold) is untouched and flight behaviour is byte-for-byte unchanged. "landed" (sitting on
+-- the pad) counts as parked. Calibrate so a parked craft reads idle within IDLE_SETTLE s while
+-- the smallest real manoeuvre clears it at once (watch the "PARK" flag on the TRIM line).
+CFG.ATT_I_IDLE_BLEED = 0.95   -- per-tick (~0.05 s) decay applied to the attitude trim while idle
+CFG.IDLE_SPEED   = 0.6    -- m/s; horizontal speed below this counts as still
+CFG.IDLE_VSPEED  = 0.4    -- m/s; vertical speed below this counts as still
+CFG.IDLE_RATE    = 0.06   -- rad/s; total angular rate below this counts as still
+CFG.IDLE_ALT_TOL = 1.0    -- m; |TARGET_ALT - posY| above this = an ALT-AP climb/descent (active)
+CFG.IDLE_SETTLE  = 1.5    -- s of continuous stillness-and-unguided before idle latches
+
 -- Sign / channel calibration (see header). All default to +1 / false.
 CFG.PITCH_SIGN = 1
 CFG.ROLL_SIGN  = -1
@@ -231,11 +268,66 @@ CFG.ROLL_RATE_SIGN  = 1
 CFG.HEADING_SIGN   = 1
 CFG.HEADING_OFFSET = math.pi   -- ship's logical forward is 180 from thrust-forward
 
--- Channel limits (redstone steps)
-CFG.STAB_MAX   = 14
-CFG.YAW_MAX    = 14
-CFG.THRUST_MAX = 14
-CFG.STRAFE_MAX = 14
+-- Channel limits (redstone steps). Full 0..15 range now that nothing downstream
+-- reserves the top step.
+CFG.STAB_MAX   = 15
+CFG.YAW_MAX    = 15
+CFG.THRUST_MAX = 15
+CFG.STRAFE_MAX = 15
+
+-- ============================================================================
+-- FLIGHT MODE -- how the craft holds course and handles turns / altitude changes.
+-- Set in source; there is no runtime switch (edit + rerun to change).
+--   "VTOL"      : the original holonomic-hover behaviour. The body is held wings-
+--                 LEVEL at all times; EVERY bit of horizontal course correction is
+--                 done by STRAFING; yaw swings the nose but the craft never banks.
+--                 The bank/pitch overlays below are OFF (exact prior behaviour).
+--   "HYBRID"    : a VTOL flown to LOOK like an aeroplane. It banks INTO turns
+--                 (coordinated roll) and pitches the nose for climb/descent, but
+--                 the strafe thrusters are STILL used for cross-track holding,
+--                 position hold and landing when attitude alone can't hold the
+--                 line. (Bank + pitch overlays ON, strafe ON.)
+--   "FIXEDWING" : strafe thrusters COMPLETELY disabled -- lateral course is
+--                 corrected only by turning (bank + the yaw law pointing the nose,
+--                 which drags the craft round via the tilted alt-thruster "lift").
+--                 Banks into turns and pitches for altitude like HYBRID; no strafe
+--                 even for landing. (Bank + pitch overlays ON, strafe OFF.)
+-- Anything unrecognised is treated as VTOL (safe default).
+CFG.FLIGHT_MODE = "VTOL"
+
+-- Coordinated-bank overlay (HYBRID/FIXEDWING only; a no-op in VTOL and whenever the
+-- craft is already tracking its heading, i.e. straight-and-level). Commands a roll
+-- angle proportional to the current heading error, so the craft leans INTO a turn
+-- and rolls wings-level again once pointed at the target. It is added to the
+-- attitude SETPOINT, so the leveling loop holds the bank and the alt-thruster tilt-
+-- allocation turns that bank into the lateral "lift" that pulls the craft round.
+-- CALIBRATE like the other axes: if it banks the WRONG way into a turn, flip
+-- CFG.BANK_SIGN. (Alternative driver: base it on measured yaw rate instead of
+-- heading error -- see the note where bankTarget is computed in controlLoop.)
+CFG.BANK_SIGN       = -1
+CFG.BANK_PER_YAWERR = 0.14    -- rad of commanded bank per rad of heading error
+CFG.BANK_MAX        = 0.4    -- rad (~29 deg) cap on commanded bank
+CFG.BANK_RATE       = 0.5    -- rad/s slew on the bank command (smooth roll in/out)
+
+-- Pitch-for-altitude overlay (HYBRID/FIXEDWING only; a no-op in VTOL and in level
+-- cruise). Commands a pitch angle proportional to the desired climb/descent rate,
+-- so the nose rises to climb and drops to descend. The alt thruster still does the
+-- real vertical work and the tilt-allocation keeps altitude held regardless; this
+-- makes the motion LOOK right and, in FIXEDWING, lets the nose-up attitude convert
+-- forward thrust into climb. Suppressed during autoland/LANDING so the craft keeps
+-- a level pad approach. Flip CFG.PITCH_ALT_SIGN if the nose drops when it should
+-- rise to climb.
+CFG.PITCH_ALT_SIGN  = 0 -- -1
+CFG.PITCH_PER_MPS   = 0.0--0.04   -- rad of commanded pitch per m/s of desired vertical rate
+CFG.PITCH_ALT_MAX   = 0.0--0.3    -- rad (~23 deg) cap on commanded pitch
+CFG.PITCH_ALT_RATE  = 0.0--0.2    -- rad/s slew on the pitch command
+
+-- Derived once from FLIGHT_MODE (unrecognised -> VTOL). Kept in CFG rather than new
+-- top-level locals, to stay under Cobalt's 200-locals-per-function cap (see top).
+CFG.STRAFE_ENABLED = (CFG.FLIGHT_MODE ~= "FIXEDWING")
+CFG.ATTITUDE_BANKS = (CFG.FLIGHT_MODE == "HYBRID" or CFG.FLIGHT_MODE == "FIXEDWING")
+CFG.MODE_TAG = (CFG.FLIGHT_MODE == "HYBRID" and "HYB")
+    or (CFG.FLIGHT_MODE == "FIXEDWING" and "FW") or "VTOL"
 
 -- ============================================================================
 -- TRANSLATION CONFIG -- ported from navcom.lua (yaw removed; it is attitude now)
@@ -263,9 +355,15 @@ CFG.WP_EPSILON  = 0.5
 -- ============================================================================
 -- ALTITUDE CONFIG -- ported from control.lua (the vertical cascade + autoland)
 -- ============================================================================
+-- The vertical channel now drives the up- and down-firing thrusters directly on
+-- two separate redstone lines (see sendAlt) -- the old single 0..14 line + external
+-- splitter box is gone. ALT_NEUTRAL is the balanced-hover level BOTH lines sit at
+-- when the cascade wants zero net effort; +steps drives up, -steps drives down.
 CFG.ALT_NEUTRAL = 7
-CFG.ALT_MIN, CFG.ALT_MAX = 0, 14
-CFG.ALT_SWING   = math.min(CFG.ALT_NEUTRAL - CFG.ALT_MIN, CFG.ALT_MAX - CFG.ALT_NEUTRAL)
+CFG.ALT_MIN, CFG.ALT_MAX = 0, 15
+-- math.max (not min): with neutral 7 in a 0..15 range the up side has 8 steps of
+-- headroom, so full effort reaches level 15 and the down line reaches 0.
+CFG.ALT_SWING   = math.max(CFG.ALT_NEUTRAL - CFG.ALT_MIN, CFG.ALT_MAX - CFG.ALT_NEUTRAL)
 CFG.CLIMB_AT_FULL = 5.0
 CFG.STEPS_PER_MPS = CFG.ALT_SWING / CFG.CLIMB_AT_FULL
 CFG.ALT_KP      = 0.3
@@ -348,7 +446,8 @@ local ditherRoll   = makeDither()
 local ditherYaw    = makeDither()
 local ditherThrust = makeDither()
 local ditherStrafe = makeDither()
-local ditherAlt    = makeDither()
+local ditherAltUp   = makeDither()   -- up-firing thruster line
+local ditherAltDown = makeDither()   -- down-firing thruster line
 
 -- Resolve, once, how to BUILD a wings-level quaternion facing a given raw yaw
 -- (a rotation about world-up Y only => zero pitch/roll). probe.lua tells you which
@@ -417,7 +516,11 @@ end
 -- and any real rotation means the P/D loop is doing dynamic work the integral must
 -- NOT join -- integrating through motion lags the error ~90 deg and pumps a slow,
 -- growing oscillation. So the integral learns the steady trim only, near rest.
-local function integStep(cur, e, rate, dt)
+local function integStep(cur, e, rate, dt, idle)
+    -- Parked / engine-off: never learn a trim from a craft that isn't flying (the tilt it
+    -- reads is imposed by the ground, not a moment the thrusters could null) -- bleed any
+    -- wind-up accrued while parked away so the next flight starts from a clean trim.
+    if idle then return cur * CFG.ATT_I_IDLE_BLEED end
     if math.abs(e) > CFG.ATT_I_BLEED_ERR then return cur * 0.98 end
     if math.abs(rate) > CFG.ATT_I_RATE_GATE then return cur end
     return clamp(cur + e * dt, -CFG.ATT_I_LIMIT, CFG.ATT_I_LIMIT)
@@ -431,6 +534,16 @@ local function profileRate(err, kp, maxRate, maxDecel)
     return clamp(kp * err, -cap, cap)
 end
 
+-- Slew-rate limiter: move `cur` toward `target` by at most `maxStep` this call.
+-- Smooths the commanded bank/pitch so a turn or climb rolls/pitches in and out
+-- gently instead of snapping the setpoint (which would jerk the attitude loop).
+local function slew(cur, target, maxStep)
+    local d = target - cur
+    if d >  maxStep then d =  maxStep end
+    if d < -maxStep then d = -maxStep end
+    return cur + d
+end
+
 -- STATE (set by the receive loops; read by the control loop) ------------------
 local navTarget = { nil, nil, nil, '' }   -- {X, Z, type, name}
 local navPrev   = nil                     -- {X, Z} previous waypoint, or nil
@@ -438,6 +551,15 @@ local navPhase  = "ENROUTE"
 local navHoldHeading = nil
 local navCruiseCap   = CFG.CRUISE_SPEED
 local apLastMsg = nil
+
+-- Pilot autopilot mode (from #12) and manual vertical (from #6). Held between
+-- messages: these are latching switches / a continuously-streamed stick, so a dropped
+-- packet must not disengage anything -- we keep the last value and only flag staleness.
+local AP_NAV = CFG.AP_NAV_DEFAULT
+local AP_ALT = CFG.AP_ALT_DEFAULT
+local apswLastMsg = nil
+local manVS = 0            -- pilot's wanted climb rate (m/s) from the VSC #6
+local manLastMsg = nil
 
 local AP_ALTI    = nil
 local altLastMsg = nil
@@ -483,9 +605,9 @@ end
 -- OUTPUT ----------------------------------------------------------------------
 local outStab   = { front = 0, back = 0, left = 0, right = 0 }
 local outNav    = { thrust = 0, yaw = 0, strafe = 0 }
-local outAlt    = CFG.ALT_NEUTRAL
+local outAlt    = { up = CFG.ALT_NEUTRAL, down = CFG.ALT_NEUTRAL }
 
--- pitch/roll are signed steps [-14,14]. front/back carry pitch, left/right roll
+-- pitch/roll are signed steps [-15,15]. front/back carry pitch, left/right roll
 -- (control.lua's mapping; flip via CFG.SWAP_PITCH_ROLL_CHANNELS / *_SIGN if wrong).
 local function sendStab(pitch, roll)
     if CFG.DITHER then
@@ -504,7 +626,7 @@ local function sendStab(pitch, roll)
     outStab = { front = front, back = back, left = left, right = right }
 end
 
--- thrust +fwd/-back, yaw +right/-left, strafe +right/-left; all [-14,14].
+-- thrust +fwd/-back, yaw +right/-left, strafe +right/-left; all [-15,15].
 local function sendNav(thrust, yaw, strafe)
     if CFG.DITHER then
         thrust = ditherThrust(thrust, -CFG.THRUST_MAX, CFG.THRUST_MAX)
@@ -526,12 +648,23 @@ local function sendNav(thrust, yaw, strafe)
     outNav = { thrust = thrust, yaw = yaw, strafe = strafe }
 end
 
+-- Split the signed vertical command into independent up- and down-thruster levels
+-- (replacing the external splitter box). steps 0 -> both at ALT_NEUTRAL (balanced
+-- hover); +steps drives the up line and backs off the down line, -steps the reverse.
+-- Each line is dithered on its own accumulator and clamped to the full 0..15 range.
 local function sendAlt(steps)
-    local want = CFG.ALT_NEUTRAL + steps
-    local level = CFG.DITHER and ditherAlt(want, CFG.ALT_MIN, CFG.ALT_MAX) or clamp(round(want), CFG.ALT_MIN, CFG.ALT_MAX)
-    rednet.broadcast({ alt = level }, CFG.ALT_PROTOCOL)
-    outAlt = level
-    return level
+    local wantUp, wantDown = CFG.ALT_NEUTRAL + steps, CFG.ALT_NEUTRAL - steps
+    local up, down
+    if CFG.DITHER then
+        up   = ditherAltUp(wantUp,     CFG.ALT_MIN, CFG.ALT_MAX)
+        down = ditherAltDown(wantDown, CFG.ALT_MIN, CFG.ALT_MAX)
+    else
+        up   = clamp(round(wantUp),   CFG.ALT_MIN, CFG.ALT_MAX)
+        down = clamp(round(wantDown), CFG.ALT_MIN, CFG.ALT_MAX)
+    end
+    rednet.broadcast({ up = up, down = down }, CFG.ALT_PROTOCOL)
+    outAlt = { up = up, down = down }
+    return up, down
 end
 
 -- ATTITUDE --------------------------------------------------------------------
@@ -541,7 +674,10 @@ end
 -- frame if needed, and the inertia tensor is applied via inertiaMul (body vector ->
 -- body vector, whatever frame the tensor itself is in). There is no final command
 -- rotation, so a pure pitch demand stays a pure pitch command.
-local function attitude(q_cur, w, heading, desiredHeading, I, dt)
+local function attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitchCmd, idle)
+    bankCmd  = bankCmd  or 0   -- commanded roll  overlay (rad), HYBRID/FIXEDWING; 0 = level
+    pitchCmd = pitchCmd or 0   -- commanded pitch overlay (rad), HYBRID/FIXEDWING; 0 = level
+    -- idle: craft parked/engine-off (see the IDLE block). Freezes + bleeds the trim integral.
     local q_inv = q_cur:inverse()
     -- Desired level attitude facing desiredHeading. Invert navcom's heading chain
     -- so the yaw we build lives in the raw-quaternion frame q_cur reads back in.
@@ -580,6 +716,18 @@ local function attitude(q_cur, w, heading, desiredHeading, I, dt)
         ex, ey, ez = vx*es, vy*es, vz*es
     end
 
+    -- COMMANDED-ATTITUDE OVERLAY (HYBRID/FIXEDWING). Shift the pitch/roll SETPOINT
+    -- off level by the coordinated-turn bank and the climb pitch. ex/ez are the
+    -- drive-to-zero tilt errors, so SUBTRACTING the command moves the equilibrium to
+    -- that attitude, and everything downstream -- the integral, the P/D law, and the
+    -- tilt/yaw level-priority (which reads sqrt(ex^2+ez^2)) -- then works relative to
+    -- the COMMANDED attitude. So a deliberate bank is NOT mistaken for an upset and
+    -- does not fade the yaw during a coordinated turn, while a genuine flip (error
+    -- far from the small commanded bank) still fades it. Both commands are zero in
+    -- VTOL and in straight-and-level flight, making this an exact no-op there.
+    ex = ex - CFG.PITCH_ALT_SIGN * pitchCmd
+    ez = ez - CFG.BANK_SIGN      * bankCmd
+
     -- Angular velocity in the BODY frame (rotate the world reading in if needed),
     -- then the per-axis rate-feedback sign (independent of the output *_SIGN).
     local wx, wy, wz
@@ -589,9 +737,9 @@ local function attitude(q_cur, w, heading, desiredHeading, I, dt)
 
     -- Integral trim (body frame), rate-gated so it can't pump a manoeuvre (integStep).
     if CFG.ATT_INTEGRAL then
-        attIntegX = integStep(attIntegX, ex, wx, dt)
-        --attIntegY = integStep(attIntegY, ey, wy, dt)
-        --attIntegZ = integStep(attIntegZ, ez, wz, dt)
+        attIntegX = integStep(attIntegX, ex, wx, dt, idle)
+        --attIntegY = integStep(attIntegY, ey, wy, dt, idle)
+        --attIntegZ = integStep(attIntegZ, ez, wz, dt, idle)
     end
     local biasX = CFG.ATT_INTEGRAL and attIntegX or 0
     local biasY = CFG.ATT_INTEGRAL and attIntegY or 0
@@ -691,9 +839,13 @@ end
 -- CONTROL LOOP ----------------------------------------------------------------
 local function controlLoop()
     local lastTime = os.clock()
-    local prevVelY = 0
     local lastMass = nil
     local trimBoost = 0
+    local lastDesiredVelY = 0   -- previous tick's desired climb rate, feeds pitch overlay
+    local bankCmd  = 0          -- slewed coordinated-bank command (rad), HYBRID/FIXEDWING
+    local pitchCmd = 0          -- slewed pitch-for-altitude command (rad), HYBRID/FIXEDWING
+    local stillFor = 0          -- s the craft has been still-and-unguided, for the idle gate
+    local altCascadePrev = false -- edge-detect entry into altitude-hold, to seize current alt
 
     while true do
         local now = os.clock()
@@ -711,6 +863,19 @@ local function controlLoop()
 
         latestPosY = pos.y
         if TARGET_ALT == nil then setTarget(pos.y) end   -- boot: hold where we are
+
+        -- ---- pilot autopilot mode (from the #12 toggle switches) ----
+        -- Attitude/levelling always runs (below). navActive gates navigation; else
+        -- positional control is handed to the pilot. useAltCascade runs the altitude-hold
+        -- cascade; else the vertical effort comes from the manual VSC (mancon). An
+        -- in-progress autoland overrides both -- it owns the craft until it aborts/finishes.
+        local autolandActive = (alState ~= "normal")
+        local navActive      = AP_NAV or autolandActive
+        local useAltCascade  = AP_ALT or autolandActive
+        -- Entering altitude-hold from manual: seize the current altitude so it holds here
+        -- rather than snapping to a stale target (a live ALT-AP panel pick overrides within 1 s).
+        if useAltCascade and not altCascadePrev and latestPosY then setTarget(latestPosY) end
+        altCascadePrev = useAltCascade
 
         local heading = CFG.HEADING_SIGN * getYaw(q_cur) + CFG.HEADING_OFFSET
 
@@ -746,21 +911,61 @@ local function controlLoop()
         -- ---- desired heading, per phase (the yaw "autopilot") ----
         --  ENROUTE  -> seek the bearing to the target
         --  LANDING  -> hold the commanded pad heading
-        --  else / hands-off / no target -> current heading, so the attitude loop
-        --                     only rate-damps yaw and the pilot keeps steering.
+        --  else / hands-off / no target / AP_NAV off -> current heading, so the attitude
+        --                     loop only rate-damps yaw and the pilot keeps steering.
         local desiredHeading = heading
-        if hasTarget and navPhase == "ENROUTE" then desiredHeading = bearing
-        elseif headingHold then desiredHeading = navHoldHeading end
+        if navActive then
+            if hasTarget and navPhase == "ENROUTE" then desiredHeading = bearing
+            elseif headingHold then desiredHeading = navHoldHeading end
+        end
+
+        -- ---- coordinated-bank + pitch-for-altitude commands (HYBRID/FIXEDWING) ----
+        -- Bank leans into the turn (from the heading error, so wings-level on a tracked
+        -- course); pitch tracks the desired climb rate. Both are slewed for a smooth
+        -- roll/pitch in and out, held at zero in VTOL, and suppressed during autoland/
+        -- LANDING so the craft keeps a level, un-banked pad approach.
+        local bankTarget, pitchTarget = 0, 0
+        if CFG.ATTITUDE_BANKS and alState == "normal" and navPhase ~= "LANDING" then
+            -- Heading-error bank: zero on a tracked course. For a turn-RATE bank instead
+            -- (banks during ANY yaw, incl. pilot yaw), use CFG.BANK_PER_YAWERR * w.y here.
+            local hErr  = wrapPi(desiredHeading - heading)
+            bankTarget  = clamp(CFG.BANK_PER_YAWERR * hErr, -CFG.BANK_MAX, CFG.BANK_MAX)
+            -- Pitch from LAST tick's desired climb rate (computed after attitude, below);
+            -- one 50 ms tick of lag on a cosmetic pitch command is immaterial.
+            pitchTarget = clamp(CFG.PITCH_PER_MPS * lastDesiredVelY, -CFG.PITCH_ALT_MAX, CFG.PITCH_ALT_MAX)
+        end
+        bankCmd  = slew(bankCmd,  bankTarget,  CFG.BANK_RATE     * dt)
+        pitchCmd = slew(pitchCmd, pitchTarget, CFG.PITCH_ALT_RATE * dt)
+
+        -- ---- IDLE / PARKED trim-freeze gate ----
+        -- Freeze (and bleed) the learnt trims when the craft sits still and is not being
+        -- actively guided -- parked, or engine master OFF -- so a near-rest integral can't wind
+        -- up against a tilt the thrusters have no authority to correct and poison the next
+        -- flight. Any active guidance (a nav target, an autoland approach/descent, or an ALT-AP
+        -- climb/descent) or the least motion clears it at once. "landed" (on the pad) is parked.
+        local speedH    = math.sqrt(vel.x*vel.x + vel.z*vel.z)
+        local wmag      = math.sqrt(w.x*w.x + w.y*w.y + w.z*w.z)
+        local altActive = (TARGET_ALT ~= nil) and (math.abs(TARGET_ALT - pos.y) > CFG.IDLE_ALT_TOL)
+        local guiding   = (navActive and hasTarget) or (useAltCascade and altActive)
+            or alState == "hold" or alState == "descend"
+        local still     = (not guiding) and speedH < CFG.IDLE_SPEED
+            and math.abs(vel.y) < CFG.IDLE_VSPEED and wmag < CFG.IDLE_RATE
+        stillFor = still and (stillFor + dt) or 0
+        local idle = stillFor >= CFG.IDLE_SETTLE
+        ui.idle = idle
 
         -- ---- ATTITUDE ----
         local pitchSteps, rollSteps, yawSteps = 0, 0, 0
         if CFG.ENABLE_ATTITUDE then
-            pitchSteps, rollSteps, yawSteps = attitude(q_cur, w, heading, desiredHeading, I, dt)
+            pitchSteps, rollSteps, yawSteps = attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitchCmd, idle)
         end
 
         -- ---- HORIZONTAL TRANSLATION (ported navcom) ----
+        -- navActive off => positional control handed to the pilot: command no translation
+        -- (the tilt-allocation vertical spill below may still add some -- that is executing
+        -- the vertical command, not navigating).
         local thrustCmd, strafeCmd = 0, 0
-        if CFG.ENABLE_TRANSLATION and hasTarget then
+        if CFG.ENABLE_TRANSLATION and navActive and hasTarget then
             if translateOnly then
                 local speedCap = (navPhase == "APPROACH") and CFG.APPROACH_SPEED or CFG.TERMINAL_MAX_SPEED
                 local desiredSpeed = clamp(CFG.APPROACH_KP * dist, 0, speedCap)
@@ -831,17 +1036,31 @@ local function controlLoop()
             end
         end
 
-        -- ---- VERTICAL (ported control.lua cascade + autoland) ----
-        local altLevel = CFG.ALT_NEUTRAL
+        -- ---- VERTICAL (ported control.lua cascade + autoland, OR manual VSC) ----
+        local altUp, altDown = CFG.ALT_NEUTRAL, CFG.ALT_NEUTRAL
         local desiredVelY, velY = 0, vel.y
-        local vertEffort = 0   -- signed alt-thruster steps the cascade wants (+ = climb)
+        local vertEffort = 0   -- signed alt-thruster steps wanted (+ = climb)
         if CFG.ENABLE_ALTITUDE then
-            if alState == "descend" then
-                desiredVelY = alDescendVS
-                if alLastMsg and (now - alLastMsg) > CFG.AL_STALE_AFTER then desiredVelY = 0 end
+            -- ---- desired climb rate: pick the source, then run ONE shared inner loop ----
+            -- Three sources feed the same inner climb-rate loop below: the altitude-hold
+            -- outer P, an autoland-commanded descent, or -- when altitude-hold is off -- the
+            -- pilot's wanted rate straight off the VSC (#6) over mancon. The VSC no longer
+            -- controls anything itself; it just names a rate, and this loop buys it.
+            if useAltCascade then
+                if alState == "descend" then
+                    desiredVelY = alDescendVS
+                    if alLastMsg and (now - alLastMsg) > CFG.AL_STALE_AFTER then desiredVelY = 0 end
+                else
+                    desiredVelY = altPID:step(pos.y, dt)
+                end
             else
-                desiredVelY = altPID:step(pos.y, dt)
+                -- MANUAL: stale/absent stick -> hold (0 = hover). Clamp to the same rate
+                -- limits the cascade obeys so a full stick can't ask for the impossible.
+                local manFresh = manLastMsg and (now - manLastMsg) <= CFG.MANCON_STALE_AFTER
+                desiredVelY = manFresh and clamp(manVS, -CFG.DESCEND_MAX, CFG.CLIMB_MAX) or 0
             end
+
+            -- ---- inner climb-rate loop (shared): rate error -> alt-thruster steps ----
             if lastMass and math.abs(mass - lastMass) > CFG.MASS_STEP_THRESHOLD then trimBoost = CFG.TRIM_BOOST_TIME end
             lastMass = mass
             if trimBoost > 0 then trimBoost = trimBoost - dt end
@@ -850,7 +1069,13 @@ local function controlLoop()
             local ib = velPID.integral
             local steps = CFG.STEPS_PER_MPS * desiredVelY + velPID:step(velY, dt)
             local stepsSat = clamp(steps, -CFG.ALT_SWING, CFG.ALT_SWING)
-            if stepsSat ~= steps and (steps - stepsSat) * velPID.integral > 0 then
+            if idle then
+                -- Parked/landed: HOLD the learnt hover trim (as shutdown() preserves it) rather
+                -- than pumping it against a grounded craft that can't respond -- undo this tick's
+                -- integration. Freeze, don't bleed: the hover lift is a real value wanted at the
+                -- next takeoff, unlike the attitude trim which bleeds toward zero.
+                velPID.integral = ib
+            elseif stepsSat ~= steps and (steps - stepsSat) * velPID.integral > 0 then
                 velPID.integral = ib
             elseif trimBoost > 0 then
                 velPID.integral = clamp(velPID.integral + (desiredVelY - velY) * dt * (CFG.TRIM_BOOST_GAIN - 1),
@@ -858,6 +1083,7 @@ local function controlLoop()
             end
             vertEffort = stepsSat
         end
+        lastDesiredVelY = desiredVelY   -- feed next tick's pitch-for-altitude overlay
 
         -- ---- ATTITUDE-AWARE VERTICAL ALLOCATION (Bug 2) ----
         -- "Hold altitude" is world-up, but the alt thruster is body-fixed. Route the
@@ -872,9 +1098,15 @@ local function controlLoop()
             strafeCmd = strafeCmd + vertEffort * ux * CFG.VERT_XFER_STR   -- body-lat -> strafe
             ui.tiltUp = uy
         end
-        altLevel = sendAlt(CFG.ENABLE_ALTITUDE and altSteps or 0)
+        altUp, altDown = sendAlt(CFG.ENABLE_ALTITUDE and altSteps or 0)
 
         -- ---- OUTPUT ----
+        -- FIXEDWING: strafe thrusters fully disabled -- drop course-correction AND the
+        -- tilt-allocation lateral spill above, and hold the strafe integral at zero so
+        -- it cannot wind up while its output is suppressed. Lateral course is then
+        -- corrected only by turning (bank + yaw), and the alt thruster carries whatever
+        -- vertical effort the banked craft can't route laterally (may sag in hard banks).
+        if not CFG.STRAFE_ENABLED then strafeCmd = 0; strafePID.integral = 0 end
         if CFG.ENABLE_ATTITUDE then sendStab(pitchSteps, rollSteps) else sendStab(0, 0) end
         sendNav(thrustCmd, yawSteps, strafeCmd)
 
@@ -886,15 +1118,17 @@ local function controlLoop()
         ui.headingDeg = math.deg(wrapPi(heading))
         ui.desHeadingDeg = math.deg(wrapPi(desiredHeading))
         ui.yawRate = w.y
-        ui.phase = hasTarget and navPhase or "NO TGT"
+        ui.phase = (not navActive) and "HANDOFF" or (hasTarget and navPhase or "NO TGT")
+        ui.apNav, ui.apAlt, ui.altManual = AP_NAV, AP_ALT, (not useAltCascade)
         ui.dist, ui.bearingDeg = dist, math.deg(wrapPi(bearing))
         ui.xtk = hasLeg and (CFG.XTK_SIGN * xtk) or nil
         ui.targetAlt, ui.velY, ui.desVelY = TARGET_ALT, velY, desiredVelY
-        ui.altLevel = altLevel
+        ui.altUp, ui.altDown = altUp, altDown
         ui.pStep, ui.rStep, ui.yStep = outStab, outNav.yaw, nil
         ui.thr, ui.yaw, ui.str = outNav.thrust, outNav.yaw, outNav.str or outNav.strafe
         ui.alState = alState
         ui.tgtName = navTarget[4]
+        ui.bankCmd, ui.pitchCmd = bankCmd, pitchCmd
 
         sleep(0.05)
     end
@@ -940,6 +1174,34 @@ local function altReceiveLoop()
             -- Ignore ALT-AP while autoland owns the vertical channel.
             if alState == "normal" and a1 then setTarget(AP_ALTI) end
             if a1 then altLastMsg = os.clock() end
+        end
+    end
+end
+
+-- Pilot AP toggle switches (#12). Latching switches streamed continuously; hold the last
+-- value between packets so a dropped one cannot disengage the autopilot.
+local function apSwitchReceiveLoop()
+    while true do
+        local sender, msg = rednet.receive(CFG.APSWITCH_PROTOCOL, 1)
+        if sender and type(msg) == "table" then
+            AP_NAV = msg.autopilot_nav and true or false
+            AP_ALT = msg.autopilot_altitude and true or false
+            apswLastMsg = os.clock()
+        end
+    end
+end
+
+-- Manual vertical from the VSC (#6): the pilot's wanted climb rate (m/s). Held between
+-- packets; staleness (and the rate clamp) handled by the control loop.
+local function manConReceiveLoop()
+    while true do
+        local sender, msg = rednet.receive(CFG.MANCON_PROTOCOL, 1)
+        if sender and type(msg) == "table" then
+            local v = tonumber(msg.vs)
+            if v then
+                manVS = v
+                manLastMsg = os.clock()
+            end
         end
     end
 end
@@ -1027,8 +1289,11 @@ local function displayLoop()
         line(r + 2, string.format("STAB F%d B%d L%d R%d Y%+3d raw%.0f",
             (ui.pStep or outStab).front, (ui.pStep or outStab).back,
             (ui.pStep or outStab).left, (ui.pStep or outStab).right, ui.yaw or 0, ui.rotRaw or 0))
-        line(r + 7, string.format("TRIM iP%+.2f iR%+.2f yS%.2f gy%.2f", ui.integP or 0, ui.integR or 0, ui.yawScale or 1, ui.gyroFade or 0))
+        line(r + 7, string.format("TRIM iP%+.2f iR%+.2f yS%.2f gy%.2f %s",
+            ui.integP or 0, ui.integR or 0, ui.yawScale or 1, ui.gyroFade or 0, ui.idle and "PARK" or ""))
         line(r + 8, string.format("I(k) x%.0f y%.0f z%.0f", (ui.Ix or 0)/1000, (ui.Iy or 0)/1000, (ui.Iz or 0)/1000))
+        line(r + 9, string.format("MODE %-4s STR%s bank%+.2f pit%+.2f",
+            CFG.MODE_TAG, CFG.STRAFE_ENABLED and "+" or "-", ui.bankCmd or 0, ui.pitchCmd or 0))
         term.setTextColour(colours.orange)
         line(r + 3, string.format("PHASE %-7s  DIST %6.1f", ui.phase or "--", ui.dist or 0))
         term.setTextColour(colours.white)
@@ -1037,10 +1302,13 @@ local function displayLoop()
         else
             line(r + 4, string.format("XTK  ---     THR %+3d  STR %+3d", ui.thr or 0, ui.str or 0))
         end
-        line(r + 5, string.format("ALT %6.1f -> %s  Vy%+5.2f o%2d up%+.2f",
-            ui.posY or 0, ui.targetAlt and string.format("%.0f", ui.targetAlt) or "--",
-            ui.velY or 0, ui.altLevel or CFG.ALT_NEUTRAL, ui.tiltUp or 1))
-        local al = (ui.alState ~= "normal") and ("AUTOLAND " .. string.upper(ui.alState or "")) or ("LINK " .. (ui.link or "--"))
+        local altTgt = ui.altManual and "MAN" or (ui.targetAlt and string.format("%.0f", ui.targetAlt) or "--")
+        line(r + 5, string.format("ALT %6.1f -> %s  Vy%+5.2f u%2d d%2d t%+.2f",
+            ui.posY or 0, altTgt,
+            ui.velY or 0, ui.altUp or CFG.ALT_NEUTRAL, ui.altDown or CFG.ALT_NEUTRAL, ui.tiltUp or 1))
+        local apTag = string.format("AP nav:%s alt:%s  %s",
+            ui.apNav and "on" or "off", ui.apAlt and "on" or "off", ui.link or "--")
+        local al = (ui.alState ~= "normal") and ("AUTOLAND " .. string.upper(ui.alState or "")) or apTag
         term.setTextColour(ui.link == "ok" and colours.green or colours.orange)
         line(r + 6, al)
         term.setTextColour(colours.white)
@@ -1054,13 +1322,18 @@ local function shutdown()
         rednet.broadcast({ left = 0, right = 0, front = 0, back = 0 }, CFG.STAB_PROTOCOL)
         rednet.broadcast({ thrust_forward = 0, thrust_backward = 0, yaw_left = 0,
             yaw_right = 0, strafe_left = 0, strafe_right = 0 }, CFG.NAVCTRL_PROTOCOL)
-        rednet.broadcast({ alt = clamp(CFG.ALT_NEUTRAL + CFG.VEL_KI * velPID.integral, CFG.ALT_MIN, CFG.ALT_MAX) }, CFG.ALT_PROTOCOL)
+        local trimSteps = clamp(CFG.VEL_KI * velPID.integral, -CFG.ALT_SWING, CFG.ALT_SWING)
+        rednet.broadcast({
+            up   = clamp(round(CFG.ALT_NEUTRAL + trimSteps), CFG.ALT_MIN, CFG.ALT_MAX),
+            down = clamp(round(CFG.ALT_NEUTRAL - trimSteps), CFG.ALT_MIN, CFG.ALT_MAX),
+        }, CFG.ALT_PROTOCOL)
     end)
 end
 
 term.setBackgroundColour(colours.black); term.clear()
 local ok, err = pcall(parallel.waitForAny,
-    controlLoop, navReceiveLoop, altReceiveLoop, autolandReceiveLoop, displayLoop)
+    controlLoop, navReceiveLoop, altReceiveLoop, autolandReceiveLoop,
+    apSwitchReceiveLoop, manConReceiveLoop, displayLoop)
 shutdown()
 term.setBackgroundColour(colours.black); term.setTextColour(colours.white)
 term.setCursorPos(1, term.getSize() and select(2, term.getSize()) or 19)
