@@ -312,7 +312,7 @@ local function drawAI()
     local midX = math.floor(W / 2) + 1
     local midY = math.floor(H / 2) + 0
     local pxPerRad = H / 1.6                                  -- rows per rad of pitch
-    local slope    = math.tan(math.max(-1.3, math.min(1.3, roll))) * (2 / 3)  -- char aspect
+    local slope    = math.tan(math.max(-1.3, math.min(1.3, -roll))) * (2 / 3)  -- char aspect
     local pitchOff = pitch * pxPerRad                          -- +pitch (nose up) -> horizon down
 
     -- horizon, one blit per row (sky above, ground below, white line at the boundary)
