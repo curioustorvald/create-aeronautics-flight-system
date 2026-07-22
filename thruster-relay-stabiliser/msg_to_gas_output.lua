@@ -42,6 +42,11 @@ function stabil()
             redstone.setAnalogOutput("right", msg.right)
             redstone.setAnalogOutput("front", msg.front)
             redstone.setAnalogOutput("back", msg.back)
+        else
+            redstone.setAnalogOutput("left", 0)
+            redstone.setAnalogOutput("right", 0)
+            redstone.setAnalogOutput("front", 0)
+            redstone.setAnalogOutput("back", 0)
         end
         displayLine(2, string.format("Stabil: %2d  %2d  %2d  %2d", msg.left, msg.right, msg.front, msg.back))
     else

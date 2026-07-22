@@ -45,6 +45,9 @@ function strafe()
         if active then
             redstone.setAnalogOutput("left", msg.strafe_left)
             redstone.setAnalogOutput("right", msg.strafe_right)
+        else
+            redstone.setAnalogOutput("left", 0)
+            redstone.setAnalogOutput("right", 0)
         end
         displayLine(2, string.format("Strafe: %2d  %2d  active: %s", msg.strafe_left, msg.strafe_right, active))
     else
@@ -65,6 +68,9 @@ function alti()
         if active then
             redstone.setAnalogOutput(UP_SIDE, up)
             redstone.setAnalogOutput(DOWN_SIDE, down)
+        else
+            redstone.setAnalogOutput(UP_SIDE, 0)
+            redstone.setAnalogOutput(DOWN_SIDE, 0)
         end
         displayLine(3, string.format("Alti: up %2d  down %2d  active: %s", up, down, tostring(active)))
     else
@@ -72,6 +78,9 @@ function alti()
         if alt and mst then
             redstone.setAnalogOutput(UP_SIDE, ALT_NEUTRAL)
             redstone.setAnalogOutput(DOWN_SIDE, ALT_NEUTRAL)
+        else
+            redstone.setAnalogOutput(UP_SIDE, 0)
+            redstone.setAnalogOutput(DOWN_SIDE, 0)
         end
         displayLine(3, string.format("No alti signal, holding %d/%d", ALT_NEUTRAL, ALT_NEUTRAL))
     end

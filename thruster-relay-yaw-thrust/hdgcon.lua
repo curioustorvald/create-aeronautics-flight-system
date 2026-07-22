@@ -41,6 +41,11 @@ function headingThrust()
             redstone.setAnalogOutput("right", msg.yaw_right)
             redstone.setAnalogOutput("front", msg.thrust_forward)
             redstone.setAnalogOutput("back", msg.thrust_backward)
+        else
+            redstone.setAnalogOutput("left", 0)
+            redstone.setAnalogOutput("right", 0)
+            redstone.setAnalogOutput("front", 0)
+            redstone.setAnalogOutput("back", 0)
         end
         displayLine(2, string.format("Yaw: %2d  %2d  active: %s", msg.yaw_left, msg.yaw_right, active))
         displayLine(3, string.format("Thrust: %2d  %2d  active: %s", msg.thrust_forward, msg.thrust_backward, active))
