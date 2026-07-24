@@ -1,5 +1,5 @@
 -- Aer Togekiss Autopilot -- touch-oriented navigator / flight management page
---
+-- a
 -- This is the "external navigator" navcom.lua's own header talks about: navcom
 -- just flies whatever (x, z, type, name) it is last told and holds it when the
 -- link goes quiet; deciding WHAT to fly next, and telling the pilot about it on
@@ -45,18 +45,22 @@ local LANDING_FILE = "landing.db"
 -- past at a distance (fly-by fix), aerodromes/POIs mid-route get a moderate
 -- radius, and the very last point of a plan is drawn in tight since that is
 -- an actual arrival.
-local VOR_RADIUS         = 240
-local POI_ENROUTE_RADIUS = 120
-local POI_FINAL_RADIUS   = 60
+-- ARRIVED_FRACTION: inside this fraction of the final point's own pass radius, the phase sent
+-- to navcom becomes ARRIVED rather than TERMINAL. Scales with the same contextual radius as
+-- everything else here, so a VOR final gets a looser "arrived" than a POI final does.
+-- (Tabled, not one local each -- see the 200-locals note at the top of the tuning section.)
+local RAD = {
+    VOR_RADIUS         = 240,
+    POI_ENROUTE_RADIUS = 120,
+    POI_FINAL_RADIUS   = 60,
+    ARRIVED_FRACTION   = 0.25,
+}
 
--- Inside this fraction of the final point's own pass radius, the phase sent to
--- navcom becomes ARRIVED rather than TERMINAL. Scales with the same contextual
--- radius as everything else here, so a VOR final gets a looser "arrived" than
--- a POI final does, same as its pass radius is looser.
-local ARRIVED_FRACTION = 0.25
-
-local PING_INTERVAL = 1.0  -- s; how often the current target is re-broadcast
-local TICK_INTERVAL = 0.2  -- s; how often position vs target is checked
+local PING_INTERVAL = 0.2  -- s; how often the current target is re-broadcast. Matches TICK_INTERVAL
+                           -- because cruiseCap now carries a LIVE commanded speed (with the nose-
+                           -- alignment / cross-track gates folded in), not just a slow keep-alive --
+                           -- at 1 s the craft would accelerate for a whole second before a gate bit.
+local TICK_INTERVAL = 0.1  -- s; how often position vs target is checked
 
 -- AUTO-LANDING ---------------------------------------------------------------
 -- The FMS runs the landing state machine itself: it reads position, heading,
@@ -68,31 +72,22 @@ local TICK_INTERVAL = 0.2  -- s; how often position vs target is checked
 -- AUTOLAND_PROTOCOL). Landing sites and their approach heading/altitude come from
 -- landing.db.
 
--- Gate tolerances, straight from the landing procedure.
-local ALIGN_HDG_DEG = 15   -- step 1: coarse heading alignment before translating
-local FINE_HDG_DEG  = 2    -- step 3: heading this tight (with position) begins descent
-local POS_TOL_M     = 3    -- step 3: horizontal error this small begins descent
--- Once descending, allow a little more slop before we call it "drifted" and pause the
--- descent to re-capture the pad. The descent burn nods the craft, and the vertical
--- thrusters have no vectoring, so X/Z gets shoved; NAVCOM corrects it, but we stop
--- sinking while it does so we never touch down off the mark.
-local RECAPTURE_M       = 4
-local RECAPTURE_HDG_DEG = 8
-
--- Descent profile (m/s of descent). Quick up high, easing to a gentle rate for
--- touchdown. Descent authority is capped by the Stabiliser+Alt control's thrusters,
--- so keep DESCEND_FAST within what it can actually fly (cf. its DESCEND_MAX).
-local DESCEND_FAST  = 3.0   -- m/s while well above the pad
-local DESCEND_SLOW  = 0.8   -- m/s just before touchdown
-local FLARE_AGL     = 10.0   -- m above the pad where the flare (slow-down) begins
-local TOUCHDOWN_AGL = 1.0   -- m above the pad counted as touchdown
-
--- Touchdown is normally called from AGL alone (the pad altitude is known). This is a
--- backup for when that altitude is a touch off: if we are commanding descent but the
--- craft has stopped sinking (weight on the gear) near the pad, that is a landing.
-local TD_SETTLE_VEL   = 0.15  -- m/s; |VelY| below this counts as "not sinking"
-local TD_SETTLE_AGL   = 2.0   -- m; only trust the backup this close to the pad
-local TD_SETTLE_TICKS = 3     -- consecutive ticks of the above before declaring it
+-- Landing gates/profile, tabled rather than one local each (see the 200-locals note below).
+--   ALIGN/FINE_HDG_DEG, POS_TOL_M : step 1 coarse heading, then step 3's tight heading+position
+--                                   that begins the descent.
+--   RECAPTURE_*  : once descending, allow a little more slop before we call it "drifted" and
+--                  pause to re-capture the pad -- the descent burn nods the craft and the
+--                  vertical thrusters have no vectoring, so X/Z gets shoved.
+--   DESCEND_*/FLARE_AGL/TOUCHDOWN_AGL : descent profile, quick up high easing to a gentle rate.
+--                  Keep DESCEND_FAST within what the vertical channel can fly (its DESCEND_MAX).
+--   TD_SETTLE_*  : touchdown backup for when the pad altitude is a touch off -- if we are
+--                  commanding descent but the craft stopped sinking near the pad, that is a landing.
+local LG = {
+    ALIGN_HDG_DEG = 15, FINE_HDG_DEG = 2, POS_TOL_M = 3,
+    RECAPTURE_M = 4, RECAPTURE_HDG_DEG = 8,
+    DESCEND_FAST = 3.0, DESCEND_SLOW = 0.8, FLARE_AGL = 10.0, TOUCHDOWN_AGL = 1.0,
+    TD_SETTLE_VEL = 0.15, TD_SETTLE_AGL = 2.0, TD_SETTLE_TICKS = 3,
+}
 
 -- Heading measurement -- MUST match navcom.lua's HEADING_SIGN / HEADING_OFFSET,
 -- since this is the same aircraft and the same sublevel orientation. If navcom's
@@ -106,10 +101,77 @@ local HEADING_OFFSET = math.pi
 -- Pilot-selectable cruise-speed cap, sent to NAVCOM as msg.cruiseCap and applied only
 -- by its ENROUTE law (so the status-screen button "only works in cruising mode"). Three
 -- presets; COAST is a plain 0.
-local SPEED_FULL = 70   -- m/s "FULL" cruise (kept below navcom's CRUISE_SPEED ceiling)
-local SPEED_SLOW = 30   -- m/s "SLOW"; mirror of navcom.lua's APPROACH_SPEED
+local SPEED_FULL = 110   -- m/s "FULL" cruise (kept below navcom's CRUISE_SPEED ceiling) Choose fastest speed that does not outrun chunk loading
+local SPEED_SLOW = 40   -- m/s "SLOW"; mirror of navcom.lua's APPROACH_SPEED
 -- Cycle order when the button is tapped.
 local NEXT_CRUISE = { full = "slow", slow = "coast", coast = "full" }
+
+-- DYNAMIC CRUISE (kinematic braking envelope) --------------------------------
+-- SPEED_FULL / SPEED_SLOW are a soft max/min band. Each upcoming fix has a `need` speed (a turn's
+-- corner speed, or DC.FINAL_ARRIVE_SPEED at the destination; a gentle fly-by needs full cruise and
+-- never slows). dynamicSpeedTarget commands the fastest speed from which the craft can still bleed
+-- to every upcoming need in time, braking at DC.BRAKE_DECEL -- envelope sqrt(need^2 + 2*DECEL*dist),
+-- min over fixes scanned by DISTANCE (so a sharp turn several fixes ahead is caught early). Braking
+-- distance therefore scales with the speed to be shed (~v^2), which a flat proximity distance could
+-- not -- it braked too late up high and too early down low.
+--
+-- This function is the SINGLE source of commanded speed: the manoeuvre gates (nose alignment,
+-- cross-track) are applied HERE too, not in the UAC, so the CMD on the HSI is exactly what the
+-- aircraft is flown to. The UAC just tracks it as cruiseCap (schedSpeed=true).
+-- ROUTE START: point the nose at the first target BEFORE applying any throttle. While the
+-- heading error to the target exceeds LG.ALIGN_HDG_DEG the commanded speed is 0, so the craft
+-- simply yaws onto the bearing instead of accelerating off on the old heading and arcing round.
+-- Cleared for good once aligned (per plan, not per leg).
+--
+-- ADVANCE_*_MULT -- turn-aware pass radius (corner cutting): advance to the next leg early on a
+-- gentle turn so the craft flies a smooth fly-by without having to reach the fix, and hold in
+-- tighter on a sharp turn so it does not overshoot. 1.0 / 1.0 disables (plain radiusFor).
+-- Intermediate waypoints only; the destination is always drawn in tight.
+--
+-- NOTE (200-locals): CC's Lua VM caps a function at 200 locals and counts a nested function's
+-- own locals ON TOP of the enclosing scope's, so late/large functions (drawLandingHSI etc.) blow
+-- up once the file has too many TOP-LEVEL locals. Keep tuning knobs in tables like this one --
+-- add new ones as DC.X, never `local X`. (luac -p does NOT model this; it will pass regardless.)
+local DC = {
+    DYNAMIC_CRUISE = true,         -- false -> fall back to the flat pilot cruise cap
+    CURVE          = true,         -- en-route: steer to a carrot on a Catmull-Rom curve through the
+                                   -- waypoints (smooth continuous bearing, rounded corners) instead of
+                                   -- straight at the fix. false -> aim straight at the waypoint.
+    CURVE_LOOKAHEAD = 400,         -- m: how far ahead on the curve the carrot sits. Larger = smoother /
+                                   -- cuts corners more; smaller = tracks the waypoints tighter.
+    CURVE_DEV_MAX  = 120,          -- m: soft cap on how far the curve may bow OFF the straight leg. The
+                                   -- Catmull-Rom bow scales with leg length (~14 m on a 200 m leg, ~270 m
+                                   -- on a 4 km leg), so this reins in km-apart waypoints without touching
+                                   -- finely-placed ones (whose bow is already << this). Smooth, endpoint-
+                                   -- exact, pulls only toward the chord. Raise to allow rounder corners.
+    A_LAT_MAX      = 20,           -- m/s^2: max lateral accel used for the CURVATURE speed limit. Speed
+                                   -- through a bend of radius R is sqrt(A_LAT_MAX*R). Higher = faster
+                                   -- through bends (needs more strafe/bank authority); lower = slower.
+    CURVE_V_MIN    = 10,           -- m/s: floor on the curvature limit, so a Catmull-Rom curvature spike
+                                   -- at a sharp/close waypoint can't command a near-stop mid-route.
+    BRAKE_DECEL    = 8,            -- m/s^2: deceleration the speed profile plans with. Braking distance
+                                   -- to a slow point = (v^2 - v_target^2)/(2*DECEL): at 3 it was ~2000 m
+                                   -- to a stop from 110 (half of a 4000 m leg spent slowing!); 8 -> ~750 m.
+                                   -- The profile ALREADY cruises the middle of a long leg -- this only
+                                   -- sets how LATE/short the braking into a turn or the destination is.
+                                   -- Set it to what the craft can REALLY brake at: too high and it
+                                   -- overshoots the turn/pad (arrives hot); too low and it crawls in early.
+    TURN_GENTLE    = math.rad(12), -- turn <= this: full advance radius (fly-by); see ADVANCE_*_MULT.
+    TURN_SHARP     = math.rad(90), -- turn >= this: tight advance radius. (Speed is curvature-based now.)
+    FINAL_ARRIVE_SPEED = 12,       -- commanded speed AT the destination; TERMINAL takes over
+    ACCEL_MAX      = 8,            -- m/s^2: max rate the COMMANDED speed may RISE (NAV.cmdSpeed slew).
+                                   -- Eases the throttle up OUT of a turn instead of jumping to cruise
+                                   -- while still yawing onto the new leg. Lower = gentler spool-up.
+    DECEL_MAX      = 12,           -- m/s^2: max rate the COMMANDED speed may FALL. Rounds off sudden
+                                   -- steps in the raw envelope into a smooth curve. Keep >= BRAKE_DECEL
+                                   -- so real slowdowns aren't delayed; lower = smoother but slows later.
+    XTK_SLOW_LO    = 20,           -- m off the leg: below this, no cross-track slowdown
+    XTK_SLOW_HI    = 80,           -- m off the leg: at/above this, the full XTK_SLOW_MIN cut
+    XTK_SLOW_MIN   = 0.30,         -- floor speed fraction when far off the leg (fly in to intercept)
+    ADVANCE_GENTLE_MULT = 1.3333,  -- gentle turn: advance this * base pass radius (cut the corner)
+    ADVANCE_SHARP_MULT  = 0.7,     -- sharp turn: hold in to this * base radius
+    TURN_GAMMA = 1.732 -- the nonlinearity for slowdown per angle. 1=linear, <1=harder break on small turns, >1=lax breaking on small turns
+}
 
 -- RESUME MID-ROUTE -----------------------------------------------------------
 -- FLY ROUTE can join a plan at the nearest sensible waypoint instead of always flying it
@@ -627,7 +689,12 @@ local NAV = {
     landSite  = nil,    -- snapshot {name, dir, alt, type} taken when the plan is set, so
                         -- editing landing.db mid-flight cannot move a landing in progress
     -- Extra pose, read every tick for the landing state machine.
-    posY = 0, velY = 0, heading = 0, haveHeading = false,
+    posY = 0, velY = 0, heading = 0, haveHeading = false, groundSpeed = 0,
+    cmdSpeed = 0,   -- rise-rate-limited commanded speed (dynamicSpeedTarget through DC.ACCEL_MAX);
+                    -- the value actually sent as cruiseCap and shown as CMD, updated once per navTick.
+    -- Route start: hold throttle at 0 until the nose is within LG.ALIGN_HDG_DEG of the first target.
+    aligning = false,
+    aimX = nil, aimZ = nil,   -- the point broadcastCurrent last steered to (carrot or waypoint)
 }
 
 -- Auto-landing sequence state. Distinct from NAV: the plan can be flown (NAV) long
@@ -652,23 +719,29 @@ local LND = {
 -- by radiusFor and phaseFor so the two stay in step: a VOR sitting in that
 -- tier gets the same tighter tolerance that also decides when APPROACH phase
 -- kicks in.
+-- True only on the FINAL leg (the actual approach to the destination). Previously this also
+-- covered the PENULTIMATE leg, but that made a fly-THROUGH second-to-last waypoint act like an
+-- arrival -- dropping curve-following and, if the scheduled-speed flag lapsed, capping at the
+-- UAC's APPROACH_SPEED (30). A mid-route fix should stay ENROUTE (curve + cruise); only the very
+-- last leg approaches the destination, and the curvature speed profile already brakes for the
+-- endpoint on its own (endpoint = FINAL_ARRIVE_SPEED) whether the phase says APPROACH or not.
 local function isApproachLeg()
     local total = #NAV.points
-    return total >= 2 and NAV.index >= total - 1
+    return total >= 2 and NAV.index >= total
 end
 
--- VOR_RADIUS is sized for a cruise-speed fly-by, but a VOR that lands on the
+-- RAD.VOR_RADIUS is sized for a cruise-speed fly-by, but a VOR that lands on the
 -- penultimate or final leg is being approached slowly, not overflown at
 -- speed -- holding it to that wide a tolerance there just delays the
 -- slowdown/position-hold that phase is already supposed to be triggering. So
 -- in that tier a VOR uses the same tighter radius a mid-route POI would.
 local function radiusFor(pt, isFinal)
     if pt.kind == "vor" then
-        if isApproachLeg() then return POI_ENROUTE_RADIUS end
-        return VOR_RADIUS
+        if isApproachLeg() then return RAD.POI_ENROUTE_RADIUS end
+        return RAD.VOR_RADIUS
     end
-    if isFinal then return POI_FINAL_RADIUS end
-    return POI_ENROUTE_RADIUS
+    if isFinal then return RAD.POI_FINAL_RADIUS end
+    return RAD.POI_ENROUTE_RADIUS
 end
 
 local function legLength(a, b)
@@ -716,7 +789,7 @@ end
 --              not close yet
 --   TERMINAL - inside the final point's pass radius: navcom switches from
 --              along-track-plus-line-hold to direct position-hold
---   ARRIVED  - inside ARRIVED_FRACTION of that same radius
+--   ARRIVED  - inside RAD.ARRIVED_FRACTION of that same radius
 -- A single-point direct-to has no penultimate leg, so it stays ENROUTE (full
 -- cruise) until it is genuinely close, rather than crawling the whole way.
 local function phaseFor(dist)
@@ -726,7 +799,7 @@ local function phaseFor(dist)
     local isFinal = (NAV.index == total)
     if isFinal then
         local radius = radiusFor(tgt, true)
-        if dist <= radius * ARRIVED_FRACTION then
+        if dist <= radius * RAD.ARRIVED_FRACTION then
             return "ARRIVED"
         elseif dist <= radius then
             return "TERMINAL"
@@ -758,6 +831,239 @@ local function cruiseModeLabel()
     return "FULL " .. SPEED_FULL
 end
 
+-- Compass-frame direction of the leg a->b, in navcom's bearing frame (atan2(dx, dz)).
+local function legBearing(ax, az, bx, bz)
+    return atan2(bx - ax, bz - az)
+end
+
+-- Turn angle (radians, 0..pi) the plan makes AT waypoint i: the course change between the leg
+-- arriving at i and the leg leaving it. The arriving leg of the current target starts from the
+-- aircraft (no flown-from fix yet); later waypoints use the previous fix. The final point (no
+-- outgoing leg) is 0.
+local function turnAngleAt(i)
+    local p = NAV.points
+    local total = #p
+    if i < 1 or i >= total then return 0 end            -- final / out of range: no outgoing leg
+    local ax, az
+    if i - 1 >= 1 then ax, az = p[i-1].x, p[i-1].z
+    else ax, az = NAV.posX, NAV.posZ end                 -- first leg: arrive from the aircraft
+    local inB  = legBearing(ax, az, p[i].x, p[i].z)
+    local outB = legBearing(p[i].x, p[i].z, p[i+1].x, p[i+1].z)
+    return math.abs(wrapPi(outB - inB))
+end
+
+-- CURVE: the Catmull-Rom trajectory through the waypoints, shared by the carrot (bearing) guidance
+-- and the curvature-based speed profile -- so the path the craft flies and the speed it flies are
+-- ONE computer-drawn trajectory. Global parameter g: floor = segment pts[seg]->pts[seg+1], frac =
+-- position within it; neighbour points clamped at the route ends.
+local CURVE = {}
+
+-- CENTRIPETAL (alpha=0.5) Catmull-Rom, Barry-Goldman evaluation. Unlike the uniform (alpha=0)
+-- form, it never makes cusps or self-intersecting loops on unevenly-spaced or sharp waypoints
+-- (confirmed on real paths). Knot spacing = chord^0.5; the point is a pyramid of lerps over knots.
+function CURVE.at(g)
+    local pts, n = NAV.points, #NAV.points
+    local seg = math.floor(g)
+    if seg < 1 then seg = 1 elseif seg > n - 1 then seg = n - 1 end
+    local u = math.max(0, math.min(1, g - seg))
+    local p0, p1, p2, p3 = pts[math.max(1, seg-1)], pts[seg], pts[seg+1], pts[math.min(n, seg+2)]
+    local function knot(a, b)
+        local dx, dz = b.x - a.x, b.z - a.z
+        local k = math.sqrt(math.sqrt(dx*dx + dz*dz))    -- |b-a|^0.5 (centripetal)
+        return (k > 1e-6) and k or 1e-6                   -- keep knots distinct on duplicate points
+    end
+    local t0 = 0
+    local t1 = t0 + knot(p0, p1)
+    local t2 = t1 + knot(p1, p2)
+    local t3 = t2 + knot(p2, p3)
+    local t  = t1 + u * (t2 - t1)
+    local function lp(ta, tb, a, b) return (a*(tb - t) + b*(t - ta)) / (tb - ta) end
+    local a1 = lp(t0,t1, p0.x, p1.x); local a2 = lp(t1,t2, p1.x, p2.x); local a3 = lp(t2,t3, p2.x, p3.x)
+    local x  = lp(t1,t2, lp(t0,t2, a1, a2), lp(t1,t3, a2, a3))
+    a1 = lp(t0,t1, p0.z, p1.z); a2 = lp(t1,t2, p1.z, p2.z); a3 = lp(t2,t3, p2.z, p3.z)
+    local z  = lp(t1,t2, lp(t0,t2, a1, a2), lp(t1,t3, a2, a3))
+    -- Soft-cap the off-course BOW: limit the point's deviation from the straight leg to ~CURVE_DEV_MAX
+    -- so a km-long segment can't swing wide, while short segments (bow << cap) pass through unchanged.
+    -- Smooth, pulls only toward the chord (no loops), and exactly 0 at the waypoints (still passes through).
+    local lx, lz = p1.x + u*(p2.x - p1.x), p1.z + u*(p2.z - p1.z)
+    local dx, dz = x - lx, z - lz
+    local dev = math.sqrt(dx*dx + dz*dz)
+    if dev > 1e-6 then
+        local sc = 1 / math.sqrt(1 + (dev / DC.CURVE_DEV_MAX)^2)   -- ~1 for small dev, ->cap/dev for large
+        x, z = lx + dx*sc, lz + dz*sc
+    end
+    return x, z
+end
+
+-- The aircraft's parameter on the curve (projection onto the current straight leg).
+function CURVE.craftG()
+    local pts = NAV.points
+    local seg = math.max(1, NAV.index - 1)
+    local a, b = pts[seg], pts[seg + 1]
+    if not (a and b) then return seg end
+    local dx, dz = b.x - a.x, b.z - a.z
+    local ll = dx * dx + dz * dz
+    local u0 = (ll > 1e-9) and math.max(0, math.min(1, ((NAV.posX - a.x)*dx + (NAV.posZ - a.z)*dz) / ll)) or 0
+    return seg + u0
+end
+
+-- HSI course from the curve at the aircraft's position: the tangent bearing (DTK) and the signed
+-- perpendicular deviation (+=right of course, same sign as the leg CDI), or nil if unusable. So
+-- the dial shows the smoothed path as the course, reading on-course when the craft is on the curve.
+function CURVE.course()
+    if #NAV.points < 2 then return nil end
+    local g = CURVE.craftG()
+    local cx, cz = CURVE.at(g)
+    local fx, fz = CURVE.at(math.min(g + 0.01, #NAV.points))
+    fx, fz = fx - cx, fz - cz
+    local tl = math.sqrt(fx*fx + fz*fz)
+    if tl < 1e-6 then return nil end
+    return atan2(fx, fz), (fx*(NAV.posZ - cz) - fz*(NAV.posX - cx)) / tl
+end
+
+-- Menger curvature (1/radius, 1/m) of three points -- 0 if degenerate/collinear.
+function CURVE.curvature(x1, z1, x2, z2, x3, z3)
+    local cross = math.abs((x2-x1)*(z3-z1) - (x3-x1)*(z2-z1))          -- 2 * triangle area
+    local a = math.sqrt((x3-x2)*(x3-x2) + (z3-z2)*(z3-z2))
+    local b = math.sqrt((x3-x1)*(x3-x1) + (z3-z1)*(z3-z1))
+    local c = math.sqrt((x2-x1)*(x2-x1) + (z2-z1)*(z2-z1))
+    local d = a * b * c
+    return (d > 1e-9) and (2 * cross / d) or 0
+end
+
+-- Carrot: `lookahead` m ahead of the aircraft along the curve (guidance / bearing). Straight to
+-- the first fix at route start (no curve behind it yet).
+function CURVE.carrot(lookahead)
+    local pts, n = NAV.points, #NAV.points
+    if NAV.index < 2 or n < 2 then
+        local p = pts[math.max(1, math.min(n, NAV.index))]
+        return p.x, p.z
+    end
+    local g = CURVE.craftG()
+    local px, pz = CURVE.at(g)
+    local acc = 0
+    while acc < lookahead and g < n do
+        g = math.min(g + 0.02, n)
+        local nx, nz = CURVE.at(g)
+        acc = acc + math.sqrt((nx-px)*(nx-px) + (nz-pz)*(nz-pz))
+        px, pz = nx, nz
+    end
+    return px, pz
+end
+
+-- Curvature-limited commanded speed: walk the curve forward from the aircraft and run a FORWARD
+-- BRAKING PASS. The local limit at each point is sqrt(A_LAT_MAX / kappa) (a tight bend is slow),
+-- floored at CURVE_V_MIN so a curvature spike can't stall us; the route END limits to
+-- FINAL_ARRIVE_SPEED. The fastest we can be NOW is min over the scan of sqrt(vlim^2 + 2*DECEL*s),
+-- so speed bleeds off BEFORE a bend and holds cruise on straights -- the speed curve OF the path.
+function CURVE.speed(capBase)
+    local n = #NAV.points
+    if n < 2 then return capBase end
+    local scan = capBase * capBase / (2 * DC.BRAKE_DECEL)          -- full-cruise braking distance
+    local best = capBase
+    local g = CURVE.craftG()
+    local x1, z1 = CURVE.at(g)
+    -- seed s with the craft -> curve-start distance: ~0 mid-route (we sit on the curve), but real
+    -- at route start where we're still far from the first fix -- so a bend just past it isn't
+    -- treated as right on top of us.
+    local s = math.sqrt((NAV.posX-x1)*(NAV.posX-x1) + (NAV.posZ-z1)*(NAV.posZ-z1))
+    g = math.min(g + 0.02, n)
+    local x2, z2 = CURVE.at(g)
+    s = s + math.sqrt((x2-x1)*(x2-x1) + (z2-z1)*(z2-z1))           -- arc length to x2 (the sample point)
+    while s < scan and g < n do
+        g = math.min(g + 0.02, n)
+        local x3, z3 = CURVE.at(g)
+        local vlim
+        if g >= n then
+            vlim = DC.FINAL_ARRIVE_SPEED                           -- the route end point
+        else
+            local k = CURVE.curvature(x1, z1, x2, z2, x3, z3)
+            vlim = (k > 1e-6) and math.max(DC.CURVE_V_MIN, math.sqrt(DC.A_LAT_MAX / k)) or capBase
+        end
+        local allow = math.sqrt(vlim * vlim + 2 * DC.BRAKE_DECEL * s)
+        if allow < best then best = allow end
+        s = s + math.sqrt((x3-x2)*(x3-x2) + (z3-z2)*(z3-z2))
+        x1, z1, x2, z2 = x2, z2, x3, z3
+    end
+    return clamp(best, 0, capBase)
+end
+
+-- Heading error (rad) from the nose to the CURRENT target, or nil if we lack a fix/heading.
+local function targetHeadingErr()
+    if not (NAV.active and NAV.haveHeading) then return nil end
+    -- Error to the point we ACTUALLY steer toward -- the carrot on the curve (stored by
+    -- broadcastCurrent) -- NOT the raw waypoint. Otherwise the align gate never clears while the
+    -- craft correctly chases a carrot whose bearing differs from the waypoint's: alignment sticks.
+    local ax, az = NAV.aimX, NAV.aimZ
+    if not ax then
+        local tgt = NAV.points[NAV.index]
+        if not tgt then return nil end
+        ax, az = tgt.x, tgt.z
+    end
+    return wrapPi(atan2(ax - NAV.posX, az - NAV.posZ) - NAV.heading)
+end
+
+-- Cross-track offset (m) of the active leg (prev -> current target); + = right of course.
+-- 0 when there is no previous fix to form a leg (a direct-to has no line to hold).
+local function currentXtk()
+    local tgt, prev = NAV.points[NAV.index], NAV.points[NAV.index - 1]
+    if not (tgt and prev) then return 0 end
+    local lx, lz = tgt.x - prev.x, tgt.z - prev.z
+    local ll = math.sqrt(lx * lx + lz * lz)
+    if ll <= 1e-3 then return 0 end
+    return (lx / ll) * (NAV.posZ - prev.z) - (lz / ll) * (NAV.posX - prev.x)
+end
+
+-- THE commanded along-track speed = the CURVATURE speed profile of the smoothed path (CURVE.speed:
+-- slow through tight bends, cruise on straights, bled off IN ADVANCE by a forward braking pass),
+-- plus the destination arrival brake on the final leg, trimmed by the cross-track gate. Because it
+-- reads the SAME Catmull-Rom curve the bearing follows, the speed and the path are one trajectory --
+-- the speed slows exactly as much as the rounded curve needs, not for the raw waypoint angle. Zero
+-- while aligning; bounded by the pilot's cap. (A_LAT_MAX = how fast through a bend; BRAKE_DECEL =
+-- how early it starts; CURVE_V_MIN = floor at a curvature spike.)
+local function dynamicSpeedTarget()
+    local capBase = cruiseCapValue()
+    if not DC.DYNAMIC_CRUISE or capBase <= 0 then return capBase end
+    local total = #NAV.points
+    if total == 0 then return capBase end
+    if NAV.aligning then return 0 end          -- route start: yaw onto the bearing before throttling
+
+    local best = CURVE.speed(capBase)          -- curvature forward braking pass (bends + the endpoint)
+
+    -- Destination arrival on the FINAL leg (also covers a single-point direct-to, where the curve
+    -- has nothing to walk): brake straight-line to FINAL_ARRIVE_SPEED at the last fix.
+    if NAV.index == total then
+        local last = NAV.points[total]
+        local dx, dz = last.x - NAV.posX, last.z - NAV.posZ
+        local dd = math.sqrt(dx * dx + dz * dz)
+        best = math.min(best, math.sqrt(DC.FINAL_ARRIVE_SPEED * DC.FINAL_ARRIVE_SPEED + 2 * DC.BRAKE_DECEL * dd))
+    end
+
+    -- Cross-track: well off COURSE -> slow to fly IN and intercept. When curve-following, "course"
+    -- is the CURVE, not the straight leg: a craft correctly ON the curve is off the LEG by the bow
+    -- (up to CURVE_DEV_MAX), which would FALSELY trip this. Measure deviation from the curve there.
+    local xtk
+    if DC.CURVE and NAV.phase == "ENROUTE" and NAV.index >= 2 and NAV.index ~= total then
+        local _, cxtk = CURVE.course()
+        xtk = math.abs(cxtk or 0)
+    else
+        xtk = math.abs(currentXtk())
+    end
+    if xtk > DC.XTK_SLOW_LO then
+        best = best * clamp(1 - (xtk - DC.XTK_SLOW_LO) / (DC.XTK_SLOW_HI - DC.XTK_SLOW_LO), DC.XTK_SLOW_MIN, 1)
+    end
+    return clamp(best, 0, capBase)
+end
+
+-- Pass radius for the ADVANCE decision, turn-aware (see ADVANCE_*_MULT). Gentle turn -> larger
+-- (cut the corner early / fly-by); sharp -> tighter. The destination stays at the base radius.
+local function advanceRadiusFor(i, tgt, isFinal)
+    local base = radiusFor(tgt, isFinal)
+    if isFinal then return base end
+    local t = clamp((turnAngleAt(i) - DC.TURN_GENTLE) / (DC.TURN_SHARP - DC.TURN_GENTLE), 0, 1)
+    return base * (DC.ADVANCE_GENTLE_MULT + (DC.ADVANCE_SHARP_MULT - DC.ADVANCE_GENTLE_MULT) * t)
+end
+
 local function broadcastCurrent()
     if LND.active then
         -- Once touched down, NAVCOM has already been cancelled and should stay coasting
@@ -776,11 +1082,25 @@ local function broadcastCurrent()
     local tgt = NAV.points[NAV.index]
     if not tgt then return end
     local isFinal = (NAV.index == #NAV.points)
-    local ptype = isFinal and "end" or tgt.kind
+    -- En-route we hand the UAC a carrot on the smoothed curve (smooth bearing, rounded corners).
+    -- The precise capture phases (APPROACH/TERMINAL/ARRIVED) and the final fix keep aiming at the
+    -- real waypoint, unchanged -- that's a different, precise job and it works.
+    local tx, tz, ptype, carrot
+    if DC.CURVE and NAV.phase == "ENROUTE" and not isFinal then
+        tx, tz = CURVE.carrot(DC.CURVE_LOOKAHEAD)
+        ptype, carrot = "carrot", true
+    else
+        tx, tz = tgt.x, tgt.z
+        ptype = isFinal and "end" or tgt.kind
+    end
+    NAV.aimX, NAV.aimZ = tx, tz    -- the point we're actually steering to; read by the align gate + HSI
     rednet.broadcast({
-        x = tgt.x, y = tgt.z, type = ptype, name = tgt.name,
+        x = tx, y = tz, type = ptype, name = tgt.name,
         phase = NAV.phase or "ENROUTE",
-        cruiseCap = cruiseCapValue(),   -- NAVCOM applies it only in ENROUTE
+        cruiseCap = NAV.cmdSpeed,  -- the rise-rate-limited commanded along-track speed (set in navTick)
+        schedSpeed = DC.DYNAMIC_CRUISE,       -- tell the UAC this cap is a speed to TRACK, not just a
+                                           -- ceiling, so it drops its own decelerate-at-every-fix law
+        carrot = carrot,           -- UAC: pure-pursue this moving point (velocity-vector, no cross-track)
     }, APNAV_PROTOCOL)
 end
 
@@ -806,13 +1126,13 @@ local function broadcastVertical()
     end
 end
 
--- Descent-rate schedule: quick well above the pad, easing linearly to DESCEND_SLOW as
+-- Descent-rate schedule: quick well above the pad, easing linearly to LG.DESCEND_SLOW as
 -- the flare height is reached, and to zero at touchdown height. Returns a rate <= 0.
 local function descentRateFor(agl)
-    if agl <= TOUCHDOWN_AGL then return 0 end
-    if agl >= FLARE_AGL then return -DESCEND_FAST end
-    local f = (agl - TOUCHDOWN_AGL) / (FLARE_AGL - TOUCHDOWN_AGL)   -- 0 at pad .. 1 at flare top
-    return -(DESCEND_SLOW + (DESCEND_FAST - DESCEND_SLOW) * f)
+    if agl <= LG.TOUCHDOWN_AGL then return 0 end
+    if agl >= LG.FLARE_AGL then return -LG.DESCEND_FAST end
+    local f = (agl - LG.TOUCHDOWN_AGL) / (LG.FLARE_AGL - LG.TOUCHDOWN_AGL)   -- 0 at pad .. 1 at flare top
+    return -(LG.DESCEND_SLOW + (LG.DESCEND_FAST - LG.DESCEND_SLOW) * f)
 end
 
 -- Arm the landing sequence. Called once, when a landAtEnd plan has genuinely arrived at
@@ -854,11 +1174,11 @@ local function landingTick()
     -- up from the same phase.
     if LND.paused then return end
 
-    local alignedCoarse = (not LND.holdHeading) or (math.abs(hdgErr) <= math.rad(ALIGN_HDG_DEG))
-    local alignedFine   = (posErr <= POS_TOL_M)
-        and ((not LND.holdHeading) or (math.abs(hdgErr) <= math.rad(FINE_HDG_DEG)))
-    local drifted       = (posErr > RECAPTURE_M)
-        or (LND.holdHeading and math.abs(hdgErr) > math.rad(RECAPTURE_HDG_DEG))
+    local alignedCoarse = (not LND.holdHeading) or (math.abs(hdgErr) <= math.rad(LG.ALIGN_HDG_DEG))
+    local alignedFine   = (posErr <= LG.POS_TOL_M)
+        and ((not LND.holdHeading) or (math.abs(hdgErr) <= math.rad(LG.FINE_HDG_DEG)))
+    local drifted       = (posErr > LG.RECAPTURE_M)
+        or (LND.holdHeading and math.abs(hdgErr) > math.rad(LG.RECAPTURE_HDG_DEG))
 
     if LND.phase == "ALIGN" then
         -- Step 1: NAVCOM holds the pad and swings to the landing heading; hold altitude.
@@ -880,16 +1200,16 @@ local function landingTick()
         else
             LND.vs = descentRateFor(agl)
         end
-        LND.phase = (agl <= FLARE_AGL) and "FLARE" or "DESCEND"
+        LND.phase = (agl <= LG.FLARE_AGL) and "FLARE" or "DESCEND"
 
         -- Touchdown: primarily from AGL (pad altitude is known); backed up by "commanding
         -- descent but no longer sinking" for when the configured pad altitude is a bit off.
-        local touchdown = (agl <= TOUCHDOWN_AGL)
-        if not touchdown and LND.vs < 0 and agl <= TD_SETTLE_AGL
-                and math.abs(NAV.velY) < TD_SETTLE_VEL then
+        local touchdown = (agl <= LG.TOUCHDOWN_AGL)
+        if not touchdown and LND.vs < 0 and agl <= LG.TD_SETTLE_AGL
+                and math.abs(NAV.velY) < LG.TD_SETTLE_VEL then
             LND.settle = LND.settle + 1
-            if LND.settle >= TD_SETTLE_TICKS then touchdown = true end
-        elseif LND.vs < 0 and math.abs(NAV.velY) >= TD_SETTLE_VEL then
+            if LND.settle >= LG.TD_SETTLE_TICKS then touchdown = true end
+        elseif LND.vs < 0 and math.abs(NAV.velY) >= LG.TD_SETTLE_VEL then
             LND.settle = 0
         end
 
@@ -932,6 +1252,7 @@ local function setDirectTo(name, landAtEnd)
     LND.active = false
     LND.phase  = "OFF"
     NAV.cruiseMode = "full"   -- a fresh plan starts at full cruise, never a stale COAST
+    NAV.aligning   = true     -- ...and points the nose at the first target before throttling up
     NAV.planName = landAtEnd and "LAND" or "DIRECT"
     NAV.points = {{name = p.name, x = p.x, z = p.z, kind = p.kind}}
     NAV.index = 1
@@ -993,11 +1314,163 @@ local function setRoute(name, resume)
     LND.active = false
     LND.phase  = "OFF"
     NAV.cruiseMode = "full"   -- a fresh plan starts at full cruise, never a stale COAST
+    NAV.aligning   = true     -- ...and points the nose at the first target before throttling up
     NAV.planName = name
     NAV.points = pts
     NAV.index = resume and bestResumeIndex(pts) or 1
     NAV.active = true
     -- A route ending at a landing site auto-lands there on arrival (fully automatic).
+    setLandFinal(pts[#pts].name, true)
+    updatePhase()
+    broadcastCurrent()
+    return true
+end
+
+-- AUTO-ROUTER (destination-driven multi-course planner) -------------------------
+-- "FLY ROUTE > TO DESTINATION": rather than the pilot naming one course, they name a
+-- destination hub and the FMS solves a flight plan to it from the aircraft's current
+-- position, stitching published courses together through the waypoints they share. There is
+-- no direct KST-TMU course, but KST-WAU and WAU-TMU exist and meet at WAU, so KST->TMU solves
+-- as KST..WAU..TMU. The result is one ordered point list, flown (and joined mid-route) exactly
+-- like any other plan -- so everything downstream (phase, pass radii, resume, auto-land) is
+-- reused unchanged; only the point list is chosen by search instead of by name.
+
+-- Everything the auto-router owns lives on this one table rather than a dozen separate
+-- top-level locals -- the main chunk is close to Lua's 200-local-per-function ceiling, and a
+-- table costs one slot while holding the whole feature (functions + its UI state). Fields are
+-- resolved at call time, so definition order among them does not matter.
+local RTR = { destPage = 1, dest = nil }   -- dest = the hub currently being solved/previewed
+
+-- The interchange hubs: the first and last point of every course. These are the only points
+-- offered as destinations (all are landing sites) and the ones named in the route summary.
+function RTR.routeHubNames()
+    local set = {}
+    for _, cname in ipairs(COURSE_ORDER) do
+        local c = COURSES[cname]
+        if c and #c.seq >= 1 then
+            local a, b = c.seq[1], c.seq[#c.seq]
+            if POINTS[a] then set[a] = true end
+            if POINTS[b] then set[b] = true end
+        end
+    end
+    return set
+end
+
+-- The route graph: nodes are points used by some course, edges are consecutive waypoint pairs
+-- weighted by straight-line leg distance. Edges are UNDIRECTED -- a leg can be flown either way
+-- (and reverse courses exist for every route anyway), so a waypoint that two courses both pass
+-- through becomes a shared interchange node and a path can cut from one course to another
+-- wherever they meet, not only at hub aerodromes. adj is name -> { neighbourName -> legDist }.
+function RTR.buildRouteGraph()
+    local adj = {}
+    local function link(a, b)
+        local pa, pb = POINTS[a], POINTS[b]
+        if not pa or not pb or a == b then return end
+        local dx, dz = pb.x - pa.x, pb.z - pa.z
+        local w = math.sqrt(dx * dx + dz * dz)
+        adj[a] = adj[a] or {}
+        adj[b] = adj[b] or {}
+        -- a leg shared by several courses collapses to one edge (keep the shortest, though the
+        -- geometric length is identical whichever course it came from)
+        if not adj[a][b] or w < adj[a][b] then adj[a][b] = w end
+        if not adj[b][a] or w < adj[b][a] then adj[b][a] = w end
+    end
+    for _, cname in ipairs(COURSE_ORDER) do
+        local c = COURSES[cname]
+        if c then
+            for i = 1, #c.seq - 1 do link(c.seq[i], c.seq[i + 1]) end
+        end
+    end
+    return adj
+end
+
+-- Where the aircraft joins the network: the nearest node to the current fix. The first leg
+-- flown is a direct hop to it; from there the plan follows published legs. nil without a fix.
+function RTR.nearestGraphNode(adj)
+    if not NAV.haveFix then return nil end
+    local best, bestD = nil, math.huge
+    for name in pairs(adj) do
+        local p = POINTS[name]
+        if p then
+            local dx, dz = p.x - NAV.posX, p.z - NAV.posZ
+            local d = dx * dx + dz * dz   -- squared: only the argmin matters
+            if d < bestD then bestD, best = d, name end
+        end
+    end
+    return best
+end
+
+-- Dijkstra over the route graph (a few dozen nodes -- a linear-scan settle is plenty, no heap
+-- needed). Returns the point-name array from startName to goalName inclusive plus the total
+-- path distance, or nil if the goal is unreachable (the UI errors out on that, per spec).
+function RTR.solvePath(adj, startName, goalName)
+    if not adj[startName] or not adj[goalName] then return nil end
+    if startName == goalName then return {startName}, 0 end
+    local dist, prev, done = {}, {}, {}
+    for name in pairs(adj) do dist[name] = math.huge end
+    dist[startName] = 0
+    while true do
+        -- settle the unvisited node with the smallest tentative distance
+        local u, uD = nil, math.huge
+        for name, d in pairs(dist) do
+            if not done[name] and d < uD then uD, u = d, name end
+        end
+        if not u or uD == math.huge then break end   -- nothing left reachable
+        if u == goalName then break end               -- shortest to the goal is now settled
+        done[u] = true
+        for v, w in pairs(adj[u]) do
+            if not done[v] then
+                local nd = uD + w
+                if nd < dist[v] then dist[v] = nd; prev[v] = u end
+            end
+        end
+    end
+    if dist[goalName] == math.huge then return nil end
+    local path, cur = {}, goalName
+    while cur do
+        table.insert(path, 1, cur)
+        cur = prev[cur]
+    end
+    if path[1] ~= startName then return nil end       -- guard: must trace back to the start
+    return path, dist[goalName]
+end
+
+-- Solve a plan from the current position to destName. Returns the point-name path, the total
+-- path distance, and the join node -- or nil plus an error message. Pure (no NAV mutation), so
+-- the preview screen can call it live on every redraw.
+function RTR.solveRoute(destName)
+    if not destName or not POINTS[destName] then return nil, nil, nil, "Unknown destination" end
+    if not NAV.haveFix then return nil, nil, nil, "No position fix" end
+    local adj = RTR.buildRouteGraph()
+    local start = RTR.nearestGraphNode(adj)
+    if not start then return nil, nil, nil, "No route network" end
+    local path, total = RTR.solvePath(adj, start, destName)
+    if not path then return nil, nil, nil, "No route to " .. destName end
+    return path, total, start, nil
+end
+
+-- Commit a solved destination as the active plan: fly it (joining mid-route via
+-- bestResumeIndex, the same heading-aware logic RESUME uses) and auto-land at the destination
+-- hub on arrival, exactly like setRoute. Re-solves from the live fix so a moment's drift
+-- between preview and confirm can't leave a stale plan. Returns true, or false + an error.
+function RTR.setSolvedRoute(destName)
+    local path, _, _, err = RTR.solveRoute(destName)
+    if not path then return false, err or "No route" end
+    local pts = {}
+    for _, pname in ipairs(path) do
+        local p = POINTS[pname]
+        if p then table.insert(pts, {name = p.name, x = p.x, z = p.z, kind = p.kind}) end
+    end
+    if #pts == 0 then return false, "No route to " .. destName end
+    LND.active = false
+    LND.phase  = "OFF"
+    NAV.cruiseMode = "full"    -- a fresh plan starts at full cruise, never a stale COAST
+    NAV.aligning   = true      -- ...and points the nose at the first target before throttling up
+    NAV.planName = "TO " .. destName
+    NAV.points = pts
+    NAV.index = bestResumeIndex(pts)     -- heading-aware mid-route join, same as RESUME
+    NAV.active = true
+    -- The destination is a hub landing site: auto-land on arrival, same as a route to it.
     setLandFinal(pts[#pts].name, true)
     updatePhase()
     broadcastCurrent()
@@ -1028,6 +1501,8 @@ local function cancelNav(vertCmd)
     LND.phase  = "OFF"
     LND.paused = false
     NAV.active = false
+    NAV.aligning = false
+    NAV.cmdSpeed = 0
     NAV.landAtEnd = false
     NAV.landSite  = nil
     NAV.planName = nil
@@ -1044,7 +1519,9 @@ local function navTick()
     -- state machine (alignment gate and touchdown detection).
     NAV.heading = HEADING_SIGN * getYaw(pose.orientation) + HEADING_OFFSET
     NAV.haveHeading = true
-    NAV.velY = sublevel.getLinearVelocity().y
+    local vel = sublevel.getLinearVelocity()
+    NAV.velY = vel.y
+    NAV.groundSpeed = math.sqrt(vel.x * vel.x + vel.z * vel.z)   -- horizontal speed, for the HSI readout
 
     if LND.active then
         -- The landing owns the aircraft now: run its state machine and stream the vertical
@@ -1054,12 +1531,32 @@ local function navTick()
         return
     end
 
+    -- Route start: hold throttle at 0 (dynamicSpeedTarget) until the nose swings onto the first
+    -- target, then release it for good -- so we never launch off on the old heading and arc round.
+    if NAV.aligning then
+        local herr = targetHeadingErr()
+        if herr and math.abs(herr) <= math.rad(LG.ALIGN_HDG_DEG) then NAV.aligning = false end
+    end
+
     if NAV.active and NAV.points[NAV.index] then
+        -- Commanded speed, slew-rate-limited BOTH ways so it is a smooth curve, not a staircase:
+        -- rise capped at DC.ACCEL_MAX (don't slam to cruise while still yawing onto a new leg),
+        -- fall capped at DC.DECEL_MAX (any step in the raw envelope -- a turn dropping out of the
+        -- lookahead, a kink where the binding fix switches -- eases down instead of snapping).
+        -- DC.DECEL_MAX >= the envelope's own decel (~BRAKE_DECEL) so genuine slowdowns aren't
+        -- delayed -- it only rounds off the sudden steps. This is the single CMD value.
+        local rawSpeed = dynamicSpeedTarget()
+        if rawSpeed > NAV.cmdSpeed then
+            NAV.cmdSpeed = math.min(rawSpeed, NAV.cmdSpeed + DC.ACCEL_MAX * TICK_INTERVAL)
+        else
+            NAV.cmdSpeed = math.max(rawSpeed, NAV.cmdSpeed - DC.DECEL_MAX * TICK_INTERVAL)
+        end
+
         local tgt = NAV.points[NAV.index]
         local dx, dz = tgt.x - pos.x, tgt.z - pos.z
         local dist = math.sqrt(dx * dx + dz * dz)
         local isFinal = (NAV.index == #NAV.points)
-        if dist <= radiusFor(tgt, isFinal) and not isFinal then
+        if dist <= advanceRadiusFor(NAV.index, tgt, isFinal) and not isFinal then
             NAV.index = NAV.index + 1
             updatePhase() -- against the point we just switched to, not the one we passed
             broadcastCurrent() -- resend immediately on advance, not just on the 1s tick
@@ -1100,6 +1597,8 @@ local pointsPage, coursesPage = 1, 1
 local pickDirectPage, pickRoutePage = 1, 1
 local pickLandPage = 1
 local coursePickPage = 1
+-- NOTE: the auto-router's page/preview state lives on the RTR table (RTR.destPage / RTR.dest),
+-- not on separate locals here, to keep the main chunk under Lua's 200-local ceiling.
 
 -- DIRECT-TO picker: sort mode + a 1 Hz cache of the sorted, distance-tagged list.
 local pickDirectSort  = "nearest"  -- "nearest" | "az" | "za"
@@ -1157,15 +1656,60 @@ local function itemsFromLandingSites()
     return items
 end
 
+-- Destination hubs for the auto-router (FLY ROUTE > TO DESTINATION): the course endpoints,
+-- distance-tagged from the current fix. These are the only points a solved route may end at.
+function RTR.itemsFromHubs()
+    local set = RTR.routeHubNames()
+    local items = {}
+    for name in pairs(set) do
+        local p = POINTS[name]
+        if p then
+            local mark = LANDING[name] and (" <" .. LANDING[name].type:sub(1, 1):upper() .. ">") or ""
+            local dstr = ""
+            if NAV.haveFix then
+                local dx, dz = p.x - NAV.posX, p.z - NAV.posZ
+                dstr = string.format("  %.0fm", math.sqrt(dx * dx + dz * dz))
+            end
+            table.insert(items, {
+                key = name,
+                label = string.format("%-6s %d,%d [HUB]%s%s", p.name, p.x, p.z, mark, dstr),
+            })
+        end
+    end
+    table.sort(items, function(a, b) return a.key < b.key end)
+    return items
+end
+
+-- Ordered for departure: nearest DEPARTURE (the course's first fix) first, and among courses
+-- leaving the same place the SHORTEST flight first -- so the plans you could actually set off on
+-- from here float to the top. Distance is course length (sum of its legs), not straight-line.
+-- Courses sharing a departure tie exactly on dep, so the length key orders them; name breaks
+-- any remaining tie for a stable list. No fix yet (or a dangling first point) -> dep = huge, so
+-- those sort last on length alone rather than jumping around.
 local function itemsFromCourses()
     local items = {}
     for _, name in ipairs(COURSE_ORDER) do
         local c = COURSES[name]
         if c then
-            table.insert(items, {key = name, label = name .. " : " .. table.concat(c.seq, ">")})
+            local dep, len = math.huge, 0
+            local first = POINTS[c.seq[1]]
+            if first and NAV.haveFix then
+                local dx, dz = first.x - NAV.posX, first.z - NAV.posZ
+                dep = math.sqrt(dx * dx + dz * dz)
+            end
+            for i = 2, #c.seq do
+                local a, b = POINTS[c.seq[i - 1]], POINTS[c.seq[i]]
+                if a and b then len = len + legLength(a, b) end
+            end
+            table.insert(items, {key = name, dep = dep, len = len,
+                label = name .. " : " .. table.concat(c.seq, ">")})
         end
     end
-    table.sort(items, function(a, b) return a.key < b.key end)
+    table.sort(items, function(a, b)
+        if a.dep ~= b.dep then return a.dep < b.dep end
+        if a.len ~= b.len then return a.len < b.len end
+        return a.key < b.key
+    end)
     return items
 end
 
@@ -1301,8 +1845,7 @@ local function touchHome(id)
         pickDirectStamp = 0   -- force a fresh distance sort against the current fix
         screen = "pickDirect"
     elseif id == "ROUTE" then
-        pickRoutePage = 1
-        screen = "pickRoute"
+        screen = "routeMenu"
     elseif id == "LAND" then
         pickLandPage = 1
         screen = "pickLand"
@@ -1471,13 +2014,169 @@ local function touchPickRoute(id)
     elseif id == "NEXT" then
         pickRoutePage = pickRoutePage + 1
     elseif id == "BACK" then
-        screen = "home"
+        screen = "routeMenu"
     elseif id and id:sub(1, 5) == "ITEM:" then
         local name = id:sub(6)
         local choice = chooseRouteStart(name)   -- FROM START / RESUME MID-ROUTE / cancel
         if choice then
             statusManualTop = nil   -- fresh plan -> auto-scroll the en-route list
             if setRoute(name, choice == "resume") then screen = "status" end
+        end
+    end
+end
+
+-- FLY ROUTE sub-menu: pick a published course by name (existing resume-mid-route flow), or let
+-- the FMS solve a plan to a destination hub from the current position (the auto-router).
+function RTR.drawRouteMenu()
+    local w, h = term.getSize()
+    term.setBackgroundColour(colours.black)
+    term.clear()
+    term.setTextColour(colours.orange)
+    term.setCursorPos(2, 1); term.write("FLY ROUTE")
+    term.setTextColour(colours.white)
+    term.setCursorPos(2, 3); term.write("Plan a route by:")
+
+    button(2, 5, 26, 3, "BYCOURSE", "BY COURSE", true, colours.orange)
+    term.setTextColour(colours.white)
+    term.setCursorPos(2, 8); term.write("fly one named course")
+
+    button(2, 11, 26, 3, "TODEST", "TO DESTINATION", true, colours.lime)
+    term.setTextColour(colours.white)
+    term.setCursorPos(2, 14); term.write("auto-solve via courses + waypoints")
+
+    button(2, h - 1, 10, 1, "BACK", "BACK", true, colours.brown)
+end
+
+function RTR.touchRouteMenu(id)
+    if id == "BYCOURSE" then
+        pickRoutePage = 1
+        screen = "pickRoute"
+    elseif id == "TODEST" then
+        RTR.destPage = 1
+        screen = "pickDest"
+    elseif id == "BACK" then
+        screen = "home"
+    end
+end
+
+-- Destination picker for the auto-router: the network hubs only (course endpoints). Selecting
+-- one solves a plan immediately; a solvable one goes to the preview, an unsolvable one errors
+-- out (per requirement) rather than silently doing nothing.
+function RTR.drawPickDest()
+    renderList("TO DESTINATION - select hub", RTR.itemsFromHubs(), RTR.destPage, false)
+end
+
+function RTR.touchPickDest(id)
+    if id == "PREV" then
+        RTR.destPage = math.max(1, RTR.destPage - 1)
+    elseif id == "NEXT" then
+        RTR.destPage = RTR.destPage + 1
+    elseif id == "BACK" then
+        screen = "routeMenu"
+    elseif id and id:sub(1, 5) == "ITEM:" then
+        local name = id:sub(6)
+        local path, _, _, err = RTR.solveRoute(name)
+        if path then
+            RTR.dest = name
+            screen = "planPreview"
+        else
+            alert("NO ROUTE", err or ("No path to " .. name))
+        end
+    end
+end
+
+-- One-line summary of a solved path: its origin node, every interchange hub it crosses, and
+-- the destination, joined with '>' (the full waypoint list is on STATUS once committed).
+function RTR.routeSummary(path)
+    local hubs = RTR.routeHubNames()
+    local parts, n = {}, #path
+    for i, name in ipairs(path) do
+        if i == 1 or i == n or hubs[name] then
+            if parts[#parts] ~= name then table.insert(parts, name) end   -- no dupe if endpoint is a hub
+        end
+    end
+    return table.concat(parts, ">")
+end
+
+-- Preview of the solved plan before committing: the via-summary, waypoint count / total range,
+-- the mid-route join point, and the auto-land destination. Re-solved live each redraw (like
+-- chooseRouteStart) so the join range stays current; FLY commits it, BACK returns to the picker.
+function RTR.drawPlanPreview()
+    local w, h = term.getSize()
+    term.setBackgroundColour(colours.black)
+    term.clear()
+    term.setTextColour(colours.orange)
+    term.setCursorPos(2, 1); term.write("ROUTE TO " .. (RTR.dest or "?"))
+
+    local path, total, _, err = RTR.solveRoute(RTR.dest)
+    if not path then
+        -- Solvable when picked, not now (e.g. the fix dropped): show why, offer only BACK.
+        term.setTextColour(colours.white)
+        term.setCursorPos(2, 3); term.write(err or "No route")
+        button(2, h - 1, 10, 1, "BACK", "BACK", true, colours.brown)
+        return
+    end
+
+    -- Snapshot points so bestResumeIndex can preview the same join the commit will make.
+    local pts = {}
+    for _, pname in ipairs(path) do
+        local p = POINTS[pname]
+        if p then table.insert(pts, {name = p.name, x = p.x, z = p.z, kind = p.kind}) end
+    end
+    local ri = bestResumeIndex(pts)
+
+    term.setTextColour(colours.white)
+    term.setCursorPos(2, 3); term.write("VIA")
+
+    -- Wrap the '>'-joined summary to the screen width.
+    term.setTextColour(colours.lime)
+    local yy, line = 4, ""
+    for tok in (RTR.routeSummary(path)):gmatch("[^>]+") do
+        local piece = (line == "") and tok or (line .. ">" .. tok)
+        if #piece > w - 3 and line ~= "" then
+            term.setCursorPos(2, yy); term.write(line)
+            yy, line = yy + 1, tok
+        else
+            line = piece
+        end
+    end
+    if line ~= "" then term.setCursorPos(2, yy); term.write(line); yy = yy + 1 end
+
+    local infoY = yy + 1
+    term.setTextColour(colours.white)
+    term.setCursorPos(2, infoY)
+    term.write(string.format("%d waypoints  %.0fm total", #pts, total or 0))
+    term.setCursorPos(2, infoY + 1)
+    if pts[ri] then
+        local dx, dz = pts[ri].x - NAV.posX, pts[ri].z - NAV.posZ
+        term.write(string.format("Join at %s  (%.0fm)", pts[ri].name, math.sqrt(dx * dx + dz * dz)))
+    end
+    -- Most hubs are landing sites and auto-land on arrival; a hub without a landing.db entry
+    -- (e.g. VLP) is flown to and held instead -- say which, so the preview never over-promises.
+    local dest = pts[#pts] and pts[#pts].name or "?"
+    term.setCursorPos(2, infoY + 2)
+    if isLandingSite(dest) then
+        term.setTextColour(colours.green)
+        term.write("Auto-lands at " .. dest)
+    else
+        term.setTextColour(colours.orange)
+        term.write("Holds at " .. dest .. " (no landing site)")
+    end
+
+    button(2, h - 1, 12, 1, "FLY", "FLY ROUTE", true, colours.lime)
+    button(w - 9, h - 1, 8, 1, "BACK", "BACK", true, colours.brown)
+end
+
+function RTR.touchPlanPreview(id)
+    if id == "BACK" then
+        screen = "pickDest"
+    elseif id == "FLY" then
+        local ok, err = RTR.setSolvedRoute(RTR.dest)
+        if ok then
+            statusManualTop = nil   -- fresh plan -> auto-scroll the en-route list
+            screen = "status"
+        else
+            alert("NO ROUTE", err or "No route")
         end
     end
 end
@@ -1498,7 +2197,7 @@ local function drawLandingStatus()
     term.setCursorPos(2, 3)
     term.write(string.format("POS  X %.1f  Z %.1f", NAV.posX, NAV.posZ))
     term.setCursorPos(2, 4)
-    term.write(string.format("POS ERR  %5.1f m  (<=%d)", LND.posErr, POS_TOL_M))
+    term.write(string.format("POS ERR  %5.1f m  (<=%d)", LND.posErr, LG.POS_TOL_M))
     term.setCursorPos(2, 5)
     if LND.holdHeading then
         term.write(string.format("HDG ERR %+5.1f deg", LND.hdgErrDeg))
@@ -1925,7 +2624,10 @@ end
 local drawFns = {
     home = drawHome,
     pickDirect = drawPickDirect,
+    routeMenu = RTR.drawRouteMenu,
     pickRoute = drawPickRoute,
+    pickDest = RTR.drawPickDest,
+    planPreview = RTR.drawPlanPreview,
     pickLand = drawPickLand,
     status = drawStatus,
     dataMenu = drawDataMenu,
@@ -1939,7 +2641,10 @@ local drawFns = {
 local touchFns = {
     home = touchHome,
     pickDirect = touchPickDirect,
+    routeMenu = RTR.touchRouteMenu,
     pickRoute = touchPickRoute,
+    pickDest = RTR.touchPickDest,
+    planPreview = RTR.touchPlanPreview,
     pickLand = touchPickLand,
     status = touchStatus,
     dataMenu = touchDataMenu,
@@ -2002,16 +2707,20 @@ end
 --     watching the autoland.
 -- Display-only; reads NAV/LND (filled every tick). Idles if no monitor is attached.
 -- ============================================================================
--- COURSE mode (CDI):
-local CDI_FULLSCALE_M = 15    -- metres of cross-track at full needle deflection
-local CDI_ONCOURSE_M  = 1.5   -- inside this the needle turns green
--- LANDING mode (map):
-local HDG_BAR_FS_DEG = 45     -- heading error (deg) at full-width bar deflection
-local HDG_ALIGN_DEG  = 5      -- within this the bar marker turns green
--- Map range steps (metres to the ring edge): the smallest that still frames the target
--- wins, so the target creeps inward as you close and the scale only jumps occasionally.
-local HSI_RANGES = {5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000}
-local HSI_DEFAULT_RANGE = 50  -- ring scale when there is no target to frame
+-- HSI display constants, kept on one table (like RTR) so the whole instrument section costs a
+-- single main-chunk local instead of six -- the file is close to Lua's 200-local ceiling.
+local HSICFG = {
+    -- COURSE mode (CDI):
+    CDI_FULLSCALE_M = 15,   -- metres of cross-track at full needle deflection
+    CDI_ONCOURSE_M  = 1.5,  -- inside this the needle turns green
+    -- LANDING mode (map):
+    HDG_BAR_FS_DEG  = 45,   -- heading error (deg) at full-width bar deflection
+    HDG_ALIGN_DEG   = 5,    -- within this the bar marker turns green
+    -- Map range steps (metres to the ring edge): the smallest that still frames the target
+    -- wins, so the target creeps inward as you close and the scale only jumps occasionally.
+    RANGES          = {5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000},
+    DEFAULT_RANGE   = 50,   -- ring scale when there is no target to frame
+}
 
 local hsiMon = peripheral.find("monitor")
 if hsiMon then
@@ -2079,6 +2788,14 @@ local function drawCourseHSI()
                 xtk = (lx/ll)*(NAV.posZ - prev.z) - (lz/ll)*(NAV.posX - prev.x)  -- +=right of course
             end
         end
+        -- Curve-following: show the CURVE as the course, not the straight leg, so the dial reads
+        -- what the aircraft actually flies (and on-course when it's on the curve). DTK = the curve
+        -- TANGENT at our projection; XTK/CDI = signed perpendicular deviation FROM the curve (same
+        -- +=right-of-course sign as the leg version). DIST stays to the real waypoint.
+        if DC.CURVE and NAV.phase == "ENROUTE" and NAV.index >= 2 and NAV.index ~= #NAV.points then
+            local cdtk, cxtk = CURVE.course()   -- curve tangent (DTK) + signed deviation FROM the curve
+            if cdtk then dtk, xtk = cdtk, cxtk end
+        end
     end
 
     local midX, midY = math.floor(W/2) + 1, math.floor(H/2) + 1
@@ -2117,9 +2834,9 @@ local function drawCourseHSI()
         end
         -- The needle marks WHERE THE COURSE IS (fly toward it): right-of-course puts it
         -- left. If it deflects the wrong way in flight, flip this sign.
-        local defl = math.max(-1, math.min(1, -xtk / CDI_FULLSCALE_M))
+        local defl = math.max(-1, math.min(1, -xtk / HSICFG.CDI_FULLSCALE_M))
         local ox, oy = defl*(Rc*0.6)*math.sin(pr), -defl*(Rr*0.6)*math.cos(pr)
-        local ncol = (math.abs(xtk) <= CDI_ONCOURSE_M) and colours.lime or colours.yellow
+        local ncol = (math.abs(xtk) <= HSICFG.CDI_ONCOURSE_M) and colours.lime or colours.yellow
         local n1x, n1y = sp(cAng, 0.5)
         local n2x, n2y = sp(cAng + 180, 0.5)
         hLine(n1x+ox, n1y+oy, n2x+ox, n2y+oy, ncol)                                 -- CDI needle
@@ -2129,6 +2846,15 @@ local function drawCourseHSI()
     hText(midX, midY, "^", colours.white)             -- aircraft symbol (nose up)
 
     hText(midX - 3, 1, string.format("HDG %03d", math.floor(chdg + 0.5) % 360), colours.orange)
+    -- Commanded (scheduled) speed vs actual ground speed -- realtime speed-law debugging.
+    if NAV.active then
+        if NAV.aligning then
+            hText(2, 1, "ALIGN  ", colours.yellow)     -- yawing onto the bearing, throttle held at 0
+        else
+            hText(2, 1, string.format("CMD%3.0f", NAV.cmdSpeed), colours.lime)
+        end
+        hText(W - 7, 1, string.format("GS%4.0f", NAV.groundSpeed or 0), colours.cyan)
+    end
     if hasCourse then
         hText(2, H, string.format("%-6s DTK%03d", (tgtName or ""):sub(1,6), math.floor(cdtk + 0.5) % 360), colours.cyan)
         hText(W - 16, H, string.format("XTK%4.1f%s D%4.0f", math.abs(xtk), xtk >= 0 and "R" or "L", dist), colours.white)
@@ -2184,10 +2910,10 @@ local function drawLandingHSI()
         return cx + f*Rx*math.sin(a), cy - f*Ry*math.cos(a)
     end
 
-    local range = HSI_DEFAULT_RANGE
+    local range = HSICFG.DEFAULT_RANGE
     if haveTgt then
-        range = HSI_RANGES[#HSI_RANGES]
-        for _, r in ipairs(HSI_RANGES) do if dist <= r then range = r; break end end
+        range = HSICFG.RANGES[#HSICFG.RANGES]
+        for _, r in ipairs(HSICFG.RANGES) do if dist <= r then range = r; break end end
     end
 
     for a = 0, 345, 15 do local x, y = sp(a, 1.0); hFill(x, y, colours.grey) end   -- ring
@@ -2198,7 +2924,10 @@ local function drawLandingHSI()
         if card[b] then hText(x, y, card[b], colours.white) else hFill(x, y, colours.grey) end
     end
     hText(cx, cy - Ry, "v", colours.orange)                      -- fixed lubber: the nose points here
-    if haveTgt then hText(1, mapTop, "R" .. math.floor(range) .. "m", colours.grey) end
+    if haveTgt then
+        local labelTxt = "R " .. math.floor(range) .. "m"
+        hText(W - #labelTxt + 1, mapTop, labelTxt, colours.grey)
+    end
 
     if haveTgt then
         local sx, sy = sp(brg - chdg, math.min(dist / range, 1))
@@ -2217,8 +2946,8 @@ local function drawLandingHSI()
     if haveHdg and desired then
         local err  = ((desired - chdg + 540) % 360) - 180        -- +ve = wanted heading is to the right
         local half = math.max(1, math.floor(W/2) - 1)
-        local mx   = cx + math.max(-1, math.min(1, err / HDG_BAR_FS_DEG)) * half
-        hFill(mx, 1, (math.abs(err) <= HDG_ALIGN_DEG) and colours.lime or colours.orange)
+        local mx   = cx + math.max(-1, math.min(1, err / HSICFG.HDG_BAR_FS_DEG)) * half
+        hFill(mx, 1, (math.abs(err) <= HSICFG.HDG_ALIGN_DEG) and colours.lime or colours.orange)
     end
 
     -- ---- numbers (bottom row) ----

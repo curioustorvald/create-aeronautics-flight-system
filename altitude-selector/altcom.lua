@@ -20,7 +20,7 @@ term.setPaletteColour(colours.red, 0x995500)
 
 local oldAltSelection = nil
 local altSelection = nil
-local defaultAlti = {'120', '150', '180', '250'}
+local defaultAlti = {'100', '150', '200', '250'}
 
 -- FMS OVERRIDE, three modes (learned from the aertogekiss_autoland stream the FMS
 -- already sends the UAC):

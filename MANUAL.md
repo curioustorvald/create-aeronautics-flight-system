@@ -10,7 +10,8 @@ This is a complete **autopilot and flight-control stack** for a Create: Aeronaut
 
 - keep the aircraft **level and pointed** where you want it, automatically, at all times;
 - **hold a selected altitude**, or let you fly the vertical by hand on a **vertical-speed stick**;
-- **navigate** to a single point (direct-to) or fly a **route** of waypoints, holding the course line;
+- **navigate** to a single point (direct-to) or fly a **route** of waypoints as one **smooth computed curve** — rounding the corners and setting its own speed for each bend;
+- with the autopilot off, **hand-fly the horizontal and yaw** on a **nav stick** (fore/aft, strafe, yaw) — together with the vertical stick that's full manual fly-by-wire, and being independent of the autopilot it doubles as an emergency course-alteration override;
 - **land itself** on a marked pad — line up, translate over the pad, descend, flare, touch down;
 - give you a **cockpit of physical switches** — engine cut-offs (master / altitude / attitude) and autopilot toggles (nav / altitude) that pick the flight mode live;
 - show you a **glass cockpit** — an artificial horizon and a VOR/HSI (that becomes a top-down map on landing).
@@ -21,6 +22,7 @@ On top of that core it does a lot of things a real flight computer does:
 
 - an **inner rate loop with inertia-tensor scaling and gyroscopic decoupling**, so a heavy, high-inertia airframe is controlled properly rather than just damped;
 - a **motion-profiled yaw** that starts braking a turn *early* so the nose doesn't overshoot the heading;
+- a **trajectory-planning FMS** — rather than chase waypoints one at a time and slow at each, it fits a **smooth curve** through the whole route, flies an aim-point along it (pure pursuit), and derives its **speed from the curve's curvature** so it holds cruise on the straights and eases through the bends, braking *in advance*;
 - **holonomic navigation** — since a VTOL can slide sideways, it *strafes* toward a target rather than waiting for the slow yaw axis to swing the nose around (which otherwise causes a lazy spiral that never closes);
 - **attitude-aware vertical thrust** — "hold altitude" is a *world-up* goal, so if the craft is banked, pitched or inverted, the vertical effort is re-routed to whichever thrusters are actually pointing up;
 - an **automatic-landing state machine**, with a **pilot override** to pause the descent mid-approach and hand the vertical channel back to you (keeping the alignment), plus **AP OFF / RESUME ALT-AP** options after touchdown;
@@ -41,23 +43,28 @@ Everything talks over `rednet`, so the airframe is just: a few "brain" computers
 
 **Blocks you'll place on the aircraft**
 
-- 9 computers (Advanced Computers recommended — the UIs use colour and touch): 3 brains, 3 relays, 3 cockpit panels.
+- 12 computers (Advanced Computers recommended — the UIs use colour and touch): 3 brains, 3 relays, 6 cockpit panels/sticks. *(The last 3 — the nav stick — are optional if you only want autopilot flight.)*
 - 2 Advanced Monitors (for the FMS's HSI map and the Altitude Selector's attitude indicator). Any size ≥ ~3×3 blocks reads well.
-- A **wireless (or ender) modem** on every computer — the whole system is one rednet network.
+- A **wireless (NOT ender) modem** on every computer — the whole system is one rednet network.
 - Redstone links from the three relay computers to your thruster banks.
-- Cockpit redstone in: **5 switches/levers** (3 engine cut-offs → engine-switch computer, 2 autopilot toggles → autopilot-switch computer) and **1 analog lever** (the vertical-speed stick → the VS-commander computer). An analog lever / redstone-integrator gives the stick its 0–14 range; a plain lever is fine for the on/off switches.
+- Cockpit redstone in:
+  - **5 switches/levers** — 3 engine cut-offs → engine-switch computer, 2 autopilot toggles → autopilot-switch computer.
+  - **1 analog lever** — the vertical-speed stick → the VS-commander computer (an Analog Lever / redstone-integrator gives its 0–14 range; a plain lever is fine for the on/off switches).
+  - **6 momentary buttons** for the nav stick — 4 (fore/aft/strafe-left/strafe-right) → the MANCON translation relay, 2 (yaw-left/right) → the MANCON rotation relay. Buttons/keys, not latching levers: hold to move, release to stop.
 
 ---
 
 ## 2. How it's put together
 
-Nine computers: three read sensors and think ("brains"), three copy rednet numbers onto redstone ("relays"), and three read the cockpit and broadcast it ("panels").
+Twelve computers: three read sensors and think ("brains"), three copy rednet numbers onto redstone ("relays"), and six read the cockpit and broadcast it ("panels/sticks", the last three being the nav stick).
 
 ```
-  COCKPIT PANELS (read switches/stick, broadcast state)
+  COCKPIT PANELS / STICKS (read switches & keys, broadcast state)
     engine-switch     ─ engineswitch {master,altitude,attitude} ─►  the 3 RELAYS  (hardware enable)
     autopilot-switch  ─ apswitch {nav, altitude} ────────────────►  the UAC       (flight mode)
     VS-commander      ─ mancon {vs}  (wanted climb rate, m/s) ─────►  the UAC       (manual altitude)
+    NAV STICK: 2 relays ─ mancon_translational / mancon_rotational ─► MIC
+                 MIC ─ mancon_nav {fwd, strafe (m/s), yaw (rad/s)} ──►  the UAC     (manual position + heading)
 
   BRAIN → RELAYS → THRUSTERS
                  ┌───────────────────────┐
@@ -86,6 +93,9 @@ Nine computers: three read sensors and think ("brains"), three copy rednet numbe
 | `apswitch` | AP panel → UAC | `{autopilot_nav, autopilot_altitude}` booleans — the flight mode (§6.6) |
 | `engineswitch` | Engine panel → relays | `{master, altitude, attitude}` booleans — hardware thruster enables |
 | `mancon` | VS-commander → UAC | `{vs}` — pilot's wanted climb rate (m/s), flown when altitude-hold is off |
+| `mancon_translational` | translation relay → MIC | `{fore, aft, sleft, sright}` booleans — the pilot's fore/aft/strafe keys |
+| `mancon_rotational` | rotation relay → MIC | `{yleft, yright}` booleans — the pilot's yaw keys |
+| `mancon_nav` | MIC → UAC | `{fwd, strafe (m/s), yaw (rad/s), active}` — wanted body velocity, flown when nav is off |
 | `stab` | UAC → relay | `{left,right,front,back}` — pitch/roll |
 | `navcontrol` | UAC → relays | `{thrust_forward,thrust_backward,yaw_left,yaw_right,strafe_left,strafe_right}` |
 | `alt` | UAC → relay | `{up, down}` — up/down lift thrusters, 0..15, 7/7 = balanced hover |
@@ -98,7 +108,7 @@ All thruster values are **0–15** redstone steps. The lift channel is now **two
 
 ## 3. Installation
 
-For each of the nine folders in this package, put its contents on one computer (its own `startup.lua` auto-launches it on boot). It doesn't matter what computer *IDs* Minecraft gives them — only that they all share one rednet network and have the right peripherals.
+For each of the twelve folders in this package, put its contents on one computer (its own `startup.lua` auto-launches it on boot). It doesn't matter what computer *IDs* Minecraft gives them — only that they all share one rednet network and have the right peripherals. *(The three `mancon-*` folders are the optional nav stick; skip them if you only want autopilot flight.)*
 
 The quickest way to copy files onto a CC computer is `wget`/`pastebin`, or edit them in-game, or (on a server) drop them into the computer's folder under `world/computercraft/computer/<id>/`.
 
@@ -113,6 +123,9 @@ The quickest way to copy files onto a CC computer is `wget`/`pastebin`, or edit 
 | `vertical-speed-commander/` | modem (any side, **not** `top` — the stick uses `top`); analog lever into `top`. |
 | `engine-switch/` | modem on **top**; 3 redstone switches into `front`/`right`/`left`. |
 | `autopilot-switch/` | modem on **top**; 2 redstone switches into `right`/`left`. |
+| `mancon-translation-relay/` | modem on **top**; 4 momentary buttons into `back`/`front`/`left`/`right` (fore/aft/strafe-L/strafe-R). |
+| `mancon-rotation-relay/` | modem on **top**; 2 momentary buttons into `left`/`right` (yaw-L/yaw-R). |
+| `mancon-intention-controller/` | modem (any side). No redstone, no monitor — it just listens and re-broadcasts. |
 
 Then **open the modem** on each machine (the code does `rednet.open(...)` on the side shown — the relays and switch panels expect the modem on `top`; the UAC, FMS and VS-commander auto-find any modem). Reboot each computer; the relays and panels print their titles/state and the brains their UIs.
 
@@ -176,6 +189,19 @@ Three more computers read redstone *in* from the cockpit and broadcast it. These
 
 **Vertical-speed stick** (`vertical-speed-commander/`, modem on any side *except* `top`) — one **analog** input on `top` (0–14, 7 = hold), broadcast as a wanted climb rate on `aertogekiss_mancon`. Use an Analog Lever or a redstone integrator so you get the full 0–14 swing. It is only obeyed when the autopilot **altitude** switch is off. **Wire the stick so a cut/absent signal reads 7** (0 would command a full-rate descent).
 
+**Nav stick** (`mancon-translation-relay/` + `mancon-rotation-relay/` + `mancon-intention-controller/`) — the horizontal/yaw equivalent of the VS stick, built from three computers. The two relays each `rednet.open("top")` and read **momentary buttons** (hold to move, release to stop):
+
+| relay | input side | key |
+|---|---|---|
+| translation | `back`  | fore (forward) |
+| translation | `front` | aft (backward) |
+| translation | `left`  | strafe left |
+| translation | `right` | strafe right |
+| rotation | `left`  | yaw left |
+| rotation | `right` | yaw right |
+
+The **MIC** (intention controller) listens to both relays, integrates the key-presses into a wanted body velocity — holding a key ramps that axis up, releasing fades it to 0 — and broadcasts it on `aertogekiss_mancon_nav`. The UAC flies it **whenever the autopilot nav switch is off**: with nav off you steer the aircraft directly, and with a key released the UAC holds heading and nulls drift. The two relays only transmit while the engine **master** is on *and* the autopilot **nav** switch is off, so the stick is silent (and the autopilot has full control) during automatic flight.
+
 ---
 
 ## 5. First boot & calibration (do this once, on the ground / tethered)
@@ -215,13 +241,13 @@ This is your navigator. From its screen you can:
 
 - **Edit data**: create **POINTS** (waypoints — POIs and VORs, with X/Z coordinates) and **COURSES** (named sequences of points). A point marked as a landing site shows a `<H>`/etc. tag.
 - **Fly DIRECT** to any point.
-- **Fly a ROUTE** (course): it sequences the waypoints, holds the straight leg between each pair with cross-track guidance, and decides the flight phase (ENROUTE → APPROACH → TERMINAL → ARRIVED) from the plan itself.
-- **SPD** button: cycle the cruise-speed cap **FULL → SLOW → COAST**.
+- **Fly a ROUTE** (course): it flies the waypoints as one **smooth curve** — a spline fitted through the fixes (corners rounded, no bearing snap) that it pure-pursues via a moving aim-point ("carrot") — and it sets its **speed from the curve's shape**: cruise on the straights, easing through tight bends and down to the destination, braking *in advance*. It still decides the flight phase (ENROUTE → APPROACH → TERMINAL → ARRIVED) from the plan, handing to a precise point-capture only for the final arrival/landing.
+- **SPD** button: cycle the cruise-speed **ceiling** **FULL → SLOW → COAST** (the curve speed profile always stays under whatever you pick).
 - **HOME / CANCEL**: stop the autopilot and hand control back.
 
 The external **monitor** on this computer is the **HSI**, and it has **two modes**:
 
-- **While navigating a course / direct-to** it's the classic **VOR / HSI**: a heading-up compass rose (the "squarised circle"), a **course line** for the active leg, a green/yellow **course-deviation needle** (how far you are off the course, left/right), and the **heading number** — plus DTK (desired track), XTK (cross-track metres, L/R) and distance-to-go.
+- **While navigating a course / direct-to** it's the classic **VOR / HSI**: a heading-up compass rose (the "squarised circle"), a **course line**, a green/yellow **course-deviation needle**, and the **heading number** — plus DTK (desired track), XTK (cross-track metres, L/R) and distance-to-go. On a curved route the course line and needle follow the **flown curve** — DTK is the curve's *tangent* and XTK your deviation *from the curve* — so the needle centres when you're tracking the curve, not the straight leg. Top-left **CMD** reads the commanded speed and top-right **GS** your ground speed.
 - **Once a landing engages** (auto or manual) it switches to a **heading-up top-down map** for flying the approach or watching the autoland. Your aircraft sits fixed at the centre as a nose-up `^` while the compass card and the **pad** (`H`, with a short line marking its approach heading) rotate under it (dead ahead is the top). The scale auto-ranges (shown as `R__m`) so the pad creeps in as you close. The **top row is a heading-error bar** — a bright marker shows how far the pad's landing heading is off your nose, green when aligned. The **bottom row** shows the landing numbers: phase / AGL / VS / position error / heading error.
 
 ### 6.3 Automatic landing
@@ -258,13 +284,15 @@ Two banks of physical switches, plus one stick, sit between you and the autopilo
 | nav | altitude | The craft… |
 |:---:|:---:|---|
 | **on**  | **on**  | full autopilot — navigates the route/target **and** holds altitude, level throughout |
-| **on**  | off | navigates + stays level, but **you** fly the vertical on the stick |
-| off | **on**  | holds altitude + stays level, but **you** fly the position (nav handed off) |
-| off | off | just keeps the craft **level** — you fly everything else |
+| **on**  | off | navigates + stays level, but **you** fly the vertical on the VS stick |
+| off | **on**  | holds altitude + stays level, but **you** fly the position/heading on the **nav stick** |
+| off | off | keeps the craft **level**; **you** fly everything — position/heading on the nav stick, vertical on the VS stick (full manual fly-by-wire) |
 
-Flipping the **altitude** switch on grabs the *current* altitude to hold (a live ALT-AP panel selection then takes over within a second). Flipping it off hands the vertical to the stick. An **automatic landing in progress overrides both switches** — it owns the craft until it finishes or you abort.
+Flipping the **altitude** switch on grabs the *current* altitude to hold (a live ALT-AP panel selection then takes over within a second); flipping it off hands the vertical to the VS stick. Flipping the **nav** switch off hands the horizontal position and heading to the **nav stick** — with no key pressed the UAC just holds the current heading and station. An **automatic landing in progress overrides both switches** — it owns the craft until it finishes or you abort.
 
 **Vertical-speed stick** — active whenever the autopilot **altitude** switch is off. Centre (7) holds level; push up to climb, down to descend, proportionally, up to `VS_MAX_CMD`. The UAC executes the rate through the *same* inner loop it uses for altitude-hold, so it's attitude-aware (it still lifts you straight up even nose-high) and it learns the hover trim as you fly. The stick only *asks* for a rate; the UAC clamps it to what the airframe can actually do (`CLIMB_MAX`/`DESCEND_MAX`).
+
+**Nav stick** — active whenever the autopilot **nav** switch is off. The fore/aft/strafe/yaw keys command a *body velocity*: hold a key and the aircraft accelerates that way (up to the MIC's per-axis limit), release and it fades to a stop; with everything released the UAC holds heading and nulls drift, so it station-keeps. Because the keys are fed as a velocity into the UAC's own loops it flies steady and attitude-aware like the autopilot, and since it runs independently it's also your quick manual course-change override any time nav is off.
 
 ---
 
@@ -288,9 +316,27 @@ All optional once the signs (Section 5) are right. Numbers are the shipped defau
 | `CLIMB_AT_FULL` / `CLIMB_MAX` / `DESCEND_MAX` | vertical-rate model. `CLIMB_AT_FULL` is the measured full-thrust climb rate; the two caps (autopilot *and* manual stick obey them) default to 0.75× it. The lift channel learns its own hover trim (`VEL_KI`), so leave that be. |
 | `AP_NAV_DEFAULT` / `AP_ALT_DEFAULT` | assumed autopilot mode until the switch panel is first heard. Both `false` (safe: hand-off + manual) so a craft with no switch panel wired won't fly itself off. |
 | `MANCON_STALE_AFTER` | manual-stick timeout — if the VS-commander goes quiet, the vertical falls back to a neutral hover. |
+| `MANNAV_*` | the manual **nav** stick: `MANNAV_ENABLE`; `MANNAV_YAW_SIGN` (flip if a manual yaw command turns the wrong way); `MANNAV_STALE_AFTER` (nav-stick timeout → hold heading/station). |
 | `ENABLE_ATTITUDE/TRANSLATION/ALTITUDE` | bring channels up one at a time during first setup (source-level debug isolators, independent of the AP switches). |
 
 > The vertical-speed stick's full-scale rate is `VS_MAX_CMD` in **`vertical-speed-commander/vspdpid.lua`** (in m/s). Keep it at or just below the UAC's `CLIMB_MAX`, or the top of the stick travel just saturates against the UAC's cap.
+>
+> The **nav stick's** full-scale speeds are `V_FWD_MAX` / `V_STRAFE_MAX` (m/s) and `YAW_MAX` (rad/s) in **`mancon-intention-controller/mic.lua`**, with `RAMP_UP` / `YAW_RAMP_UP` setting how fast a held key builds up to them.
+
+### 7.1 Trajectory tuning (`DC` table in `flight-management-system/autopilot.lua`)
+
+How the FMS draws its **path** curve and **speed** curve. All optional; the defaults suit the *Aer Togekiss*.
+
+| Knob | What it does |
+|---|---|
+| `CURVE` | `true` = fly the smoothed curve; `false` = aim straight at each waypoint (no rounding). |
+| `CURVE_LOOKAHEAD` | how far ahead on the curve the aim-point ("carrot") sits, m. Larger = smoother / cuts corners more; smaller = tracks the fixes tighter. |
+| `CURVE_DEV_MAX` | soft cap on how far the curve may bow off the straight leg, m — reins in **km-apart** waypoints without touching finely-placed ones (whose bow is already small). |
+| `A_LAT_MAX` | cornering lateral accel for the curvature speed limit — speed through a bend of radius R is √(`A_LAT_MAX`·R). Higher = faster through bends (needs the strafe/bank authority to match). |
+| `BRAKE_DECEL` | how hard the speed profile plans to brake, m/s². Sets how EARLY/short the slowdown into a bend or the destination is (braking distance ≈ (v²−v_target²)/(2·`BRAKE_DECEL`)). **Set it to what the craft can really brake** — too high and it arrives hot; too low and it crawls in from far out. |
+| `ACCEL_MAX` / `DECEL_MAX` | rate limits on how fast the commanded speed may rise / fall, so it reads as a smooth curve, not a staircase. |
+| `FINAL_ARRIVE_SPEED` | the speed the profile aims for AT the destination (the point-capture then stops it). Raise it to fly *through* a course without slowing at the last fix. |
+| `SPEED_FULL` / `SPEED_SLOW` | the FULL / SLOW cruise-cap presets the **SPD** button cycles (the ceiling the curve speed stays under). |
 
 ---
 
@@ -310,10 +356,16 @@ All optional once the signs (Section 5) are right. Numbers are the shipped defau
 | **Pitch/roll dead** but yaw & lift work | engine **attitude** switch off. / **Lift dead** but the rest works | engine **altitude** switch off. |
 | Autopilot **won't navigate** (phase shows `HANDOFF`) or **won't hold altitude** (target shows `MAN`) | the matching autopilot switch is off, or the autopilot-switch panel isn't broadcasting — check its screen (`AP NAV/AP ALT`) and modem. |
 | **Vertical stick does nothing** | the autopilot **altitude** switch is on, so the stick is ignored (it's manual-only). Flip it off. If still nothing, the VS-commander has no modem, or the stick reads 0 (wire it to fail to 7). |
+| **Nav stick does nothing** | the autopilot **nav** switch is on (stick ignored — it's manual-only), or the engine **master** is off (the relays only transmit while master is on and nav off). If still nothing, the MIC or a relay is missing its modem. |
+| Manual **yaw turns the wrong way** on the nav stick | flip `CFG.MANNAV_YAW_SIGN` in `uac.lua`. (Fore/aft & strafe reuse the calibrated `THRUST_SIGN`/`STRAFE_SIGN`, so they follow from Section 5.) |
 | Lift **drives the wrong way** (sinks on climb) | up/down banks swapped — swap the wiring or the `UP_SIDE`/`DOWN_SIDE` constants in `strafecon.lua`. |
+| Autopilot **stays slow for much of a long straight leg** | `DC.BRAKE_DECEL` too low → the braking distance to the destination/bend is huge. Raise it (see §7.1). |
+| Autopilot **arrives at a bend/destination too fast** | `DC.BRAKE_DECEL` higher than the craft can actually brake. Lower it so it starts slowing sooner. |
+| The curve **swings noticeably off-course** between far-apart waypoints | lower `DC.CURVE_DEV_MAX` (bounds the bow) and/or `DC.CURVE_LOOKAHEAD`. |
+| Craft **won't throttle up at route start** (sits at 0) | it's aligning — pointing the nose at the first fix before accelerating. It releases once within `ALIGN_HDG_DEG`; if it's stuck, the align target and the flown target disagree (check the FMS/UAC are the synced build). |
 | **Lazy ~200 m spiral** on approach that never closes | (fixed in this build) — the direct-to path now strafes toward the target instead of relying on yaw. |
 | UAC screen shows the whole loop dead / `raw` in the millions but output ~1 | check the modem is open and the relays are running; the vector-rotation/scale bugs are fixed in this build. |
-| `function ... has more than 200 local variables` on load | you added a top-level `local`; put new tuning constants in the `CFG` table (`CFG.NAME = ...`), not as a bare `local`. |
+| `function ... has more than 200 local variables` on load | you added a top-level `local`; put new tuning constants in a table — `CFG.NAME` in `uac.lua`, or the `DC` / `LG` / `RAD` tables in `autopilot.lua` — not as a bare `local`. (`luac -p` won't catch this; the VM counts a nested function's locals on top of the file's top-level ones.) |
 | Attitude Indicator shows **"NO SUBLEVEL API"** | that computer isn't part of the Sable-tracked contraption — it must be built into the aircraft. |
 | HSI heading/map reads rotated or mirrored | the compass conversion is the one `toCompass()` in autopilot.lua (shared by both HSI modes). Course mode: the **CDI needle** deflection is a one-character sign flip in `drawCourseHSI`. Landing mode: the heading-bar turn direction is the sign on `err` in `drawLandingHSI`. |
 | AI bank pointer moves the **wrong way** | flip the roll sign on the pointer in `drawAI` (altcom.lua) — it's the one marked bank switch. |

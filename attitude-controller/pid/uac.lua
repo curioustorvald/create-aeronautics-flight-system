@@ -40,6 +40,7 @@ CFG.ALTAP_PROTOCOL    = 'aertogekiss_altap'      -- in : ALT-AP panel setpoint
 CFG.AUTOLAND_PROTOCOL = 'aertogekiss_autoland'   -- in : FMS vertical channel
 CFG.APSWITCH_PROTOCOL = 'aertogekiss_apswitch'   -- in : pilot autopilot toggles (nav / altitude), #12
 CFG.MANCON_PROTOCOL   = 'aertogekiss_mancon'     -- in : manual wanted climb rate (m/s) from the VSC, #6
+CFG.MANNAV_PROTOCOL   = 'aertogekiss_mancon_nav' -- in : manual horizontal+yaw stick (m/s, rad/s) from the MIC, #14
 CFG.STAB_PROTOCOL     = 'aertogekiss_stab'       -- out: pitch/roll thrusters
 CFG.NAVCTRL_PROTOCOL  = 'aertogekiss_navcontrol' -- out: yaw/thrust/strafe
 CFG.ALT_PROTOCOL      = 'aertogekiss_alt'        -- out: up/down thruster
@@ -55,8 +56,10 @@ CFG.ENABLE_ALTITUDE    = true
 -- Levelling/attitude is ALWAYS held. On top of that the two switches pick the mode:
 --   nav ON  + alt ON  -> navigate + hold altitude + level          (full autopilot)
 --   nav ON  + alt OFF -> navigate + level; altitude from the manual VSC (aertogekiss_mancon)
---   nav OFF + alt ON  -> hold altitude + level; positional control handed to the pilot
---   nav OFF + alt OFF -> just keep the craft level (altitude still manual via the VSC)
+--   nav OFF + alt ON  -> hold altitude + level; horizontal/yaw flown by the pilot (MIC #14)
+--   nav OFF + alt OFF -> level + manual horizontal/yaw (MIC #14); altitude manual via the VSC
+-- "handed to the pilot" now means the nav MANCON stick (MIC #14) over MANNAV_PROTOCOL, not a
+-- dead-stick coast: with no MIC packet the craft still just holds heading + zero translation.
 -- An in-progress autoland overrides BOTH switches (it is a committed sequence with its
 -- own abort path) and keeps flying the craft down. The DEFAULTS below apply only until
 -- #12 is first heard; false/false = safe (hand-off + manual) so a craft with no switch
@@ -64,6 +67,31 @@ CFG.ENABLE_ALTITUDE    = true
 CFG.AP_NAV_DEFAULT = false
 CFG.AP_ALT_DEFAULT = false
 CFG.MANCON_STALE_AFTER = 0.5   -- s; manual vertical older than this -> treat as neutral hover
+
+-- MANUAL HORIZONTAL + YAW (the nav MANCON stick, via the MIC #14 over MANNAV_PROTOCOL).
+-- Active only with AP-NAV OFF and a fresh MIC packet; then the pilot's wanted body-frame
+-- forward/right speed (m/s) and yaw RATE (rad/s) fly the craft. A released stick commands
+-- zero -> brake to a hover and hold heading. MANNAV_YAW_SIGN is a calibration GUESS like the
+-- other *_SIGN (flip if yaw turns the wrong way); fwd/strafe reuse the calibrated THRUST_SIGN/
+-- STRAFE_SIGN. Independent of the autopilot by design -- see the MIC header on #14.
+CFG.MANNAV_ENABLE      = true
+CFG.MANNAV_YAW_SIGN    = -1     -- +1: MIC yaw + (nose-right) advances the heading target CW
+CFG.MANNAV_STALE_AFTER = 0.5   -- s; MIC packet older than this -> no manual horizontal/yaw
+-- Yaw-rate BRAKE (DISABLED -- kept for reference). This added EXTRA proportional rate damping
+-- (-BRAKE*wy) on release to stop the yaw harder. It turned out to be the CAUSE of the release
+-- oscillation: RATE_KP_YAW=5 already puts the discrete rate loop at ~critical damping
+-- (gain*dt = 5*0.05 = 0.25), and the ~1-tick actuator lag makes any EXTRA rate-feedback gain
+-- RING -- with BRAKE=9 the effective gain 14 gives complex closed-loop roots (|z|~0.84), i.e.
+-- the several-oscillations-then-settle the pilot saw (and why no MANNAV_YAW_SETTLE value fixed
+-- it -- SETTLE changes when the HEADING is captured, not the loop gain). You cannot stop faster
+-- than the critically-damped loop by adding gain: loop bandwidth is capped by the 50 ms tick +
+-- lag, NOT by thrust (the extra yaw thrusters raised authority, not bandwidth). To stop quicker,
+-- build LESS rate to begin with -- lower the MIC's YAW_MAX.
+CFG.MANNAV_YAW_BRAKE   = 0     -- 0 = off. Leave off; >0 re-introduces the release ring (see above).
+CFG.MANNAV_YAW_EPS     = 0.02  -- rad/s; |manual yaw command| below this = "not commanding yaw" -> brake on
+CFG.MANNAV_YAW_SETTLE  = 0.05  -- rad/s; on release, don't CAPTURE the hold-heading until |yaw rate| is
+                               -- below this. Freezing it earlier makes the craft drift back (opposite way)
+                               -- to the release-instant heading momentum already carried it past.
 
 -- ATTITUDE LAW MODE -----------------------------------------------------------
 --  "PD"      : steps = KP*errVec - KD*angVel, straight to redstone. Simple,
@@ -125,7 +153,10 @@ CFG.RATE_KD     = 0.0    -- inner: derivative on the rate error (noisy; start 0)
 -- thrusters) have different authority, so tune the three separately.
 CFG.ROT_GAIN_PITCH = 5e-6
 CFG.ROT_GAIN_ROLL  = 5e-6
-CFG.ROT_GAIN_YAW   = 5e-6
+CFG.ROT_GAIN_YAW   = 1.7e-6   -- was 5e-6; /3 after ~3x more yaw thrusters (each step now ~3x
+                              -- the torque, so the loop was 3x over-gained -> left/right oscillation).
+                              -- If it STILL hunts you added more than 3x -> keep dividing; if it went
+                              -- sluggish, raise back toward 5e-6. This is the yaw plant-gain calibration.
 
 -- INERTIA cross-axis coupling. false (default): use ONLY the body-diagonal moments,
 -- so each axis is independent -- a pitch demand makes pitch torque and nothing else
@@ -192,7 +223,12 @@ CFG.TILT_YAW_MAX = 0.60   -- rad (~34 deg): zero yaw at/above this tilt
 --    stronger than the horizontal thrusters so altitude sags when tilted.
 CFG.YAW_TILT_DECOMP = true
 CFG.TILT_ALT_ALLOC  = true
-CFG.VERT_XFER_FWD   = 1.0   -- fore/aft steps per unit vertical-effort * (world-up . body-fwd)
+-- VERT_XFER_FWD is NEGATIVE because the ship's logical forward (the quaternion's body-fwd
+-- axis this uz is dotted against) is 180 deg from thrust-forward (HEADING_OFFSET = pi), and
+-- the spill is added AFTER THRUST_SIGN so it carries its own sign. Calibrated in-game: nose
+-- DOWN 90 deg + climb wanted must fire the BACKWARD thruster (not forward). Flip back to +1
+-- only if that test inverts.
+CFG.VERT_XFER_FWD   = -1.0  -- fore/aft steps per unit vertical-effort * (world-up . body-fwd)
 CFG.VERT_XFER_STR   = 1.0   -- strafe   steps per unit vertical-effort * (world-up . body-lat)
 
 -- Yaw -> pitch/roll ACTUATOR-coupling feedforward. An off-CoM yaw thruster produces a
@@ -282,16 +318,19 @@ CFG.STRAFE_MAX = 15
 --                 LEVEL at all times; EVERY bit of horizontal course correction is
 --                 done by STRAFING; yaw swings the nose but the craft never banks.
 --                 The bank/pitch overlays below are OFF (exact prior behaviour).
---   "HYBRID"    : a VTOL flown to LOOK like an aeroplane. It banks INTO turns
---                 (coordinated roll) and pitches the nose for climb/descent, but
---                 the strafe thrusters are STILL used for cross-track holding,
---                 position hold and landing when attitude alone can't hold the
---                 line. (Bank + pitch overlays ON, strafe ON.)
---   "FIXEDWING" : strafe thrusters COMPLETELY disabled -- lateral course is
---                 corrected only by turning (bank + the yaw law pointing the nose,
---                 which drags the craft round via the tilted alt-thruster "lift").
---                 Banks into turns and pitches for altitude like HYBRID; no strafe
---                 even for landing. (Bank + pitch overlays ON, strafe OFF.)
+--   "HYBRID"    : a VTOL flown to LOOK like -- and steer like -- an aeroplane. In-course
+--                 lateral correction is flown by BANKING toward the track (the tilted
+--                 alt-thruster lift pulls it back on line, see the cross-track bank),
+--                 NOT by strafing. Strafe is reserved for aligning to the pad in the
+--                 close-in phases (TERMINAL/ARRIVED/LANDING), plus a SPARING amount
+--                 through the banking phases to damp bank oscillation. Banks into turns
+--                 and (optionally) pitches for climb. (Bank overlays ON; strafe = pad
+--                 alignment + sparing damping.)
+--   "FIXEDWING" : strafe thrusters COMPLETELY disabled -- lateral course is corrected
+--                 ONLY by banking (toward the track) + the yaw law pointing the nose,
+--                 which drag the craft round via the tilted alt-thruster "lift" in every
+--                 phase, landing included. Banks and pitches like HYBRID. (Bank overlays
+--                 ON, strafe OFF -- so it banks even in the pad phases.)
 -- Anything unrecognised is treated as VTOL (safe default).
 CFG.FLIGHT_MODE = "VTOL"
 
@@ -302,12 +341,17 @@ CFG.FLIGHT_MODE = "VTOL"
 -- attitude SETPOINT, so the leveling loop holds the bank and the alt-thruster tilt-
 -- allocation turns that bank into the lateral "lift" that pulls the craft round.
 -- CALIBRATE like the other axes: if it banks the WRONG way into a turn, flip
--- CFG.BANK_SIGN. (Alternative driver: base it on measured yaw rate instead of
--- heading error -- see the note where bankTarget is computed in controlLoop.)
-CFG.BANK_SIGN       = -1
-CFG.BANK_PER_YAWERR = 0.14    -- rad of commanded bank per rad of heading error
-CFG.BANK_MAX        = 0.4    -- rad (~29 deg) cap on commanded bank
-CFG.BANK_RATE       = 0.5    -- rad/s slew on the bank command (smooth roll in/out)
+-- CFG.BANK_SIGN. This is the MASTER bank sign -- it multiplies BOTH the coordinated-turn
+-- bank and the cross-track bank (they share the "positive = go right" convention and the
+-- same roll->lateral-lift physics, so they invert together). Set +1 in-game: at -1 the
+-- craft banked AWAY from the target (banking drove it off, consistent with the same 180
+-- deg logical-vs-thrust frame offset that made VERT_XFER_FWD negative). Flip back to -1
+-- only if it banks away again. (Alternative driver: base it on measured yaw rate instead
+-- of heading error -- see the note where bankTarget is computed in controlLoop.)
+CFG.BANK_SIGN       = 1
+CFG.BANK_PER_YAWERR = 0.02    -- rad of commanded bank per rad of heading error
+CFG.BANK_MAX        = 0.25    -- rad (~29 deg) cap on commanded bank
+CFG.BANK_RATE       = 0.1    -- rad/s slew on the bank command (smooth roll in/out)
 
 -- Pitch-for-altitude overlay (HYBRID/FIXEDWING only; a no-op in VTOL and in level
 -- cruise). Commands a pitch angle proportional to the desired climb/descent rate,
@@ -322,20 +366,62 @@ CFG.PITCH_PER_MPS   = 0.0--0.04   -- rad of commanded pitch per m/s of desired v
 CFG.PITCH_ALT_MAX   = 0.0--0.3    -- rad (~23 deg) cap on commanded pitch
 CFG.PITCH_ALT_RATE  = 0.0--0.2    -- rad/s slew on the pitch command
 
--- Derived once from FLIGHT_MODE (unrecognised -> VTOL). Kept in CFG rather than new
--- top-level locals, to stay under Cobalt's 200-locals-per-function cap (see top).
-CFG.STRAFE_ENABLED = (CFG.FLIGHT_MODE ~= "FIXEDWING")
-CFG.ATTITUDE_BANKS = (CFG.FLIGHT_MODE == "HYBRID" or CFG.FLIGHT_MODE == "FIXEDWING")
-CFG.MODE_TAG = (CFG.FLIGHT_MODE == "HYBRID" and "HYB")
-    or (CFG.FLIGHT_MODE == "FIXEDWING" and "FW") or "VTOL"
+-- Cross-track (lateral-correction) BANK -- HYBRID/FIXEDWING only. In these modes the
+-- lateral course correction that VTOL flies by STRAFING is flown by BANKING instead:
+-- the craft rolls toward the track and the tilted alt-thruster's sideways lift pulls it
+-- back on line (the TILT_ALT_ALLOC spill, left UNcancelled while steering by bank -- see
+-- there). This term sets that bank from the SAME body-right demand strafe would use (last
+-- tick's latDemand), redirected into roll, so it is the PRIMARY in-course lateral
+-- corrector; the heading-error coordinated bank above just layers a turn-lean on top.
+-- Active only where the mode steers by bank (bankSteer): HYBRID in the non-pad phases,
+-- FIXEDWING in every phase; zero in VTOL and during autoland. CALIBRATE CFG.BANK_XTK_SIGN
+-- in-game like every other *_SIGN -- it is a GUESS combining several already-calibrated
+-- signs: if the craft banks the WRONG way and drifts FURTHER off track (diverges), flip it.
+CFG.BANK_XTK_SIGN = 1
+CFG.BANK_PER_LAT  = 0.015   -- rad of commanded bank per redstone-step of body-right demand
+CFG.BANK_LAT_MAX  = 0.5    -- rad (~29 deg) cap on the cross-track bank component alone
+-- Cross-track-RATE damping on the bank. Banking-to-track is a slow 2nd-order loop (bank ->
+-- lateral lift -> velocity -> position) that SWAYS if driven on position error alone -- and
+-- the P demand above SATURATES (clamps at BANK_LAT_MAX / STRAFE_MAX), which throws away the
+-- little rate-damping baked into the strafe law exactly when off-track and closing fast. So
+-- add an explicit counter-bank against the cross-track closing rate that survives that
+-- saturation. Built with the SAME handedness as the strafe law's D term (STRAFE_SIGN*xtkRate)
+-- so it rides on BANK_XTK_SIGN and needs no separate calibration. Raise if it still sways;
+-- lower toward 0 if the correction turns sluggish / it won't bank in enough to close.
+CFG.BANK_XTK_KD   = 1.5   -- rad of counter-bank per m/s of cross-track closing rate (leg only)
+
+-- SPARING strafe for HYBRID's banking phases. Banking is a slow 2nd-order lateral response
+-- (bank -> sideways lift -> velocity -> position) and tends to OSCILLATE about the track.
+-- So HYBRID keeps a SMALL strafe authority through the banking phases -- mostly its rate/D
+-- damping -- to settle that oscillation without taking lateral control back off the bank
+-- ("strafe sparingly, to minimise banking oscillation"). FIXEDWING keeps NONE (strafe fully
+-- off). FRAC -> 0 flies HYBRID like FIXEDWING (pure banking); FRAC -> 1 is more VTOL-like
+-- strafe; MAX hard-caps the steps the sparing strafe may ever command so it can't dominate.
+CFG.HYBRID_STRAFE_FRAC = 0.25   -- fraction of the full course strafe kept while banking
+CFG.HYBRID_STRAFE_MAX  = 4      -- redstone-step cap on that sparing strafe
+
+-- Set CFG.FLIGHT_MODE and derive its flags (unrecognised -> VTOL). A function, not an inline
+-- block, so the on-screen MODE button (inputLoop) can switch modes at runtime and re-derive.
+-- The flags stay in CFG (not new top-level locals) to respect Cobalt's 200-locals cap.
+local function applyFlightMode(mode)
+    if mode ~= "HYBRID" and mode ~= "FIXEDWING" then mode = "VTOL" end
+    CFG.FLIGHT_MODE    = mode
+    CFG.STRAFE_ENABLED = (mode ~= "FIXEDWING")
+    CFG.ATTITUDE_BANKS = (mode == "HYBRID" or mode == "FIXEDWING")
+    CFG.MODE_TAG       = (mode == "HYBRID" and "HYB") or (mode == "FIXEDWING" and "FW") or "VTOL"
+end
+applyFlightMode(CFG.FLIGHT_MODE)   -- derive from the source-configured default
 
 -- ============================================================================
 -- TRANSLATION CONFIG -- ported from navcom.lua (yaw removed; it is attitude now)
 -- ============================================================================
-CFG.CRUISE_SPEED       = 70.0
+CFG.CRUISE_SPEED       = 150.0
 CFG.APPROACH_KP        = 0.20
 CFG.APPROACH_SPEED     = 30.0
 CFG.TERMINAL_MAX_SPEED = 10.0
+-- NOTE: the manoeuvre slowdowns (nose-alignment gate, cross-track bleed) now live in the FMS
+-- (#8 dynamicSpeedTarget) so that ONE place owns the commanded speed and its HSI CMD readout is
+-- truthful. Do not re-add them here -- two sources would double-cut the throttle.
 CFG.TRANSLATE_MIN_CMD  = 5.0
 CFG.TRANSLATE_DEADZONE = 1.0
 CFG.TRANSLATE_MIN_RATE = 0.35
@@ -550,6 +636,10 @@ local navPrev   = nil                     -- {X, Z} previous waypoint, or nil
 local navPhase  = "ENROUTE"
 local navHoldHeading = nil
 local navCruiseCap   = CFG.CRUISE_SPEED
+local navCruiseCapDynamic = false   -- FMS schedules the speed (schedSpeed): track cruiseCap as a
+                                    -- speed target, not just a ceiling. false -> old per-fix decel.
+local navCarrot = false             -- target is an en-route carrot on the FMS's smoothed path:
+                                    -- pure-pursue it (velocity-vector, no cross-track leg hold).
 local apLastMsg = nil
 
 -- Pilot autopilot mode (from #12) and manual vertical (from #6). Held between
@@ -560,6 +650,9 @@ local AP_ALT = CFG.AP_ALT_DEFAULT
 local apswLastMsg = nil
 local manVS = 0            -- pilot's wanted climb rate (m/s) from the VSC #6
 local manLastMsg = nil
+local manFwd, manStrafe, manYaw = 0, 0, 0  -- pilot's wanted body velocities (m/s, m/s, rad/s), MIC #14
+local manNavActive  = false                -- MIC reports a key currently held (vs. sticks centred)
+local manNavLastMsg = nil
 
 local AP_ALTI    = nil
 local altLastMsg = nil
@@ -674,7 +767,7 @@ end
 -- frame if needed, and the inertia tensor is applied via inertiaMul (body vector ->
 -- body vector, whatever frame the tensor itself is in). There is no final command
 -- rotation, so a pure pitch demand stays a pure pitch command.
-local function attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitchCmd, idle)
+local function attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitchCmd, idle, yawBrake, manYawRate)
     bankCmd  = bankCmd  or 0   -- commanded roll  overlay (rad), HYBRID/FIXEDWING; 0 = level
     pitchCmd = pitchCmd or 0   -- commanded pitch overlay (rad), HYBRID/FIXEDWING; 0 = level
     -- idle: craft parked/engine-off (see the IDLE block). Freezes + bleeds the trim integral.
@@ -762,11 +855,13 @@ local function attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitch
         -- brake from (so yaw doesn't overshoot/spin); inner P(D) tracks that rate,
         -- plus the integral trim as an accel bias.
         local wdx = profileRate(ex, CFG.ATT_KP, CFG.MAX_RATE_PITCH, CFG.MAX_DECEL_PITCH)
-        local wdy = profileRate(ey, CFG.ATT_KP, CFG.MAX_RATE_YAW,   CFG.MAX_DECEL_YAW)
+        -- Manual yaw held -> the pilot NAMES the yaw rate; feed it straight to the rate loop and
+        -- skip the heading profile (no ramp to chase = no counter-steer overshoot). Else profile.
+        local wdy = manYawRate or profileRate(ey, CFG.ATT_KP, CFG.MAX_RATE_YAW, CFG.MAX_DECEL_YAW)
         local wdz = profileRate(ez, CFG.ATT_KP, CFG.MAX_RATE_ROLL,  CFG.MAX_DECEL_ROLL)
         local rex, rey, rez = wdx - wx, wdy - wy, wdz - wz
         local ax = CFG.RATE_KP*rex     + CFG.ATT_KI*biasX
-        local ay = CFG.RATE_KP_YAW*rey + CFG.ATT_KI*biasY
+        local ay = CFG.RATE_KP_YAW*rey + CFG.ATT_KI*biasY - (yawBrake or 0)*wy
         local az = CFG.RATE_KP*rez     + CFG.ATT_KI*biasZ
         if CFG.RATE_KD ~= 0 then
             ax = ax + CFG.RATE_KD*(rex - prevRateErrX)/dt
@@ -815,7 +910,11 @@ local function attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitch
     else
         -- PD in the body frame, per axis (inherently decoupled), + integral step bias.
         px = CFG.PD_KP_PITCH*ex - CFG.PD_KD_PITCH*wx + CFG.PD_KI*biasX
-        py = CFG.PD_KP_YAW  *ey - CFG.PD_KD_YAW  *wy + CFG.PD_KI*biasY
+        if manYawRate then   -- manual: track the commanded yaw rate, not a heading
+            py = CFG.PD_KD_YAW*(manYawRate - wy) + CFG.PD_KI*biasY
+        else
+            py = CFG.PD_KP_YAW  *ey - CFG.PD_KD_YAW  *wy + CFG.PD_KI*biasY - (yawBrake or 0)*wy
+        end
         pz = CFG.PD_KP_ROLL *ez - CFG.PD_KD_ROLL *wz + CFG.PD_KI*biasZ
         ui.rotRaw = math.sqrt(px*px + py*py + pz*pz)
     end
@@ -824,6 +923,11 @@ local function attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitch
     -- never roll/pitch the craft over faster than the leveling loop can recover.
     local tilt = math.sqrt(ex*ex + ez*ez)   -- pitch+roll error magnitude (rad), excl. yaw
     local yawScale = clamp((CFG.TILT_YAW_MAX - tilt) / (CFG.TILT_YAW_MAX - CFG.TILT_YAW_MIN), 0, 1)
+    -- Manual yaw BRAKE gets full authority: level-priority normally fades yaw as tilt grows, but
+    -- nulling a spin REDUCES flip risk (it can't tip the craft over faster than it's already
+    -- going), so a brake must not be starved of thrust by the little nutation-tilt a hard yaw
+    -- throws off. Keep full scale up to the hard flip guard (TILT_YAW_MAX ~34 deg).
+    if (yawBrake or 0) > 0 and tilt < CFG.TILT_YAW_MAX then yawScale = 1 end
 
     ui.errPitch, ui.errYaw, ui.errRoll = ex, ey, ez
     ui.integP, ui.integR = attIntegX, attIntegZ
@@ -843,7 +947,9 @@ local function controlLoop()
     local trimBoost = 0
     local lastDesiredVelY = 0   -- previous tick's desired climb rate, feeds pitch overlay
     local bankCmd  = 0          -- slewed coordinated-bank command (rad), HYBRID/FIXEDWING
+    local lastLatDemand = 0     -- previous tick's body-right course demand, feeds the cross-track bank
     local pitchCmd = 0          -- slewed pitch-for-altitude command (rad), HYBRID/FIXEDWING
+    local manHeading = nil      -- integrated manual-yaw heading target (MIC #14); nil until first tick
     local stillFor = 0          -- s the craft has been still-and-unguided, for the idle gate
     local altCascadePrev = false -- edge-detect entry into altitude-hold, to seize current alt
 
@@ -904,32 +1010,102 @@ local function controlLoop()
             end
         end
 
-        local translateOnly = (navPhase == "APPROACH" or navPhase == "TERMINAL"
+        -- APPROACH is deliberately treated like ENROUTE here (cruise speed + along-track +
+        -- leg cross-track hold), NOT as a slow position-hold: the FMS emits APPROACH for the
+        -- whole penultimate leg and the final leg while still outside the final point's pass
+        -- radius, and we want to keep FLYING (and seeking heading) through all that, slowing
+        -- and handing off heading only once actually AT the final point (TERMINAL/ARRIVED,
+        -- inside its pass radius -- the autoland then rotates the nose via the LANDING phase).
+        local translateOnly = (navPhase == "TERMINAL"
             or navPhase == "ARRIVED" or navPhase == "LANDING")
+        -- APPROACH also flies the VELOCITY VECTOR toward the fix (via the translateOnly law below),
+        -- not the scalar closing speed: the closing loop only sees velocity TOWARD the target, so an
+        -- overshoot/orbit (closing goes NEGATIVE while ground speed stays high) is never braked -- it
+        -- even commands forward thrust to chase the fix it just passed. Velocity-vector control nulls
+        -- the tangential component too. APPROACH still seeks the bearing (desiredHeading, above).
+        local approachVec = (navPhase == "APPROACH")
         local headingHold = (navPhase == "LANDING" and type(navHoldHeading) == "number")
 
+        -- Lateral-control policy for HYBRID/FIXEDWING. Pad phases = the close-in, precise
+        -- ones where strafe does the pad alignment. bankSteer = "this tick the mode corrects
+        -- lateral course by BANKING": HYBRID banks in the non-pad phases and hands lateral
+        -- control to strafe (wings-level) in the pad phases; FIXEDWING has no strafe at all so
+        -- it banks in EVERY phase. Autoland (alState ~= normal, incl. the LANDING phase) forces
+        -- wings-level in BOTH modes for a level pad approach -- excluded here via alState.
+        local padPhase  = (navPhase == "TERMINAL" or navPhase == "ARRIVED" or navPhase == "LANDING")
+        local bankSteer = CFG.ATTITUDE_BANKS and alState == "normal"
+            and not (CFG.FLIGHT_MODE == "HYBRID" and padPhase)
+
         -- ---- desired heading, per phase (the yaw "autopilot") ----
-        --  ENROUTE  -> seek the bearing to the target
+        --  ENROUTE/APPROACH -> seek the bearing to the target (keep pointing the nose all the
+        --                      way in; APPROACH is still an active flying leg -- see translateOnly)
         --  LANDING  -> hold the commanded pad heading
-        --  else / hands-off / no target / AP_NAV off -> current heading, so the attitude
-        --                     loop only rate-damps yaw and the pilot keeps steering.
-        local desiredHeading = heading
-        if navActive then
-            if hasTarget and navPhase == "ENROUTE" then desiredHeading = bearing
-            elseif headingHold then desiredHeading = navHoldHeading end
+        --  else (TERMINAL/ARRIVED at the final point) / hands-off / no target / AP_NAV off ->
+        --                      current heading: stop seeking, the attitude loop only rate-damps
+        --                      yaw and the pilot / autoland sequence takes the nose from here.
+        -- ---- manual horizontal + yaw stick (MIC #14) ----
+        -- Live only with AP-NAV OFF and a fresh MIC packet. Manual yaw is a RATE command:
+        --   STICK HELD -> feed the wanted yaw rate straight to the inner rate loop (crisp,
+        --     constant rotation). Do NOT ramp a heading target and chase it -- the position
+        --     cascade's decel-limited profile is built to slew to a FIXED heading and stop,
+        --     so tracking a moving ramp makes it overshoot/reverse (the counter-steer buzz).
+        --   STICK CENTRED -> the stable inner rate loop nulls the yaw to zero (wdy=0), then the
+        --     heading is frozen where it stops and held -- the MIC's "cancel unwanted yawing".
+        -- manHeading tracks the live heading whenever we're NOT holding (commanding, or not
+        -- manual), so the freeze-on-release grabs the current heading with no snap.
+        local manNavFresh = manNavLastMsg and (now - manNavLastMsg) <= CFG.MANNAV_STALE_AFTER
+        local manNavLive  = CFG.MANNAV_ENABLE and (not navActive) and manNavFresh and true or false
+        if manHeading == nil then manHeading = heading end
+        local manYawCmd  = manNavLive and (math.abs(manYaw) >= CFG.MANNAV_YAW_EPS)   -- stick held
+        local manYawRate = nil
+        if manYawCmd then
+            manYawRate = clamp(CFG.MANNAV_YAW_SIGN * manYaw, -CFG.MAX_RATE_YAW, CFG.MAX_RATE_YAW)
+            manHeading = heading      -- track live heading while steering
+        elseif manNavLive then
+            -- Stick centred: with manYawRate nil and the heading error held at ~0 (below), the
+            -- attitude loop runs wdy=0 -> the STABLE, critically-damped inner rate loop nulls wy
+            -- (RATE_KP_YAW alone -- no extra brake gain, so no ring). Keep manHeading tracking the
+            -- live heading while the craft is still rotating so there's no positional pull (pure
+            -- rate-null), and CAPTURE/freeze the hold-heading only once the rate has settled -- so
+            -- it holds where it actually stops, not the release-instant heading (momentum carries
+            -- past that, and the heading-hold would then drag it back the opposite way).
+            if math.abs(w.y) > CFG.MANNAV_YAW_SETTLE then
+                manHeading = heading  -- still rotating: track -> no heading-hold pull, just the rate-null
+            end                        -- settled: manHeading FROZEN at the stop heading -> hold it
+        else
+            manHeading = heading      -- not flying manually: stay synced (no snap on handoff)
         end
 
-        -- ---- coordinated-bank + pitch-for-altitude commands (HYBRID/FIXEDWING) ----
-        -- Bank leans into the turn (from the heading error, so wings-level on a tracked
-        -- course); pitch tracks the desired climb rate. Both are slewed for a smooth
-        -- roll/pitch in and out, held at zero in VTOL, and suppressed during autoland/
-        -- LANDING so the craft keeps a level, un-banked pad approach.
+        local desiredHeading = heading
+        if navActive then
+            if hasTarget and (navPhase == "ENROUTE" or navPhase == "APPROACH") then desiredHeading = bearing
+            elseif headingHold then desiredHeading = navHoldHeading end
+        elseif manNavLive then
+            desiredHeading = manHeading   -- used only when centred; a held stick overrides via manYawRate
+        end
+
+        -- ---- coordinated + cross-track bank + pitch-for-altitude (HYBRID/FIXEDWING) ----
+        -- Only when the mode is steering by bank this tick (bankSteer -- see its note): zero
+        -- in VTOL, during autoland, and in HYBRID's wings-level pad phases. Two bank sources:
+        --   * coordinated-turn bank -- leans INTO a heading change (from the heading error),
+        --     so it fades to zero once tracking; purely how a turn LOOKS.
+        --   * cross-track bank -- the PRIMARY in-course lateral corrector: banks toward the
+        --     track using the same body-right demand strafe would apply (last tick's
+        --     latDemand), so the tilted alt-thruster lift pulls the craft back on line
+        --     instead of strafing. See CFG.BANK_XTK_SIGN (a calibration GUESS).
+        -- pitch tracks the desired climb rate. All are slewed for a smooth roll/pitch in/out.
         local bankTarget, pitchTarget = 0, 0
-        if CFG.ATTITUDE_BANKS and alState == "normal" and navPhase ~= "LANDING" then
+        if bankSteer then
             -- Heading-error bank: zero on a tracked course. For a turn-RATE bank instead
             -- (banks during ANY yaw, incl. pilot yaw), use CFG.BANK_PER_YAWERR * w.y here.
             local hErr  = wrapPi(desiredHeading - heading)
             bankTarget  = clamp(CFG.BANK_PER_YAWERR * hErr, -CFG.BANK_MAX, CFG.BANK_MAX)
+            local latBank = CFG.BANK_XTK_SIGN * CFG.BANK_PER_LAT * lastLatDemand
+            if hasLeg then   -- rate damping to settle the banking sway; survives P saturation
+                latBank = latBank - CFG.BANK_XTK_SIGN * CFG.STRAFE_SIGN * CFG.BANK_XTK_KD * xtkRate
+            end
+            latBank = clamp(latBank, -CFG.BANK_LAT_MAX, CFG.BANK_LAT_MAX)
+            bankTarget  = clamp(bankTarget + latBank, -CFG.BANK_MAX, CFG.BANK_MAX)
             -- Pitch from LAST tick's desired climb rate (computed after attitude, below);
             -- one 50 ms tick of lag on a cosmetic pitch command is immaterial.
             pitchTarget = clamp(CFG.PITCH_PER_MPS * lastDesiredVelY, -CFG.PITCH_ALT_MAX, CFG.PITCH_ALT_MAX)
@@ -955,9 +1131,15 @@ local function controlLoop()
         ui.idle = idle
 
         -- ---- ATTITUDE ----
+        -- Manual yaw brake: engage the extra yaw rate-null only when flying manually with the
+        -- yaw stick released (command ~0). Drives residual angular velocity to zero hard so a
+        -- hand-flown yaw settles crisply; a no-op for the autopilot and while actively yawing.
+        local yawBrake = (manNavLive and math.abs(manYaw) < CFG.MANNAV_YAW_EPS)
+            and CFG.MANNAV_YAW_BRAKE or 0
+        ui.yawBrake = (yawBrake > 0)
         local pitchSteps, rollSteps, yawSteps = 0, 0, 0
         if CFG.ENABLE_ATTITUDE then
-            pitchSteps, rollSteps, yawSteps = attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitchCmd, idle)
+            pitchSteps, rollSteps, yawSteps = attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitchCmd, idle, yawBrake, manYawRate)
         end
 
         -- ---- HORIZONTAL TRANSLATION (ported navcom) ----
@@ -966,9 +1148,19 @@ local function controlLoop()
         -- the vertical command, not navigating).
         local thrustCmd, strafeCmd = 0, 0
         if CFG.ENABLE_TRANSLATION and navActive and hasTarget then
-            if translateOnly then
-                local speedCap = (navPhase == "APPROACH") and CFG.APPROACH_SPEED or CFG.TERMINAL_MAX_SPEED
-                local desiredSpeed = clamp(CFG.APPROACH_KP * dist, 0, speedCap)
+            if translateOnly or approachVec or navCarrot then
+                -- Velocity-vector control toward the target. APPROACH and the en-route CARROT both
+                -- track the FMS's scheduled speed directly (single source of truth on the HSI); the
+                -- carrot is a moving point on the smoothed path, so pure-pursuing it gives smooth
+                -- bearing AND self-corrects cross-track (no separate leg hold). TERMINAL/ARRIVED/
+                -- LANDING draw their own decelerate-to-zero position hold to stop AT the point.
+                local desiredSpeed
+                if (approachVec or navCarrot) and navCruiseCapDynamic then
+                    desiredSpeed = clamp(navCruiseCap, 0, CFG.CRUISE_SPEED)
+                else
+                    local speedCap = (navPhase == "APPROACH") and CFG.APPROACH_SPEED or CFG.TERMINAL_MAX_SPEED
+                    desiredSpeed = clamp(CFG.APPROACH_KP * dist, 0, speedCap)
+                end
                 local ux, uz = 0, 0
                 if dist > 1e-6 then ux, uz = dx / dist, dz / dist end
                 local velErrX = desiredSpeed * ux - vel.x
@@ -994,7 +1186,20 @@ local function controlLoop()
                 local cap = clamp(navCruiseCap, 0, CFG.CRUISE_SPEED)
                 local headingErr = wrapPi(bearing - heading)
                 local align = math.max(0, math.cos(headingErr))
-                local desiredClosing = clamp(CFG.APPROACH_KP * dist, 0, cap) * align
+                -- When the FMS is scheduling the speed (turn-aware look-ahead), TRACK its cap
+                -- directly -- it already bleeds speed in for sharp corners and the destination and
+                -- holds cruise through gentle fly-by fixes. Only fall back to the old decelerate-
+                -- toward-THIS-fix law (which slowed at every waypoint) when no schedule is present.
+                local desiredClosing
+                if navCruiseCapDynamic then
+                    -- Track the FMS speed EXACTLY. It already folds in the proximity/look-ahead
+                    -- slowdown AND the nose-alignment / cross-track gates, so re-deriving any of
+                    -- that here would double-cut it and make the FMS's displayed CMD a lie (the
+                    -- craft coasted at ~30 while the HSI read 130). One source of speed truth.
+                    desiredClosing = cap
+                else
+                    desiredClosing = clamp(CFG.APPROACH_KP * dist, 0, cap) * align
+                end
                 speedPID.sp = desiredClosing
                 local ib = speedPID.integral
                 local thrustRaw = CFG.SPD_FF * desiredClosing + speedPID:step(closing, dt)
@@ -1034,6 +1239,34 @@ local function controlLoop()
                     strafePID.integral = 0
                 end
             end
+        elseif CFG.ENABLE_TRANSLATION and manNavLive then
+            -- MANUAL body-frame velocity command from the MIC (#14). Proportional velocity
+            -- control to the pilot's wanted forward/right speed -- the SAME body projection and
+            -- gains/signs as the TERMINAL translate law above, but the target is pilot-named,
+            -- not position-derived. A released stick sends 0 -> the craft brakes to a hover in
+            -- place (velocity-hold at zero), which is how sideways drift gets nulled.
+            local sinH, cosH = math.sin(heading), math.cos(heading)
+            local fwdVel   = vel.x * sinH + vel.z * cosH        -- body forward speed
+            local rightVel = vel.z * sinH - vel.x * cosH        -- body right speed (xtk handedness)
+            local fwdCmd   = CFG.SPD_KP    * (manFwd    - fwdVel)
+            local rightCmd = CFG.STRAFE_KP * (manStrafe - rightVel)
+            thrustCmd = CFG.THRUST_SIGN * clamp(fwdCmd,   -CFG.THRUST_MAX, CFG.THRUST_MAX)
+            strafeCmd = CFG.STRAFE_SIGN * clamp(rightCmd, -CFG.STRAFE_MAX, CFG.STRAFE_MAX)
+            speedPID.integral  = 0
+            strafePID.integral = 0
+        end
+
+        -- Capture the body-right course-correction demand (pre-mode, pre-spill) so next
+        -- tick's cross-track bank can fly it by BANKING instead of strafing.
+        local latDemand = strafeCmd
+
+        -- HYBRID banking phases: banking is the lateral corrector, so keep only a SPARING
+        -- strafe -- just enough to damp the slow, 2nd-order bank oscillation (its D term
+        -- opposes cross-track drift). FIXEDWING keeps NONE (zeroed at output). VTOL and the
+        -- HYBRID pad phases keep full strafe.
+        if bankSteer and CFG.FLIGHT_MODE == "HYBRID" then
+            strafeCmd = clamp(strafeCmd * CFG.HYBRID_STRAFE_FRAC,
+                -CFG.HYBRID_STRAFE_MAX, CFG.HYBRID_STRAFE_MAX)
         end
 
         -- ---- VERTICAL (ported control.lua cascade + autoland, OR manual VSC) ----
@@ -1095,7 +1328,14 @@ local function controlLoop()
             local ux, uy, uz = rotateVec(q_inv, 0, 1, 0)   -- world-up expressed in body
             altSteps  = vertEffort * uy                     -- body-up axis  -> alt thruster
             thrustCmd = thrustCmd + vertEffort * uz * CFG.VERT_XFER_FWD   -- body-fwd -> fore/aft
-            strafeCmd = strafeCmd + vertEffort * ux * CFG.VERT_XFER_STR   -- body-lat -> strafe
+            -- Lateral spill: normally the strafe thruster picks up the banked alt thruster's
+            -- sideways component so altitude AND position hold. But while STEERING by bank
+            -- (bankSteer) that sideways component is exactly the lift turning the craft, so
+            -- cancelling it would defeat the bank -- leave it UNcancelled (as FIXEDWING does
+            -- by zeroing strafe entirely). Otherwise (VTOL, HYBRID pad phases) compensate.
+            if not bankSteer then
+                strafeCmd = strafeCmd + vertEffort * ux * CFG.VERT_XFER_STR   -- body-lat -> strafe
+            end
             ui.tiltUp = uy
         end
         altUp, altDown = sendAlt(CFG.ENABLE_ALTITUDE and altSteps or 0)
@@ -1118,9 +1358,15 @@ local function controlLoop()
         ui.headingDeg = math.deg(wrapPi(heading))
         ui.desHeadingDeg = math.deg(wrapPi(desiredHeading))
         ui.yawRate = w.y
-        ui.phase = (not navActive) and "HANDOFF" or (hasTarget and navPhase or "NO TGT")
+        ui.phase = navActive and (hasTarget and navPhase or "NO TGT")
+            or (manNavLive and (manNavActive and "MANUAL" or "MAN-HOLD") or "HANDOFF")
         ui.apNav, ui.apAlt, ui.altManual = AP_NAV, AP_ALT, (not useAltCascade)
         ui.dist, ui.bearingDeg = dist, math.deg(wrapPi(bearing))
+        -- Speed diagnostics: CMD = cap the FMS actually sent us, CLO = closing (velocity TOWARD the
+        -- target -- what the along-track PID controls), GS = true horizontal ground speed. If CMD is
+        -- 20-30 but the craft stays fast: CLO high + THR not going negative => PID/thruster (can't
+        -- brake); CLO low but GS high => speed is tangential (loop happy, craft still fast).
+        ui.cmdCap, ui.closing, ui.gs = navCruiseCap, closing, speedH
         ui.xtk = hasLeg and (CFG.XTK_SIGN * xtk) or nil
         ui.targetAlt, ui.velY, ui.desVelY = TARGET_ALT, velY, desiredVelY
         ui.altUp, ui.altDown = altUp, altDown
@@ -1129,6 +1375,8 @@ local function controlLoop()
         ui.alState = alState
         ui.tgtName = navTarget[4]
         ui.bankCmd, ui.pitchCmd = bankCmd, pitchCmd
+        ui.bankSteer = bankSteer
+        lastLatDemand = latDemand   -- feed next tick's cross-track bank
 
         sleep(0.05)
     end
@@ -1143,6 +1391,8 @@ local function navReceiveLoop()
                 navTarget = { nil, nil, nil, '' }
                 navPrev, navPhase = nil, "ENROUTE"
                 navHoldHeading, navCruiseCap = nil, CFG.CRUISE_SPEED
+                navCruiseCapDynamic = false
+                navCarrot = false
                 apLastMsg = os.clock()
             else
                 local x = tonumber(msg.x)
@@ -1158,6 +1408,8 @@ local function navReceiveLoop()
                     navPhase = tostring(msg.phase or "ENROUTE")
                     navHoldHeading = tonumber(msg.holdHeading)
                     navCruiseCap = tonumber(msg.cruiseCap) or CFG.CRUISE_SPEED
+                    navCruiseCapDynamic = msg.schedSpeed and true or false
+                    navCarrot = msg.carrot and true or false
                     apLastMsg = os.clock()
                 end
             end
@@ -1202,6 +1454,23 @@ local function manConReceiveLoop()
                 manVS = v
                 manLastMsg = os.clock()
             end
+        end
+    end
+end
+
+-- Manual horizontal + yaw from the MIC (#14): wanted body velocities (fwd/strafe m/s, yaw
+-- rad/s) + an "active" flag. Held between packets; the control loop gates on freshness and
+-- the AP-NAV switch. A distinct protocol from the vertical mancon so this can own a loop
+-- (two rednet.receive loops cannot share one protocol filter).
+local function manNavReceiveLoop()
+    while true do
+        local sender, msg = rednet.receive(CFG.MANNAV_PROTOCOL, 1)
+        if sender and type(msg) == "table" then
+            manFwd    = tonumber(msg.fwd)    or 0
+            manStrafe = tonumber(msg.strafe) or 0
+            manYaw    = tonumber(msg.yaw)    or 0
+            manNavActive  = msg.active and true or false
+            manNavLastMsg = os.clock()
         end
     end
 end
@@ -1290,12 +1559,25 @@ local function displayLoop()
             (ui.pStep or outStab).front, (ui.pStep or outStab).back,
             (ui.pStep or outStab).left, (ui.pStep or outStab).right, ui.yaw or 0, ui.rotRaw or 0))
         line(r + 7, string.format("TRIM iP%+.2f iR%+.2f yS%.2f gy%.2f %s",
-            ui.integP or 0, ui.integR or 0, ui.yawScale or 1, ui.gyroFade or 0, ui.idle and "PARK" or ""))
+            ui.integP or 0, ui.integR or 0, ui.yawScale or 1, ui.gyroFade or 0,
+            (ui.idle and "PARK " or "") .. (ui.yawBrake and "YBRK" or "")))
         line(r + 8, string.format("I(k) x%.0f y%.0f z%.0f", (ui.Ix or 0)/1000, (ui.Iy or 0)/1000, (ui.Iz or 0)/1000))
-        line(r + 9, string.format("MODE %-4s STR%s bank%+.2f pit%+.2f",
-            CFG.MODE_TAG, CFG.STRAFE_ENABLED and "+" or "-", ui.bankCmd or 0, ui.pitchCmd or 0))
+        local strTag = (not CFG.STRAFE_ENABLED and "off")
+            or (ui.bankSteer and "spar") or "on"   -- FIXEDWING off; HYBRID banking=spar, pad=on
+        -- MODE line: the mode tag is a CLICKABLE BUTTON (highlighted) that cycles the flight
+        -- mode -- inputLoop reads the bounds we publish here as ui.modeBtn. Tap to change.
+        term.setCursorPos(1, r + 9); term.clearLine()
+        term.setTextColour(colours.white); term.write("MODE ")
+        local btnText = " " .. CFG.MODE_TAG .. " "
+        local bx1 = 6                              -- first column of the button ("MODE " = 5)
+        term.setBackgroundColour(colours.orange); term.setTextColour(colours.black)
+        term.write(btnText)
+        ui.modeBtn = { x1 = bx1, x2 = bx1 + #btnText - 1, y = r + 9 }
+        term.setBackgroundColour(colours.black); term.setTextColour(colours.white)
+        term.write(string.format(" STR:%-4s bank%+.2f pit%+.2f", strTag, ui.bankCmd or 0, ui.pitchCmd or 0))
         term.setTextColour(colours.orange)
-        line(r + 3, string.format("PHASE %-7s  DIST %6.1f", ui.phase or "--", ui.dist or 0))
+        line(r + 3, string.format("PH %-7s D%5.0f CMD%3.0f CLO%3.0f GS%3.0f",
+            ui.phase or "--", ui.dist or 0, ui.cmdCap or 0, ui.closing or 0, ui.gs or 0))
         term.setTextColour(colours.white)
         if ui.xtk then
             line(r + 4, string.format("XTK %+5.1fm  THR %+3d  STR %+3d", ui.xtk, ui.thr or 0, ui.str or 0))
@@ -1316,6 +1598,25 @@ local function displayLoop()
     end
 end
 
+-- TERMINAL INPUT: the on-screen MODE button. A click (advanced-computer terminal) or a
+-- monitor touch within the button bounds displayLoop published (ui.modeBtn) cycles the
+-- flight mode VTOL -> HYBRID -> FIXEDWING -> VTOL and re-derives its flags. Levelling and
+-- the slewed bank/strafe transitions absorb the switch, so it is safe to toggle in flight.
+local function inputLoop()
+    local order = { "VTOL", "HYBRID", "FIXEDWING" }
+    while true do
+        local ev, _, x, y = os.pullEvent()   -- mouse_click/monitor_touch both give (.,.,x,y)
+        if ev == "mouse_click" or ev == "monitor_touch" then
+            local b = ui.modeBtn
+            if b and y == b.y and x >= b.x1 and x <= b.x2 then
+                local idx = 1
+                for i = 1, #order do if CFG.FLIGHT_MODE == order[i] then idx = i end end
+                applyFlightMode(order[(idx % #order) + 1])
+            end
+        end
+    end
+end
+
 -- Kill outputs on exit; hold the learnt altitude trim rather than a blind neutral.
 local function shutdown()
     pcall(function()
@@ -1333,7 +1634,7 @@ end
 term.setBackgroundColour(colours.black); term.clear()
 local ok, err = pcall(parallel.waitForAny,
     controlLoop, navReceiveLoop, altReceiveLoop, autolandReceiveLoop,
-    apSwitchReceiveLoop, manConReceiveLoop, displayLoop)
+    apSwitchReceiveLoop, manConReceiveLoop, manNavReceiveLoop, displayLoop, inputLoop)
 shutdown()
 term.setBackgroundColour(colours.black); term.setTextColour(colours.white)
 term.setCursorPos(1, term.getSize() and select(2, term.getSize()) or 19)
