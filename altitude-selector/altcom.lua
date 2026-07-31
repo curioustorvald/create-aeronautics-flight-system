@@ -378,7 +378,7 @@ local function aiLoop()
     mon.setBackgroundColour(colours.black); mon.clear()
     while true do
         pcall(drawAI)
-        sleep(0.15)
+        sleep(0.05)
     end
 end
 

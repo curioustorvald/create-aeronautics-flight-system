@@ -60,7 +60,7 @@ local PING_INTERVAL = 0.2  -- s; how often the current target is re-broadcast. M
                            -- because cruiseCap now carries a LIVE commanded speed (with the nose-
                            -- alignment / cross-track gates folded in), not just a slow keep-alive --
                            -- at 1 s the craft would accelerate for a whole second before a gate bit.
-local TICK_INTERVAL = 0.1  -- s; how often position vs target is checked
+local TICK_INTERVAL = 0.05  -- s; how often position vs target is checked
 
 -- AUTO-LANDING ---------------------------------------------------------------
 -- The FMS runs the landing state machine itself: it reads position, heading,
@@ -101,32 +101,31 @@ local HEADING_OFFSET = math.pi
 -- Pilot-selectable cruise-speed cap, sent to NAVCOM as msg.cruiseCap and applied only
 -- by its ENROUTE law (so the status-screen button "only works in cruising mode"). Three
 -- presets; COAST is a plain 0.
-local SPEED_FULL = 110   -- m/s "FULL" cruise (kept below navcom's CRUISE_SPEED ceiling) Choose fastest speed that does not outrun chunk loading
-local SPEED_SLOW = 40   -- m/s "SLOW"; mirror of navcom.lua's APPROACH_SPEED
+local SPEED_FULL = 240   -- m/s "FULL" cruise (kept below navcom's CRUISE_SPEED ceiling) Choose fastest speed that does not outrun chunk loading
+local SPEED_SLOW = 50   -- m/s "SLOW"; mirror of navcom.lua's APPROACH_SPEED
 -- Cycle order when the button is tapped.
 local NEXT_CRUISE = { full = "slow", slow = "coast", coast = "full" }
 
--- DYNAMIC CRUISE (kinematic braking envelope) --------------------------------
--- SPEED_FULL / SPEED_SLOW are a soft max/min band. Each upcoming fix has a `need` speed (a turn's
--- corner speed, or DC.FINAL_ARRIVE_SPEED at the destination; a gentle fly-by needs full cruise and
--- never slows). dynamicSpeedTarget commands the fastest speed from which the craft can still bleed
--- to every upcoming need in time, braking at DC.BRAKE_DECEL -- envelope sqrt(need^2 + 2*DECEL*dist),
--- min over fixes scanned by DISTANCE (so a sharp turn several fixes ahead is caught early). Braking
--- distance therefore scales with the speed to be shed (~v^2), which a flat proximity distance could
--- not -- it braked too late up high and too early down low.
+-- DYNAMIC CRUISE (pre-planned clothoid path + baked speed profile) -----------
+-- The en-route path is now planned ONCE, when the pilot confirms a plan (setDirectTo /
+-- setRoute / RTR.setSolvedRoute call planPath()): each interior waypoint gets an explicit
+-- LineSegment -> ClothoidSegment -> CircularArc -> ClothoidSegment -> LineSegment fly-by
+-- transition sized from a real turn radius R = V^2/(g*tan(bank)), and the whole route is
+-- walked into a dense arc-length-sampled polyline (PLAN.samples) with the speed profile
+-- baked in. Runtime (dynamicSpeedTarget/broadcastCurrent/drawCourseHSI) just looks values
+-- up on that polyline -- no per-tick curve math. See the PLAN table below planPath().
 --
--- This function is the SINGLE source of commanded speed: the manoeuvre gates (nose alignment,
--- cross-track) are applied HERE too, not in the UAC, so the CMD on the HSI is exactly what the
--- aircraft is flown to. The UAC just tracks it as cruiseCap (schedSpeed=true).
+-- This function is still the SINGLE source of commanded speed: the destination-arrival
+-- brake and cross-track gate are applied HERE, not in the UAC, so the CMD on the HSI is
+-- exactly what the aircraft is flown to. The UAC just tracks it as cruiseCap (schedSpeed=true).
 -- ROUTE START: point the nose at the first target BEFORE applying any throttle. While the
 -- heading error to the target exceeds LG.ALIGN_HDG_DEG the commanded speed is 0, so the craft
 -- simply yaws onto the bearing instead of accelerating off on the old heading and arcing round.
 -- Cleared for good once aligned (per plan, not per leg).
 --
--- ADVANCE_*_MULT -- turn-aware pass radius (corner cutting): advance to the next leg early on a
--- gentle turn so the craft flies a smooth fly-by without having to reach the fix, and hold in
--- tighter on a sharp turn so it does not overshoot. 1.0 / 1.0 disables (plain radiusFor).
--- Intermediate waypoints only; the destination is always drawn in tight.
+-- ADVANCE_*_MULT -- turn-aware pass radius, used only as the FALLBACK advance test when
+-- DC.CURVE is off (PLAN.passed, from the baked transition midpoints, is the primary test
+-- while curve-following). 1.0 / 1.0 disables (plain radiusFor).
 --
 -- NOTE (200-locals): CC's Lua VM caps a function at 200 locals and counts a nested function's
 -- own locals ON TOP of the enclosing scope's, so late/large functions (drawLandingHSI etc.) blow
@@ -134,43 +133,75 @@ local NEXT_CRUISE = { full = "slow", slow = "coast", coast = "full" }
 -- add new ones as DC.X, never `local X`. (luac -p does NOT model this; it will pass regardless.)
 local DC = {
     DYNAMIC_CRUISE = true,         -- false -> fall back to the flat pilot cruise cap
-    CURVE          = true,         -- en-route: steer to a carrot on a Catmull-Rom curve through the
-                                   -- waypoints (smooth continuous bearing, rounded corners) instead of
-                                   -- straight at the fix. false -> aim straight at the waypoint.
-    CURVE_LOOKAHEAD = 400,         -- m: how far ahead on the curve the carrot sits. Larger = smoother /
+    CURVE          = true,         -- en-route: steer to a carrot on the planned clothoid path
+                                   -- (smooth continuous bearing, jerk-controlled rounded corners)
+                                   -- instead of straight at the fix. false -> aim at the waypoint.
+    CURVE_LOOKAHEAD = 400,         -- m: how far ahead on the path the carrot sits. Larger = smoother /
                                    -- cuts corners more; smaller = tracks the waypoints tighter.
-    CURVE_DEV_MAX  = 120,          -- m: soft cap on how far the curve may bow OFF the straight leg. The
-                                   -- Catmull-Rom bow scales with leg length (~14 m on a 200 m leg, ~270 m
-                                   -- on a 4 km leg), so this reins in km-apart waypoints without touching
-                                   -- finely-placed ones (whose bow is already << this). Smooth, endpoint-
-                                   -- exact, pulls only toward the chord. Raise to allow rounder corners.
-    A_LAT_MAX      = 20,           -- m/s^2: max lateral accel used for the CURVATURE speed limit. Speed
-                                   -- through a bend of radius R is sqrt(A_LAT_MAX*R). Higher = faster
-                                   -- through bends (needs more strafe/bank authority); lower = slower.
-    CURVE_V_MIN    = 10,           -- m/s: floor on the curvature limit, so a Catmull-Rom curvature spike
-                                   -- at a sharp/close waypoint can't command a near-stop mid-route.
-    BRAKE_DECEL    = 8,            -- m/s^2: deceleration the speed profile plans with. Braking distance
-                                   -- to a slow point = (v^2 - v_target^2)/(2*DECEL): at 3 it was ~2000 m
-                                   -- to a stop from 110 (half of a 4000 m leg spent slowing!); 8 -> ~750 m.
+    GRAVITY        = 11.0,         -- m/s^2: Minecraft's gravity, used in the turn-radius formula.
+    MAX_BANK_DEG   = 45,           -- deg: the bank angle the turn-radius formula assumes --
+                                   -- R = V^2/(GRAVITY*tan(MAX_BANK_DEG)). One physical knob that
+                                   -- means the same thing whether the UAC is presently flying
+                                   -- VTOL/HYBRID/FIXEDWING, so corner geometry "just works" across
+                                   -- all three without the FMS needing to know the flight mode.
+                                   -- Retune in-game like every other knob here; the old flat
+                                   -- A_LAT_MAX=20 this replaces implied a much steeper ~61 deg.
+    JERK_MAX       = 8,            -- m/s^3: caps the rate lateral accel may ramp through a
+                                   -- clothoid -- this is what makes the turn jerk-controlled.
+                                   -- Clothoid length Ls = V^3/(R*JERK_MAX). Lower = longer, gentler
+                                   -- spiral entry/exit; higher = shorter spiral, closer to a plain
+                                   -- circular fillet.
+    MIN_RADIUS     = 40,           -- m: floor on a corner's turn radius.
+    MAX_RADIUS     = 3000,         -- m: ceiling on a corner's turn radius (sanity cap for a very
+                                   -- gentle turn at high speed).
+    LEG_FIT_FRACTION = 0.45,       -- max fraction of EITHER adjacent leg's length a corner's
+                                   -- tangent length may consume. Kept well under 0.5 so two
+                                   -- corners sharing one leg (fed from each end) can never overlap
+                                   -- even if both want their full share.
+    SAMPLE_SPACING = 5,            -- m: density of the baked polyline. Smaller = smoother carrot/
+                                   -- speed/course lookups and more precise geometry, at the cost of
+                                   -- more samples (memory) for a long route.
+    PLAN_MAX_ITERS = 6,            -- global speed<->geometry passes before planPath() gives up and
+                                   -- uses whatever it has (see the iterative solver in planPath).
+    PLAN_CONV_EPS  = 2,            -- m: a corner's radius changing less than this between passes
+                                   -- counts as converged -- stops iterating early on easy routes.
+    BRAKE_DECEL    = 12,            -- m/s^2: deceleration the CORNER speed profile plans with (how
+                                   -- early/hard it brakes INTO a turn). Braking distance to a slow
+                                   -- point = (v^2 - v_target^2)/(2*DECEL): at 3 it was ~2000 m to a
+                                   -- stop from 110 (half of a 4000 m leg spent slowing!); 8 -> ~750 m.
                                    -- The profile ALREADY cruises the middle of a long leg -- this only
-                                   -- sets how LATE/short the braking into a turn or the destination is.
-                                   -- Set it to what the craft can REALLY brake at: too high and it
-                                   -- overshoots the turn/pad (arrives hot); too low and it crawls in early.
+                                   -- sets how LATE/short the braking into a turn is. Set it to what the
+                                   -- craft can REALLY brake at: too high and it overshoots the turn;
+                                   -- too low and it crawls in early. (See ARRIVE_DECEL for the
+                                   -- destination stop specifically -- it is NOT governed by this.)
+    ARRIVE_DECEL   = 30,           -- m/s^2: deceleration for the FINAL destination stop specifically --
+                                   -- deliberately STEEPER than BRAKE_DECEL. A gentle corner-speed
+                                   -- profile can legitimately let the craft carry full cruise almost to
+                                   -- the last waypoint (that's the point of curvature-based cornering),
+                                   -- but that means the LAST leg alone has to shed all of it; using the
+                                   -- lazy BRAKE_DECEL there let the craft arrive "hot" (still 80+ m/s)
+                                   -- whenever the final leg was shorter than BRAKE_DECEL's stopping
+                                   -- distance. Baked into the profile as an ADDITIONAL backward-only
+                                   -- sweep from the route end (PLAN.build), min'd against the corner
+                                   -- profile, plus the runtime destination brake in dynamicSpeedTarget --
+                                   -- so nothing downstream of the last corner can out-run it. Keep
+                                   -- DECEL_MAX >= this or the NAV.cmdSpeed slew becomes the bottleneck
+                                   -- instead. Raise/lower to match the craft's REAL stopping power.
     TURN_GENTLE    = math.rad(12), -- turn <= this: full advance radius (fly-by); see ADVANCE_*_MULT.
     TURN_SHARP     = math.rad(90), -- turn >= this: tight advance radius. (Speed is curvature-based now.)
     FINAL_ARRIVE_SPEED = 12,       -- commanded speed AT the destination; TERMINAL takes over
-    ACCEL_MAX      = 8,            -- m/s^2: max rate the COMMANDED speed may RISE (NAV.cmdSpeed slew).
+    ACCEL_MAX      = 12,            -- m/s^2: max rate the COMMANDED speed may RISE (NAV.cmdSpeed slew).
                                    -- Eases the throttle up OUT of a turn instead of jumping to cruise
                                    -- while still yawing onto the new leg. Lower = gentler spool-up.
-    DECEL_MAX      = 12,           -- m/s^2: max rate the COMMANDED speed may FALL. Rounds off sudden
-                                   -- steps in the raw envelope into a smooth curve. Keep >= BRAKE_DECEL
-                                   -- so real slowdowns aren't delayed; lower = smoother but slows later.
-    XTK_SLOW_LO    = 20,           -- m off the leg: below this, no cross-track slowdown
-    XTK_SLOW_HI    = 80,           -- m off the leg: at/above this, the full XTK_SLOW_MIN cut
+    DECEL_MAX      = 32,           -- m/s^2: max rate the COMMANDED speed may FALL. Rounds off sudden
+                                   -- steps in the raw envelope into a smooth curve. Keep >= ARRIVE_DECEL
+                                   -- (the steepest of the two) so real slowdowns aren't delayed by this
+                                   -- slew rather than by the actual physics; lower = smoother but slows later.
+    XTK_SLOW_LO    = 50,           -- m off the leg: below this, no cross-track slowdown
+    XTK_SLOW_HI    = 180,           -- m off the leg: at/above this, the full XTK_SLOW_MIN cut
     XTK_SLOW_MIN   = 0.30,         -- floor speed fraction when far off the leg (fly in to intercept)
     ADVANCE_GENTLE_MULT = 1.3333,  -- gentle turn: advance this * base pass radius (cut the corner)
     ADVANCE_SHARP_MULT  = 0.7,     -- sharp turn: hold in to this * base radius
-    TURN_GAMMA = 1.732 -- the nonlinearity for slowdown per angle. 1=linear, <1=harder break on small turns, >1=lax breaking on small turns
 }
 
 -- RESUME MID-ROUTE -----------------------------------------------------------
@@ -852,140 +883,395 @@ local function turnAngleAt(i)
     return math.abs(wrapPi(outB - inB))
 end
 
--- CURVE: the Catmull-Rom trajectory through the waypoints, shared by the carrot (bearing) guidance
--- and the curvature-based speed profile -- so the path the craft flies and the speed it flies are
--- ONE computer-drawn trajectory. Global parameter g: floor = segment pts[seg]->pts[seg+1], frac =
--- position within it; neighbour points clamped at the route ends.
-local CURVE = {}
+-- PLAN: the pre-flight-computed path -- replaces the old per-tick Catmull-Rom CURVE table.
+-- Built ONCE by PLAN.build(), called when the pilot confirms a plan (setDirectTo / setRoute /
+-- RTR.setSolvedRoute), not re-evaluated every tick. Each interior waypoint gets an explicit
+-- LineSegment -> ClothoidSegment -> CircularArc -> ClothoidSegment -> LineSegment fly-by
+-- transition sized from a real turn radius (R = V^2/(GRAVITY*tan(bank))); curvature ramps
+-- linearly through each clothoid instead of jumping at a spline knot, so lateral accel -- and
+-- its rate of change, jerk -- is continuous through a turn. The whole route (straights +
+-- transitions) is walked once into a dense arc-length-sampled polyline with the speed profile
+-- baked in, so carrot/speed/course/passed lookups at runtime are near-O(1), not a per-tick walk.
+local PLAN = {
+    samples  = {},  -- arc-length ordered: {x, z, hdg, kappa, s, speed}
+    totalLen = 0,
+    wpS      = {},  -- wpS[i] = arc length of interior waypoint i's transition midpoint --
+                     -- the "abeam" point PLAN.passed uses to advance NAV.index
+    cursor   = 1,   -- last-known nearest-sample index; advances monotonically at runtime
+    lastX = nil, lastZ = nil, lastS = 0,       -- cache for updateCursor (see below)
+    SEARCH_WINDOW = 120,                        -- samples either side of cursor to search each tick
+    RESCAN_DIST2  = 1000 * 1000,                 -- if the window search is still this far off (m^2),
+                                                 -- do one full O(n) rescan (route resume, teleport, etc.)
+}
 
--- CENTRIPETAL (alpha=0.5) Catmull-Rom, Barry-Goldman evaluation. Unlike the uniform (alpha=0)
--- form, it never makes cusps or self-intersecting loops on unevenly-spaced or sharp waypoints
--- (confirmed on real paths). Knot spacing = chord^0.5; the point is a pyramid of lerps over knots.
-function CURVE.at(g)
-    local pts, n = NAV.points, #NAV.points
-    local seg = math.floor(g)
-    if seg < 1 then seg = 1 elseif seg > n - 1 then seg = n - 1 end
-    local u = math.max(0, math.min(1, g - seg))
-    local p0, p1, p2, p3 = pts[math.max(1, seg-1)], pts[seg], pts[seg+1], pts[math.min(n, seg+2)]
-    local function knot(a, b)
-        local dx, dz = b.x - a.x, b.z - a.z
-        local k = math.sqrt(math.sqrt(dx*dx + dz*dz))    -- |b-a|^0.5 (centripetal)
-        return (k > 1e-6) and k or 1e-6                   -- keep knots distinct on duplicate points
+-- Exact heading (rad, relative to the transition's own start heading) at distance l along a
+-- symmetric entry-clothoid / arc / exit-clothoid profile: curvature ramps 0->1/R over the
+-- first Ls, holds at 1/R for the middle La, then ramps back to 0 over the last Ls. sigma =
+-- +1 (right turn) / -1 (left turn). Exact for any l in [0, 2*Ls+La]: the curvature profile is
+-- piecewise-LINEAR in l, so heading (its integral) is piecewise-quadratic -- no numeric
+-- integration needed for heading, only for position (PLAN.marchTransition, below).
+function PLAN.transHdg(l, Ls, R, La, sigma)
+    if l <= Ls then
+        return sigma * l * l / (2 * Ls * R)
+    elseif l <= Ls + La then
+        return sigma * (Ls / (2 * R) + (l - Ls) / R)
+    else
+        local m = 2 * Ls + La - l
+        return sigma * (Ls / R + La / R - m * m / (2 * Ls * R))
     end
-    local t0 = 0
-    local t1 = t0 + knot(p0, p1)
-    local t2 = t1 + knot(p1, p2)
-    local t3 = t2 + knot(p2, p3)
-    local t  = t1 + u * (t2 - t1)
-    local function lp(ta, tb, a, b) return (a*(tb - t) + b*(t - ta)) / (tb - ta) end
-    local a1 = lp(t0,t1, p0.x, p1.x); local a2 = lp(t1,t2, p1.x, p2.x); local a3 = lp(t2,t3, p2.x, p3.x)
-    local x  = lp(t1,t2, lp(t0,t2, a1, a2), lp(t1,t3, a2, a3))
-    a1 = lp(t0,t1, p0.z, p1.z); a2 = lp(t1,t2, p1.z, p2.z); a3 = lp(t2,t3, p2.z, p3.z)
-    local z  = lp(t1,t2, lp(t0,t2, a1, a2), lp(t1,t3, a2, a3))
-    -- Soft-cap the off-course BOW: limit the point's deviation from the straight leg to ~CURVE_DEV_MAX
-    -- so a km-long segment can't swing wide, while short segments (bow << cap) pass through unchanged.
-    -- Smooth, pulls only toward the chord (no loops), and exactly 0 at the waypoints (still passes through).
-    local lx, lz = p1.x + u*(p2.x - p1.x), p1.z + u*(p2.z - p1.z)
-    local dx, dz = x - lx, z - lz
-    local dev = math.sqrt(dx*dx + dz*dz)
-    if dev > 1e-6 then
-        local sc = 1 / math.sqrt(1 + (dev / DC.CURVE_DEV_MAX)^2)   -- ~1 for small dev, ->cap/dev for large
-        x, z = lx + dx*sc, lz + dz*sc
-    end
-    return x, z
 end
 
--- The aircraft's parameter on the curve (projection onto the current straight leg).
-function CURVE.craftG()
-    local pts = NAV.points
-    local seg = math.max(1, NAV.index - 1)
-    local a, b = pts[seg], pts[seg + 1]
-    if not (a and b) then return seg end
-    local dx, dz = b.x - a.x, b.z - a.z
-    local ll = dx * dx + dz * dz
-    local u0 = (ll > 1e-9) and math.max(0, math.min(1, ((NAV.posX - a.x)*dx + (NAV.posZ - a.z)*dz) / ll)) or 0
-    return seg + u0
-end
-
--- HSI course from the curve at the aircraft's position: the tangent bearing (DTK) and the signed
--- perpendicular deviation (+=right of course, same sign as the leg CDI), or nil if unusable. So
--- the dial shows the smoothed path as the course, reading on-course when the craft is on the curve.
-function CURVE.course()
-    if #NAV.points < 2 then return nil end
-    local g = CURVE.craftG()
-    local cx, cz = CURVE.at(g)
-    local fx, fz = CURVE.at(math.min(g + 0.01, #NAV.points))
-    fx, fz = fx - cx, fz - cz
-    local tl = math.sqrt(fx*fx + fz*fz)
-    if tl < 1e-6 then return nil end
-    return atan2(fx, fz), (fx*(NAV.posZ - cz) - fz*(NAV.posX - cx)) / tl
-end
-
--- Menger curvature (1/radius, 1/m) of three points -- 0 if degenerate/collinear.
-function CURVE.curvature(x1, z1, x2, z2, x3, z3)
-    local cross = math.abs((x2-x1)*(z3-z1) - (x3-x1)*(z2-z1))          -- 2 * triangle area
-    local a = math.sqrt((x3-x2)*(x3-x2) + (z3-z2)*(z3-z2))
-    local b = math.sqrt((x3-x1)*(x3-x1) + (z3-z1)*(z3-z1))
-    local c = math.sqrt((x2-x1)*(x2-x1) + (z2-z1)*(z2-z1))
-    local d = a * b * c
-    return (d > 1e-9) and (2 * cross / d) or 0
-end
-
--- Carrot: `lookahead` m ahead of the aircraft along the curve (guidance / bearing). Straight to
--- the first fix at route start (no curve behind it yet).
-function CURVE.carrot(lookahead)
-    local pts, n = NAV.points, #NAV.points
-    if NAV.index < 2 or n < 2 then
-        local p = pts[math.max(1, math.min(n, NAV.index))]
-        return p.x, p.z
-    end
-    local g = CURVE.craftG()
-    local px, pz = CURVE.at(g)
-    local acc = 0
-    while acc < lookahead and g < n do
-        g = math.min(g + 0.02, n)
-        local nx, nz = CURVE.at(g)
-        acc = acc + math.sqrt((nx-px)*(nx-px) + (nz-pz)*(nz-pz))
-        px, pz = nx, nz
-    end
-    return px, pz
-end
-
--- Curvature-limited commanded speed: walk the curve forward from the aircraft and run a FORWARD
--- BRAKING PASS. The local limit at each point is sqrt(A_LAT_MAX / kappa) (a tight bend is slow),
--- floored at CURVE_V_MIN so a curvature spike can't stall us; the route END limits to
--- FINAL_ARRIVE_SPEED. The fastest we can be NOW is min over the scan of sqrt(vlim^2 + 2*DECEL*s),
--- so speed bleeds off BEFORE a bend and holds cruise on straights -- the speed curve OF the path.
-function CURVE.speed(capBase)
-    local n = #NAV.points
-    if n < 2 then return capBase end
-    local scan = capBase * capBase / (2 * DC.BRAKE_DECEL)          -- full-cruise braking distance
-    local best = capBase
-    local g = CURVE.craftG()
-    local x1, z1 = CURVE.at(g)
-    -- seed s with the craft -> curve-start distance: ~0 mid-route (we sit on the curve), but real
-    -- at route start where we're still far from the first fix -- so a bend just past it isn't
-    -- treated as right on top of us.
-    local s = math.sqrt((NAV.posX-x1)*(NAV.posX-x1) + (NAV.posZ-z1)*(NAV.posZ-z1))
-    g = math.min(g + 0.02, n)
-    local x2, z2 = CURVE.at(g)
-    s = s + math.sqrt((x2-x1)*(x2-x1) + (z2-z1)*(z2-z1))           -- arc length to x2 (the sample point)
-    while s < scan and g < n do
-        g = math.min(g + 0.02, n)
-        local x3, z3 = CURVE.at(g)
-        local vlim
-        if g >= n then
-            vlim = DC.FINAL_ARRIVE_SPEED                           -- the route end point
-        else
-            local k = CURVE.curvature(x1, z1, x2, z2, x3, z3)
-            vlim = (k > 1e-6) and math.max(DC.CURVE_V_MIN, math.sqrt(DC.A_LAT_MAX / k)) or capBase
+-- Canonical (right-turn, start heading 0) spiral end point in a LOCAL frame: used only to
+-- solve a corner's exact tangent length (PLAN.solveCorner's p/k/T), not for placing samples
+-- (PLAN.marchTransition does that, in world coordinates, with the corner's real R/Ls/La/sigma).
+-- Numeric (fine sub-stepped) integration of the exact heading above -- a one-time/offline cost,
+-- so there's no need for the truncated-series shift/tangent approximations highway design
+-- normally uses; plain integration is exact to any tolerance we sample at.
+function PLAN.spiralEnd(Ls, R)
+    if Ls <= 1e-6 then return 0, 0, 0 end
+    local n = math.max(8, math.floor(Ls / 2))
+    local h, sub = Ls / n, 4
+    local x, z = 0, 0
+    for i = 1, n do
+        local lPrev, subH = (i - 1) * h, h / 4
+        for j = 1, sub do
+            local l = lPrev + (j - 0.5) * subH
+            local hdg = PLAN.transHdg(l, Ls, R, 0, 1)
+            x, z = x + math.sin(hdg) * subH, z + math.cos(hdg) * subH
         end
-        local allow = math.sqrt(vlim * vlim + 2 * DC.BRAKE_DECEL * s)
-        if allow < best then best = allow end
-        s = s + math.sqrt((x3-x2)*(x3-x2) + (z3-z2)*(z3-z2))
-        x1, z1, x2, z2 = x2, z2, x3, z3
     end
-    return clamp(best, 0, capBase)
+    return x, z, PLAN.transHdg(Ls, Ls, R, 0, 1)
+end
+
+-- March a straight run from (x,z) to the exact target (tx,tz) at heading hdg, appending
+-- samples to `out` at roughly `spacing` intervals (snapped exactly onto the target on the
+-- last sample, so straight runs never drift from floating-point accumulation).
+function PLAN.marchStraightInto(x, z, hdg, tx, tz, s, spacing, out)
+    local len = math.sqrt((tx - x) * (tx - x) + (tz - z) * (tz - z))
+    if len <= 1e-6 then return s end
+    local n = math.max(1, math.floor(len / spacing + 0.5))
+    for i = 1, n do
+        local f = i / n
+        s = s + len / n
+        table.insert(out, {x = x + (tx - x) * f, z = z + (tz - z) * f, hdg = hdg, kappa = 0, s = s})
+    end
+    return s
+end
+
+-- March the actual clothoid-arc-clothoid transition in world coordinates, from a start pose
+-- (x0,z0,hdg0) -- the incoming leg's tangent point -- through to the outgoing tangent point.
+-- Position is numerically integrated (fine sub-stepped) from the exact heading formula above;
+-- appends samples to `out` roughly every `spacing`. Returns the end (s,x,z,hdg) and the
+-- transition's midpoint arc length (PLAN.build records this as the waypoint's abeam point).
+function PLAN.marchTransition(x0, z0, hdg0, Ls, R, La, sigma, s0, spacing, out)
+    local Ltot = 2 * Ls + La
+    if Ltot <= 1e-6 then return s0, x0, z0, hdg0, s0 end
+    local n = math.max(2, math.floor(Ltot / spacing + 0.5))
+    local h, sub = Ltot / n, 4
+    local x, z, s, sMid = x0, z0, s0, nil
+    for i = 1, n do
+        local lPrev, subH = (i - 1) * h, h / 4
+        for j = 1, sub do
+            local lMid = lPrev + (j - 0.5) * subH
+            local hdg = hdg0 + PLAN.transHdg(lMid, Ls, R, La, sigma)
+            x, z = x + math.sin(hdg) * subH, z + math.cos(hdg) * subH
+        end
+        s = s + h
+        local lNow = i * h
+        local hdgNow = hdg0 + PLAN.transHdg(lNow, Ls, R, La, sigma)
+        local kfrac = (lNow <= Ls) and (lNow / Ls) or ((lNow <= Ls + La) and 1 or (Ltot - lNow) / Ls)
+        table.insert(out, {x = x, z = z, hdg = hdgNow, kappa = sigma * kfrac / R, s = s})
+        if not sMid and lNow >= Ls + La / 2 then sMid = s end
+    end
+    return s, x, z, hdg0 + PLAN.transHdg(Ltot, Ls, R, La, sigma), sMid or s
+end
+
+-- Binary search an arc-length-sorted sample array for the index whose s is closest to (and
+-- not past) the given arc length. Shared by the offline solver (corner speed feedback) and
+-- the runtime carrot/speed/course lookups.
+function PLAN.sampleIndexAtS(samples, s)
+    local lo, hi = 1, #samples
+    if hi == 0 then return 0 end
+    if s <= samples[1].s then return 1 end
+    if s >= samples[hi].s then return hi end
+    while hi - lo > 1 do
+        local mid = math.floor((lo + hi) / 2)
+        if samples[mid].s <= s then lo = mid else hi = mid end
+    end
+    return lo
+end
+
+-- Solve one corner's clothoid-arc-clothoid transition for a planned speed V and deflection
+-- Delta (rad, unsigned; sigma = +1 right / -1 left). Radius is clamped to [MIN_RADIUS,
+-- MAX_RADIUS] and, by shrinking, to whatever fits within LEG_FIT_FRACTION of the SHORTER
+-- adjacent leg -- the "maximum radius for this corner" constraint, so neighbouring corners on
+-- a short leg can never overlap. Returns nil for a near-zero deflection (straight through).
+function PLAN.solveCorner(Delta, sigma, V, legIn, legOut)
+    if Delta < 1e-4 then return nil end
+    local turnAccel = DC.GRAVITY * math.tan(math.rad(DC.MAX_BANK_DEG))
+    local maxT = DC.LEG_FIT_FRACTION * math.min(legIn, legOut)
+
+    local function forRadius(R)
+        local Ls = (V * V * V) / (R * DC.JERK_MAX)
+        local thetaS = Ls / (2 * R)
+        if thetaS > Delta / 2 then
+            thetaS = Delta / 2
+            Ls = thetaS * 2 * R
+        end
+        local arcLen = math.max(0, (Delta - 2 * thetaS) * R)
+        local lx, lz, ths = PLAN.spiralEnd(Ls, R)
+        local p = lx - R * (1 - math.cos(ths))
+        local k = lz - R * math.sin(ths)
+        local T = k + (R + p) * math.tan(Delta / 2)
+        return Ls, arcLen, T
+    end
+
+    local R = clamp(V * V / turnAccel, DC.MIN_RADIUS, DC.MAX_RADIUS)
+    local Ls, arcLen, T = forRadius(R)
+    if T > maxT then
+        -- Shrink the radius until the transition fits on the shorter adjacent leg. A plain
+        -- decay search (not bisection) because T(R) isn't guaranteed perfectly monotonic once
+        -- the jerk-limited clothoid length Ls also grows as R shrinks -- this is a one-time,
+        -- offline computation, so a few dozen extra steps cost nothing.
+        for _ = 1, 80 do
+            R = math.max(DC.MIN_RADIUS, R * 0.95)
+            Ls, arcLen, T = forRadius(R)
+            if T <= maxT or R <= DC.MIN_RADIUS then break end
+        end
+    end
+    return { R = R, Ls = Ls, arcLen = arcLen, T = T, sigma = sigma, Delta = Delta }
+end
+
+-- Walk the whole route once: a straight run into each interior vertex's transition start, the
+-- transition itself, a straight run to the next vertex (or straight through, for a
+-- near-zero-deflection vertex with no `corners[i]`), ... a final straight run into the last
+-- waypoint. Appends world-frame samples to `out`; fills wpS[i] with each interior waypoint's
+-- abeam arc length (transition midpoint, or the waypoint itself if unrounded).
+function PLAN.buildGeometry(pts, corners, out, wpS)
+    local n = #pts
+    local x, z, s = pts[1].x, pts[1].z, 0
+    table.insert(out, {x = x, z = z, hdg = legBearing(x, z, pts[2].x, pts[2].z), kappa = 0, s = 0})
+    for i = 2, n - 1 do
+        local c = corners[i]
+        local bIn = legBearing(pts[i - 1].x, pts[i - 1].z, pts[i].x, pts[i].z)
+        if c then
+            local tsX, tsZ = pts[i].x - c.T * math.sin(bIn), pts[i].z - c.T * math.cos(bIn)
+            s = PLAN.marchStraightInto(x, z, bIn, tsX, tsZ, s, DC.SAMPLE_SPACING, out)
+            local sMid
+            s, x, z, _, sMid = PLAN.marchTransition(tsX, tsZ, bIn, c.Ls, c.R, c.arcLen, c.sigma, s, DC.SAMPLE_SPACING, out)
+            wpS[i] = sMid
+        else
+            s = PLAN.marchStraightInto(x, z, bIn, pts[i].x, pts[i].z, s, DC.SAMPLE_SPACING, out)
+            x, z = pts[i].x, pts[i].z
+            wpS[i] = s
+        end
+    end
+    local bInLast = legBearing(pts[n - 1].x, pts[n - 1].z, pts[n].x, pts[n].z)
+    s = PLAN.marchStraightInto(x, z, bInLast, pts[n].x, pts[n].z, s, DC.SAMPLE_SPACING, out)
+    return s
+end
+
+-- Two-pass velocity profile, the standard way to turn per-point speed LIMITS into an
+-- achievable speed PROFILE: a backward braking pass from the route end, then a forward
+-- acceleration pass. Replaces the old per-tick single forward-braking scan (CURVE.speed) --
+-- this runs once, over the WHOLE route, so there's no look-ahead distance limit either.
+-- Mutates sample.speed in place.
+function PLAN.bakeSpeedProfile(samples, limits, brakeDecel, accelMax, endSpeed)
+    local n = #samples
+    if n == 0 then return end
+    samples[n].speed = math.min(limits[n] or endSpeed, endSpeed)
+    for i = n - 1, 1, -1 do
+        local ds = samples[i + 1].s - samples[i].s
+        samples[i].speed = math.min(limits[i], math.sqrt(samples[i + 1].speed ^ 2 + 2 * brakeDecel * ds))
+    end
+    for i = 2, n do
+        local ds = samples[i].s - samples[i - 1].s
+        samples[i].speed = math.min(samples[i].speed, math.sqrt(samples[i - 1].speed ^ 2 + 2 * accelMax * ds))
+    end
+end
+
+-- A SEPARATE, steeper backward-only sweep from the route end (DC.ARRIVE_DECEL, not
+-- BRAKE_DECEL), min'd into the already-baked profile. bakeSpeedProfile's corner braking is
+-- tuned for comfortable cornering and can legitimately leave the craft at full cruise right
+-- up to the last waypoint on a gentle final approach -- this guarantees the destination
+-- stop itself is never out-run by that, regardless of how short the final leg turns out to
+-- be, by capping every sample to what ARRIVE_DECEL can actually stop from in the remaining
+-- distance.
+function PLAN.applyArriveBrake(samples, decel, endSpeed)
+    local n = #samples
+    if n == 0 then return end
+    local v = endSpeed
+    samples[n].speed = math.min(samples[n].speed, v)
+    for i = n - 1, 1, -1 do
+        local ds = samples[i + 1].s - samples[i].s
+        v = math.sqrt(v * v + 2 * decel * ds)
+        samples[i].speed = math.min(samples[i].speed, v)
+    end
+end
+
+-- THE offline planning pipeline: waypoints -> leg definitions -> turn anticipation -> fly-by
+-- transitions -> iterate speed<->geometry to convergence -> bake the sampled polyline that
+-- PLAN.carrot/speedAt/course/passed serve at runtime. Called once when the pilot confirms a
+-- plan (setDirectTo / setRoute / RTR.setSolvedRoute).
+function PLAN.build(pts)
+    PLAN.samples, PLAN.wpS, PLAN.cursor = {}, {}, 1
+    PLAN.lastX, PLAN.lastZ, PLAN.lastS = nil, nil, 0
+    local n = #pts
+    if n < 3 then
+        -- Nothing to round -- just the straight run between however many points exist. A lone
+        -- point stays at SPEED_FULL (there's no path to bake a brake into) -- the runtime
+        -- destination-arrival brake in dynamicSpeedTarget handles the actual slowdown, same as
+        -- the old CURVE.speed's n<2 passthrough did.
+        local samples, s = {}, 0
+        if n == 1 then
+            table.insert(samples, {x = pts[1].x, z = pts[1].z, hdg = 0, kappa = 0, s = 0, speed = SPEED_FULL})
+        elseif n == 2 then
+            local bIn = legBearing(pts[1].x, pts[1].z, pts[2].x, pts[2].z)
+            table.insert(samples, {x = pts[1].x, z = pts[1].z, hdg = bIn, kappa = 0, s = 0})
+            s = PLAN.marchStraightInto(pts[1].x, pts[1].z, bIn, pts[2].x, pts[2].z, 0, DC.SAMPLE_SPACING, samples)
+            for _, sm in ipairs(samples) do sm.speed = SPEED_FULL end
+            PLAN.applyArriveBrake(samples, DC.ARRIVE_DECEL, DC.FINAL_ARRIVE_SPEED)
+        end
+        PLAN.samples, PLAN.totalLen = samples, s
+        return
+    end
+
+    local turnAccel = DC.GRAVITY * math.tan(math.rad(DC.MAX_BANK_DEG))
+    local legs = {}
+    for i = 1, n - 1 do legs[i] = legLength(pts[i], pts[i + 1]) end
+
+    -- Turn anticipation: a rough first guess, sharper angle -> slower -- just a seed for the
+    -- iteration below, doesn't need to be accurate.
+    local speedGuess, delta, sigma = {}, {}, {}
+    for i = 2, n - 1 do
+        local bIn  = legBearing(pts[i - 1].x, pts[i - 1].z, pts[i].x, pts[i].z)
+        local bOut = legBearing(pts[i].x, pts[i].z, pts[i + 1].x, pts[i + 1].z)
+        local signedTurn = wrapPi(bOut - bIn)
+        delta[i] = math.abs(signedTurn)
+        sigma[i] = (signedTurn >= 0) and 1 or -1
+        speedGuess[i] = SPEED_FULL / (1 + delta[i])
+    end
+
+    local corners, prevR = {}, {}
+    for iter = 1, DC.PLAN_MAX_ITERS do
+        local maxDelta = 0
+        for i = 2, n - 1 do
+            if delta[i] > 1e-4 then
+                local c = PLAN.solveCorner(delta[i], sigma[i], speedGuess[i], legs[i - 1], legs[i])
+                corners[i] = c
+                local r = c and c.R or 0
+                local dr = math.abs(r - (prevR[i] or -1))
+                if dr > maxDelta then maxDelta = dr end
+                prevR[i] = r
+            end
+        end
+
+        local samples, wpS = {}, {}
+        PLAN.buildGeometry(pts, corners, samples, wpS)
+        local limits = {}
+        for k, sm in ipairs(samples) do
+            limits[k] = (math.abs(sm.kappa) > 1e-9) and math.sqrt(turnAccel / math.abs(sm.kappa)) or SPEED_FULL
+        end
+        PLAN.bakeSpeedProfile(samples, limits, DC.BRAKE_DECEL, DC.ACCEL_MAX, DC.FINAL_ARRIVE_SPEED)
+        PLAN.applyArriveBrake(samples, DC.ARRIVE_DECEL, DC.FINAL_ARRIVE_SPEED)
+
+        if iter == DC.PLAN_MAX_ITERS or maxDelta < DC.PLAN_CONV_EPS then
+            PLAN.samples, PLAN.wpS, PLAN.totalLen = samples, wpS, samples[#samples].s
+            break
+        end
+
+        -- Feed each corner its own achievable speed (read off the baked profile at its
+        -- transition midpoint) back in for the next geometry pass -- a corner that got
+        -- leg-fit-clamped can't actually be taken at the speed it was guessed at.
+        for i = 2, n - 1 do
+            if wpS[i] then
+                speedGuess[i] = samples[PLAN.sampleIndexAtS(samples, wpS[i])].speed
+            end
+        end
+    end
+end
+
+-- Called once per navTick (and defensively by carrot/speedAt/course/passed below, in case
+-- they run from a different loop/redraw cadence): find the sample nearest the aircraft's
+-- position. Searches a small window around the cached cursor (the craft moves forward
+-- continuously, so this is cheap and never needs a full scan) except after a big jump (route
+-- resume, teleport), when one full O(n) rescan relocates it. Cached against repeated
+-- same-position calls within one tick.
+function PLAN.updateCursor(x, z)
+    if x == PLAN.lastX and z == PLAN.lastZ then return PLAN.lastS end
+    local samples = PLAN.samples
+    local n = #samples
+    if n == 0 then
+        PLAN.lastX, PLAN.lastZ, PLAN.lastS = x, z, 0
+        return 0
+    end
+    local lo = math.max(1, PLAN.cursor - PLAN.SEARCH_WINDOW)
+    local hi = math.min(n, PLAN.cursor + PLAN.SEARCH_WINDOW)
+    local bestI, bestD = PLAN.cursor, math.huge
+    for i = lo, hi do
+        local dx, dz = samples[i].x - x, samples[i].z - z
+        local d = dx * dx + dz * dz
+        if d < bestD then bestD, bestI = d, i end
+    end
+    if bestD > PLAN.RESCAN_DIST2 then
+        for i = 1, n do
+            local dx, dz = samples[i].x - x, samples[i].z - z
+            local d = dx * dx + dz * dz
+            if d < bestD then bestD, bestI = d, i end
+        end
+    end
+    PLAN.cursor = bestI
+    PLAN.lastX, PLAN.lastZ, PLAN.lastS = x, z, samples[bestI].s
+    return PLAN.lastS
+end
+
+-- Carrot: `lookahead` m ahead of the aircraft along the planned path (guidance / bearing).
+function PLAN.carrot(lookahead)
+    PLAN.updateCursor(NAV.posX, NAV.posZ)
+    local samples = PLAN.samples
+    if #samples == 0 then return NAV.posX, NAV.posZ end
+    local i = PLAN.sampleIndexAtS(samples, PLAN.lastS + lookahead)
+    return samples[i].x, samples[i].z
+end
+
+-- Commanded speed at the aircraft's current position on the planned path: the baked profile,
+-- linearly interpolated between the two bracketing samples. Replaces CURVE.speed's per-tick
+-- forward-braking scan -- it's already baked into PLAN.samples by PLAN.build.
+function PLAN.speedAt()
+    PLAN.updateCursor(NAV.posX, NAV.posZ)
+    local samples = PLAN.samples
+    local n = #samples
+    if n == 0 then return SPEED_FULL end
+    local i = PLAN.sampleIndexAtS(samples, PLAN.lastS)
+    if i < n then
+        local a, b = samples[i], samples[i + 1]
+        local span = b.s - a.s
+        local f = (span > 1e-6) and clamp((PLAN.lastS - a.s) / span, 0, 1) or 0
+        return a.speed + (b.speed - a.speed) * f
+    end
+    return samples[i].speed
+end
+
+-- HSI course from the planned path at the aircraft's position: the sample heading (DTK) and
+-- the signed perpendicular deviation (+=right of course, same sign as the leg CDI). nil if
+-- there's no plan yet.
+function PLAN.course()
+    PLAN.updateCursor(NAV.posX, NAV.posZ)
+    local samples = PLAN.samples
+    if #samples == 0 then return nil end
+    local sm = samples[PLAN.sampleIndexAtS(samples, PLAN.lastS)]
+    local dx, dz = NAV.posX - sm.x, NAV.posZ - sm.z
+    return sm.hdg, math.sin(sm.hdg) * dz - math.cos(sm.hdg) * dx
+end
+
+-- Has the aircraft's arc-length position passed interior waypoint i's abeam point (its
+-- transition midpoint, or the waypoint itself if it wasn't rounded)? Replaces the old
+-- tangent-plane checkpointPassed with a direct arc-length compare -- the plan already knows
+-- exactly where each waypoint's abeam point is.
+function PLAN.passed(i)
+    if not PLAN.wpS[i] then return false end
+    PLAN.updateCursor(NAV.posX, NAV.posZ)
+    return PLAN.lastS >= PLAN.wpS[i]
 end
 
 -- Heading error (rad) from the nose to the CURRENT target, or nil if we lack a fix/heading.
@@ -1014,13 +1300,14 @@ local function currentXtk()
     return (lx / ll) * (NAV.posZ - prev.z) - (lz / ll) * (NAV.posX - prev.x)
 end
 
--- THE commanded along-track speed = the CURVATURE speed profile of the smoothed path (CURVE.speed:
--- slow through tight bends, cruise on straights, bled off IN ADVANCE by a forward braking pass),
--- plus the destination arrival brake on the final leg, trimmed by the cross-track gate. Because it
--- reads the SAME Catmull-Rom curve the bearing follows, the speed and the path are one trajectory --
--- the speed slows exactly as much as the rounded curve needs, not for the raw waypoint angle. Zero
--- while aligning; bounded by the pilot's cap. (A_LAT_MAX = how fast through a bend; BRAKE_DECEL =
--- how early it starts; CURVE_V_MIN = floor at a curvature spike.)
+-- THE commanded along-track speed = the baked-in speed profile of the planned clothoid path
+-- (PLAN.speedAt: slow through tight bends, cruise on straights, already bled off IN ADVANCE by
+-- the offline backward/forward braking pass), plus the destination arrival brake on the final
+-- leg, trimmed by the cross-track gate. Because it reads the SAME planned path the bearing
+-- follows, the speed and the path are one trajectory -- the speed slows exactly as much as the
+-- rounded corner needs, not for the raw waypoint angle. Zero while aligning; bounded by the
+-- pilot's cap. (MAX_BANK_DEG/GRAVITY = how fast through a bend, baked in at plan time;
+-- BRAKE_DECEL = how early the runtime destination brake starts.)
 local function dynamicSpeedTarget()
     local capBase = cruiseCapValue()
     if not DC.DYNAMIC_CRUISE or capBase <= 0 then return capBase end
@@ -1028,23 +1315,25 @@ local function dynamicSpeedTarget()
     if total == 0 then return capBase end
     if NAV.aligning then return 0 end          -- route start: yaw onto the bearing before throttling
 
-    local best = CURVE.speed(capBase)          -- curvature forward braking pass (bends + the endpoint)
+    local best = PLAN.speedAt()                -- baked speed profile (bends + the endpoint)
 
-    -- Destination arrival on the FINAL leg (also covers a single-point direct-to, where the curve
-    -- has nothing to walk): brake straight-line to FINAL_ARRIVE_SPEED at the last fix.
+    -- Destination arrival on the FINAL leg (also covers a single-point direct-to, where the
+    -- plan has nothing to walk): brake straight-line to FINAL_ARRIVE_SPEED at the last fix,
+    -- at DC.ARRIVE_DECEL (steeper than BRAKE_DECEL -- see its comment) so this live distance
+    -- check can't be out-run any more than the baked profile's own arrive-brake sweep can.
     if NAV.index == total then
         local last = NAV.points[total]
         local dx, dz = last.x - NAV.posX, last.z - NAV.posZ
         local dd = math.sqrt(dx * dx + dz * dz)
-        best = math.min(best, math.sqrt(DC.FINAL_ARRIVE_SPEED * DC.FINAL_ARRIVE_SPEED + 2 * DC.BRAKE_DECEL * dd))
+        best = math.min(best, math.sqrt(DC.FINAL_ARRIVE_SPEED * DC.FINAL_ARRIVE_SPEED + 2 * DC.ARRIVE_DECEL * dd))
     end
 
     -- Cross-track: well off COURSE -> slow to fly IN and intercept. When curve-following, "course"
-    -- is the CURVE, not the straight leg: a craft correctly ON the curve is off the LEG by the bow
-    -- (up to CURVE_DEV_MAX), which would FALSELY trip this. Measure deviation from the curve there.
+    -- is the PLANNED PATH, not the straight leg: a craft correctly on a rounded corner is off the
+    -- LEG by design, which would FALSELY trip this. Measure deviation from the path there.
     local xtk
     if DC.CURVE and NAV.phase == "ENROUTE" and NAV.index >= 2 and NAV.index ~= total then
-        local _, cxtk = CURVE.course()
+        local _, cxtk = PLAN.course()
         xtk = math.abs(cxtk or 0)
     else
         xtk = math.abs(currentXtk())
@@ -1057,6 +1346,8 @@ end
 
 -- Pass radius for the ADVANCE decision, turn-aware (see ADVANCE_*_MULT). Gentle turn -> larger
 -- (cut the corner early / fly-by); sharp -> tighter. The destination stays at the base radius.
+-- This is the FALLBACK test (used when DC.CURVE is off); while curve-following, PLAN.passed
+-- (the baked transition-midpoint arc length) is the primary corner-cut signal -- see navTick.
 local function advanceRadiusFor(i, tgt, isFinal)
     local base = radiusFor(tgt, isFinal)
     if isFinal then return base end
@@ -1082,12 +1373,12 @@ local function broadcastCurrent()
     local tgt = NAV.points[NAV.index]
     if not tgt then return end
     local isFinal = (NAV.index == #NAV.points)
-    -- En-route we hand the UAC a carrot on the smoothed curve (smooth bearing, rounded corners).
-    -- The precise capture phases (APPROACH/TERMINAL/ARRIVED) and the final fix keep aiming at the
-    -- real waypoint, unchanged -- that's a different, precise job and it works.
+    -- En-route we hand the UAC a carrot on the planned clothoid path (smooth bearing, jerk-
+    -- controlled rounded corners). The precise capture phases (APPROACH/TERMINAL/ARRIVED) and
+    -- the final fix keep aiming at the real waypoint, unchanged -- a different, precise job.
     local tx, tz, ptype, carrot
     if DC.CURVE and NAV.phase == "ENROUTE" and not isFinal then
-        tx, tz = CURVE.carrot(DC.CURVE_LOOKAHEAD)
+        tx, tz = PLAN.carrot(DC.CURVE_LOOKAHEAD)
         ptype, carrot = "carrot", true
     else
         tx, tz = tgt.x, tgt.z
@@ -1257,6 +1548,7 @@ local function setDirectTo(name, landAtEnd)
     NAV.points = {{name = p.name, x = p.x, z = p.z, kind = p.kind}}
     NAV.index = 1
     NAV.active = true
+    PLAN.build(NAV.points)
     setLandFinal(name, landAtEnd)
     updatePhase() -- against the last known fix, so the first broadcast isn't stale
     broadcastCurrent()
@@ -1319,6 +1611,7 @@ local function setRoute(name, resume)
     NAV.points = pts
     NAV.index = resume and bestResumeIndex(pts) or 1
     NAV.active = true
+    PLAN.build(NAV.points)
     -- A route ending at a landing site auto-lands there on arrival (fully automatic).
     setLandFinal(pts[#pts].name, true)
     updatePhase()
@@ -1470,6 +1763,7 @@ function RTR.setSolvedRoute(destName)
     NAV.points = pts
     NAV.index = bestResumeIndex(pts)     -- heading-aware mid-route join, same as RESUME
     NAV.active = true
+    PLAN.build(NAV.points)
     -- The destination is a hub landing site: auto-land on arrival, same as a route to it.
     setLandFinal(pts[#pts].name, true)
     updatePhase()
@@ -1509,6 +1803,8 @@ local function cancelNav(vertCmd)
     NAV.points = {}
     NAV.index = 1
     NAV.phase = "ENROUTE"
+    PLAN.samples, PLAN.wpS, PLAN.totalLen, PLAN.cursor = {}, {}, 0, 1
+    PLAN.lastX, PLAN.lastZ, PLAN.lastS = nil, nil, 0
 end
 
 local function navTick()
@@ -1543,8 +1839,9 @@ local function navTick()
         -- rise capped at DC.ACCEL_MAX (don't slam to cruise while still yawing onto a new leg),
         -- fall capped at DC.DECEL_MAX (any step in the raw envelope -- a turn dropping out of the
         -- lookahead, a kink where the binding fix switches -- eases down instead of snapping).
-        -- DC.DECEL_MAX >= the envelope's own decel (~BRAKE_DECEL) so genuine slowdowns aren't
-        -- delayed -- it only rounds off the sudden steps. This is the single CMD value.
+        -- DC.DECEL_MAX >= the envelope's own decel (the steeper of BRAKE_DECEL/ARRIVE_DECEL) so
+        -- genuine slowdowns aren't delayed -- it only rounds off the sudden steps. This is the
+        -- single CMD value.
         local rawSpeed = dynamicSpeedTarget()
         if rawSpeed > NAV.cmdSpeed then
             NAV.cmdSpeed = math.min(rawSpeed, NAV.cmdSpeed + DC.ACCEL_MAX * TICK_INTERVAL)
@@ -1556,7 +1853,13 @@ local function navTick()
         local dx, dz = tgt.x - pos.x, tgt.z - pos.z
         local dist = math.sqrt(dx * dx + dz * dz)
         local isFinal = (NAV.index == #NAV.points)
-        if dist <= advanceRadiusFor(NAV.index, tgt, isFinal) and not isFinal then
+        -- Waypoint counts as passed either by flying inside its pass radius, OR (curve-following,
+        -- en-route, not the destination) by the planned-path arc-length cursor crossing the
+        -- waypoint's baked-in abeam point -- see PLAN.passed. Either is sufficient; radius alone
+        -- can't detect a corner-cut pass.
+        local passed = dist <= advanceRadiusFor(NAV.index, tgt, isFinal)
+            or (not isFinal and DC.CURVE and NAV.phase == "ENROUTE" and PLAN.passed(NAV.index))
+        if passed and not isFinal then
             NAV.index = NAV.index + 1
             updatePhase() -- against the point we just switched to, not the one we passed
             broadcastCurrent() -- resend immediately on advance, not just on the 1s tick
@@ -2711,8 +3014,8 @@ end
 -- single main-chunk local instead of six -- the file is close to Lua's 200-local ceiling.
 local HSICFG = {
     -- COURSE mode (CDI):
-    CDI_FULLSCALE_M = 15,   -- metres of cross-track at full needle deflection
-    CDI_ONCOURSE_M  = 1.5,  -- inside this the needle turns green
+    CDI_FULLSCALE_M = 80,   -- metres of cross-track at full needle deflection
+    CDI_ONCOURSE_M  = 10,  -- inside this the needle turns green
     -- LANDING mode (map):
     HDG_BAR_FS_DEG  = 45,   -- heading error (deg) at full-width bar deflection
     HDG_ALIGN_DEG   = 5,    -- within this the bar marker turns green
@@ -2788,12 +3091,12 @@ local function drawCourseHSI()
                 xtk = (lx/ll)*(NAV.posZ - prev.z) - (lz/ll)*(NAV.posX - prev.x)  -- +=right of course
             end
         end
-        -- Curve-following: show the CURVE as the course, not the straight leg, so the dial reads
-        -- what the aircraft actually flies (and on-course when it's on the curve). DTK = the curve
-        -- TANGENT at our projection; XTK/CDI = signed perpendicular deviation FROM the curve (same
-        -- +=right-of-course sign as the leg version). DIST stays to the real waypoint.
+        -- Curve-following: show the PLANNED PATH as the course, not the straight leg, so the dial
+        -- reads what the aircraft actually flies (and on-course when it's on the path). DTK = the
+        -- path's heading at our projection; XTK/CDI = signed perpendicular deviation FROM the path
+        -- (same +=right-of-course sign as the leg version). DIST stays to the real waypoint.
         if DC.CURVE and NAV.phase == "ENROUTE" and NAV.index >= 2 and NAV.index ~= #NAV.points then
-            local cdtk, cxtk = CURVE.course()   -- curve tangent (DTK) + signed deviation FROM the curve
+            local cdtk, cxtk = PLAN.course()   -- path heading (DTK) + signed deviation FROM the path
             if cdtk then dtk, xtk = cdtk, cxtk end
         end
     end
@@ -2977,7 +3280,7 @@ end
 
 local function hsiLoop()
     if not hsiMon then while true do sleep(1) end end
-    while true do pcall(drawHSI); sleep(0.2) end
+    while true do pcall(drawHSI); sleep(0.05) end
 end
 
 -- MAIN -------------------------------------------------------------------------

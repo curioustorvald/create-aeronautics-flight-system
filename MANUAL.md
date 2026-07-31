@@ -206,7 +206,7 @@ The **MIC** (intention controller) listens to both relays, integrates the key-pr
 
 ## 5. First boot & calibration (do this once, on the ground / tethered)
 
-Every airframe is different, so a handful of **sign** switches must be set once. They all live in the `CFG` table at the top of **`attitude-controller/pid/uac.lua`**. Edit, save, reboot the UAC, test. The golden rule: **if an axis diverges/blows up rather than oscillating, it's a sign or frame error — not a gain.**
+Every airframe is different, so a handful of **sign** switches must be set once. They all live in **`attitude-controller/pid/uacconf.lua`** — the calibration file, separate from the program so updating `uac.lua` never overwrites them. Edit, save, reboot the UAC, test. The golden rule: **if an axis diverges/blows up rather than oscillating, it's a sign or frame error — not a gain.**
 
 > **Before anything responds:** the engine **master** switch (plus the relevant **attitude** / **altitude** engine switch) must be **on**, or the relays hold their output and the craft won't move no matter what the UAC computes. Levelling is always active regardless of the autopilot switches, so the attitude steps below work with the AP switches in any position.
 
@@ -241,7 +241,7 @@ This is your navigator. From its screen you can:
 
 - **Edit data**: create **POINTS** (waypoints — POIs and VORs, with X/Z coordinates) and **COURSES** (named sequences of points). A point marked as a landing site shows a `<H>`/etc. tag.
 - **Fly DIRECT** to any point.
-- **Fly a ROUTE** (course): it flies the waypoints as one **smooth curve** — a spline fitted through the fixes (corners rounded, no bearing snap) that it pure-pursues via a moving aim-point ("carrot") — and it sets its **speed from the curve's shape**: cruise on the straights, easing through tight bends and down to the destination, braking *in advance*. It still decides the flight phase (ENROUTE → APPROACH → TERMINAL → ARRIVED) from the plan, handing to a precise point-capture only for the final arrival/landing.
+- **Fly a ROUTE** (course): it flies the waypoints as one **planned path**. When you confirm the plan the FMS lays out each interior corner as a `straight → clothoid → arc → clothoid → straight` fly-by transition — the turn radius from a real bank angle, the spiral entry jerk-limited so lateral acceleration ramps in rather than stepping — then bakes a **speed profile** along it (a backward braking pass from the route end, then a forward acceleration pass), and pure-pursues a moving aim-point ("carrot") along the result. So it cruises the straights, arrives at each bend already slowed, and brakes for the destination *in advance*, with no bearing snap at a waypoint. It still decides the flight phase (ENROUTE → APPROACH → TERMINAL → ARRIVED) from the plan, handing to a precise point-capture only for the final arrival/landing.
 - **SPD** button: cycle the cruise-speed **ceiling** **FULL → SLOW → COAST** (the curve speed profile always stays under whatever you pick).
 - **HOME / CANCEL**: stop the autopilot and hand control back.
 
@@ -294,14 +294,39 @@ Flipping the **altitude** switch on grabs the *current* altitude to hold (a live
 
 **Nav stick** — active whenever the autopilot **nav** switch is off. The fore/aft/strafe/yaw keys command a *body velocity*: hold a key and the aircraft accelerates that way (up to the MIC's per-axis limit), release and it fades to a stop; with everything released the UAC holds heading and nulls drift, so it station-keeps. Because the keys are fed as a velocity into the UAC's own loops it flies steady and attitude-aware like the autopilot, and since it runs independently it's also your quick manual course-change override any time nav is off.
 
+### 6.7 Flight modes — VTOL / HYBRID / FIXEDWING
+
+`CFG.FLIGHT_MODE` in `pid/uacconf.lua` sets **how the aircraft corrects sideways error**. Levelling, altitude and the flight plan are identical in all three; only the lateral technique changes. An unrecognised value falls back safely to VTOL.
+
+| Mode | How it flies |
+|---|---|
+| `"VTOL"` *(default)* | Holonomic. Strafe thrusters push the craft sideways onto the track; the nose is free to point wherever. Nothing banks. This is the original behaviour and is byte-for-byte unchanged by the other two modes existing. |
+| `"HYBRID"` | Banks like an aeroplane while en route — lateral error is flown by rolling toward the track and letting the tilted lift pull it round — but keeps a *sparing* amount of strafe for damping, and reverts to full wings-level strafe for the close-in pad phases (TERMINAL/ARRIVED/LANDING) and throughout an automatic landing. |
+| `"FIXEDWING"` | Strafe thrusters disabled entirely, in every phase. All lateral correction is by banking and turning. |
+
+**The coordinated turn.** In HYBRID the yaw axis is driven *from the bank*, reproducing the real relationship `ω = g·tan(bank)/v` — so the nose swings at the rate the aircraft's lean actually implies, rather than at some unrelated rate of its own. That means **in HYBRID the bank is what steers**: heading error commands a bank, and the bank turns the aircraft. FIXEDWING doesn't need this (banking is already its only lateral mechanism, so its ordinary yaw law follows the curving path naturally).
+
+**Key tuning knobs** (all in `CFG`, see the sign-calibration notes at each):
+
+| Knob | What it does |
+|---|---|
+| `BANK_MAX` | hard cap on commanded bank, **radians**. Keep it equal to the FMS's `DC.MAX_BANK_DEG` or the aircraft can't fly the corners it plans. Note a hard bank costs vertical authority (`cos(bank)` of the lift is left pointing up), so expect some altitude sag in a sustained steep turn. |
+| `BANK_PER_YAWERR` | rad of bank per rad of heading error — in HYBRID this is the **entire** heading loop, since yaw follows the bank. Too low and the aircraft tracks its route perfectly while the nose drifts to any angle at all. |
+| `BANK_HDG_KD` | damps that heading loop against the measured yaw rate. |
+| `BANK_RATE` | roll rate, rad/s. Keep it several times faster than the heading loop's own time constant (`v / (GRAVITY·BANK_PER_YAWERR)`) or the roll slew becomes the dominant lag and the loop hunts. |
+| `BANK_PER_LAT` / `BANK_LAT_MAX` / `BANK_XTK_KD` | the cross-track *trim* bank. Keep `BANK_LAT_MAX` well under `BANK_MAX` — this is a trim, not the primary control. **`BANK_XTK_KD` is a rate gain: if it sways, lower it.** |
+| `BANK_SIGN` / `BANK_XTK_SIGN` / `HDG_FROM_BANK_SIGN` | direction calibration, like every other `*_SIGN` — see Section 8. |
+| `HYBRID_STRAFE_FRAC` / `HYBRID_STRAFE_MAX` | how much strafe HYBRID keeps while banking. `0` flies it like FIXEDWING; `1` like a VTOL. |
+
 ---
 
-## 7. Tuning reference (`CFG` in `pid/uac.lua`)
+## 7. Tuning reference (`CFG` in `pid/uacconf.lua`)
 
 All optional once the signs (Section 5) are right. Numbers are the shipped defaults for the *Aer Togekiss*.
 
 | Knob | What it does |
 |---|---|
+| `FLIGHT_MODE` | `"VTOL"` / `"HYBRID"` / `"FIXEDWING"` — how lateral error is corrected (strafe vs. bank). See **§6.7** for the modes and their `BANK_*` knobs. |
 | `ATT_MODE` | `"INERTIA"` (full inertia/gyro loop) or `"PD"` (simple, tunes like an old stabiliser). |
 | `ATT_KP` / `RATE_KP` | outer (error→rate) and inner (rate→accel) gains. **Underdamped + sluggish → raise `RATE_KP`** (it speeds up *and* damps). Overshoots → lower `ATT_KP`. Buzzes → over-gained, back off. |
 | `ROT_GAIN_*` | steps per N·m per axis (INERTIA). `≈ 7 / raw`. Pitch/roll and yaw use different thrusters, tune separately. |
@@ -325,18 +350,31 @@ All optional once the signs (Section 5) are right. Numbers are the shipped defau
 
 ### 7.1 Trajectory tuning (`DC` table in `flight-management-system/autopilot.lua`)
 
-How the FMS draws its **path** curve and **speed** curve. All optional; the defaults suit the *Aer Togekiss*.
+How the FMS plans its **path** and its **speed**. The path is built **once**, when you confirm a plan — not re-evaluated every tick. Each interior waypoint gets an explicit `straight → clothoid → arc → clothoid → straight` fly-by transition, and a solver iterates geometry against speed until both agree. All optional; the defaults suit the *Aer Togekiss*.
+
+**Path geometry**
 
 | Knob | What it does |
 |---|---|
-| `CURVE` | `true` = fly the smoothed curve; `false` = aim straight at each waypoint (no rounding). |
-| `CURVE_LOOKAHEAD` | how far ahead on the curve the aim-point ("carrot") sits, m. Larger = smoother / cuts corners more; smaller = tracks the fixes tighter. |
-| `CURVE_DEV_MAX` | soft cap on how far the curve may bow off the straight leg, m — reins in **km-apart** waypoints without touching finely-placed ones (whose bow is already small). |
-| `A_LAT_MAX` | cornering lateral accel for the curvature speed limit — speed through a bend of radius R is √(`A_LAT_MAX`·R). Higher = faster through bends (needs the strafe/bank authority to match). |
-| `BRAKE_DECEL` | how hard the speed profile plans to brake, m/s². Sets how EARLY/short the slowdown into a bend or the destination is (braking distance ≈ (v²−v_target²)/(2·`BRAKE_DECEL`)). **Set it to what the craft can really brake** — too high and it arrives hot; too low and it crawls in from far out. |
-| `ACCEL_MAX` / `DECEL_MAX` | rate limits on how fast the commanded speed may rise / fall, so it reads as a smooth curve, not a staircase. |
+| `CURVE` | `true` = fly the planned path; `false` = aim straight at each waypoint (no rounding). |
+| `CURVE_LOOKAHEAD` | how far ahead on the path the aim-point ("carrot") sits, m. Larger = smoother / cuts corners more; smaller = tracks the waypoints tighter. |
+| `MAX_BANK_DEG` | **the main cornering knob.** Every corner's radius comes from `R = V²/(GRAVITY·tan(MAX_BANK_DEG))`. Higher = tighter, faster corners at a steeper bank. One *physical* number that means the same thing in all three flight modes — retune this, not a per-mode acceleration figure, if cornering feels wrong. **Keep it equal to the UAC's `CFG.BANK_MAX`** (in radians) or the aircraft can't fly the corner it planned. |
+| `JERK_MAX` | m/s³ — caps how fast lateral acceleration may ramp through the spiral entry, giving the clothoid its length (`Ls = V³/(R·JERK_MAX)`). Lower = longer, gentler roll-in; higher = shorter spiral, closer to a plain circular corner. |
+| `MIN_RADIUS` / `MAX_RADIUS` | floor and ceiling on a corner's radius, m. |
+| `LEG_FIT_FRACTION` | max fraction of *either* adjacent leg a transition may consume. Kept under 0.5 so two corners sharing one leg can never overlap. |
+| `SAMPLE_SPACING` | m between samples of the baked path polyline. Smaller = smoother carrot, more memory. |
+| `PLAN_MAX_ITERS` / `PLAN_CONV_EPS` | how hard the geometry↔speed solver tries before accepting the plan (iteration cap; convergence tolerance in m). |
+
+**Speed profile**
+
+| Knob | What it does |
+|---|---|
+| `BRAKE_DECEL` | m/s² the **corner** speed profile plans to brake with. Sets how early/short the slowdown into a bend is (braking distance ≈ (v²−v_target²)/(2·`BRAKE_DECEL`)). **Set it to what the craft can really brake** — too high and it arrives hot; too low and it crawls in from far out. |
+| `ARRIVE_DECEL` | m/s² reserved for the **final destination stop only**, independent of `BRAKE_DECEL` so it can be much steeper. A gentle final approach can legitimately carry near-cruise almost to the last waypoint, so this is what actually stops it. Raise it if the craft still arrives hot. |
+| `ACCEL_MAX` / `DECEL_MAX` | rate limits on how fast the *commanded* speed may rise / fall, so it reads as a smooth curve, not a staircase. Keep `DECEL_MAX ≥ ARRIVE_DECEL`, or this slew — not the planned physics — becomes the bottleneck. |
 | `FINAL_ARRIVE_SPEED` | the speed the profile aims for AT the destination (the point-capture then stops it). Raise it to fly *through* a course without slowing at the last fix. |
-| `SPEED_FULL` / `SPEED_SLOW` | the FULL / SLOW cruise-cap presets the **SPD** button cycles (the ceiling the curve speed stays under). |
+| `XTK_SLOW_LO/HI/MIN` | slow down while well off the leg, so the craft flies *in* to intercept the line instead of arcing across it. |
+| `SPEED_FULL` / `SPEED_SLOW` | the FULL / SLOW cruise-cap presets the **SPD** button cycles (the ceiling the planned speed stays under). |
 
 ---
 
@@ -357,15 +395,19 @@ How the FMS draws its **path** curve and **speed** curve. All optional; the defa
 | Autopilot **won't navigate** (phase shows `HANDOFF`) or **won't hold altitude** (target shows `MAN`) | the matching autopilot switch is off, or the autopilot-switch panel isn't broadcasting — check its screen (`AP NAV/AP ALT`) and modem. |
 | **Vertical stick does nothing** | the autopilot **altitude** switch is on, so the stick is ignored (it's manual-only). Flip it off. If still nothing, the VS-commander has no modem, or the stick reads 0 (wire it to fail to 7). |
 | **Nav stick does nothing** | the autopilot **nav** switch is on (stick ignored — it's manual-only), or the engine **master** is off (the relays only transmit while master is on and nav off). If still nothing, the MIC or a relay is missing its modem. |
-| Manual **yaw turns the wrong way** on the nav stick | flip `CFG.MANNAV_YAW_SIGN` in `uac.lua`. (Fore/aft & strafe reuse the calibrated `THRUST_SIGN`/`STRAFE_SIGN`, so they follow from Section 5.) |
+| Manual **yaw turns the wrong way** on the nav stick | flip `CFG.MANNAV_YAW_SIGN` in `uacconf.lua`. (Fore/aft & strafe reuse the calibrated `THRUST_SIGN`/`STRAFE_SIGN`, so they follow from Section 5.) |
 | Lift **drives the wrong way** (sinks on climb) | up/down banks swapped — swap the wiring or the `UP_SIDE`/`DOWN_SIDE` constants in `strafecon.lua`. |
 | Autopilot **stays slow for much of a long straight leg** | `DC.BRAKE_DECEL` too low → the braking distance to the destination/bend is huge. Raise it (see §7.1). |
 | Autopilot **arrives at a bend/destination too fast** | `DC.BRAKE_DECEL` higher than the craft can actually brake. Lower it so it starts slowing sooner. |
-| The curve **swings noticeably off-course** between far-apart waypoints | lower `DC.CURVE_DEV_MAX` (bounds the bow) and/or `DC.CURVE_LOOKAHEAD`. |
+| The path **swings noticeably off-course** between far-apart waypoints | lower `DC.CURVE_LOOKAHEAD` (the carrot is cutting the corner) and/or `DC.MAX_RADIUS`. |
+| Craft **flies wide of every planned corner** | `DC.MAX_BANK_DEG` and the UAC's `CFG.BANK_MAX` disagree — the plan assumes a bank the aircraft is capped below. Match them (`BANK_MAX` is in radians). |
+| In HYBRID/FIXEDWING it **banks the wrong way** | flip `CFG.BANK_XTK_SIGN` if the *cross-track* correction is inverted, `CFG.BANK_SIGN` if the whole bank is. Note `BANK_SIGN` multiplies **both** bank sources, so it can never fix the two *disagreeing* with each other — that's always `BANK_XTK_SIGN`. |
+| In HYBRID it **flies the track correctly but the nose points anywhere** (even backwards) | heading authority, not a sign — translation is holonomic and works at any nose angle, so nothing else constrains heading. Raise `CFG.BANK_PER_YAWERR`. |
+| Banks **rail-to-rail on a straight leg** | too much rate gain for the loop's bandwidth: **lower** `CFG.BANK_XTK_KD` (and check `CFG.BANK_LAT_MAX` is well under `BANK_MAX`). Raising a D gain past the actuator lag turns damping into a limit cycle — the same trap as `MANNAV_YAW_BRAKE`. |
 | Craft **won't throttle up at route start** (sits at 0) | it's aligning — pointing the nose at the first fix before accelerating. It releases once within `ALIGN_HDG_DEG`; if it's stuck, the align target and the flown target disagree (check the FMS/UAC are the synced build). |
 | **Lazy ~200 m spiral** on approach that never closes | (fixed in this build) — the direct-to path now strafes toward the target instead of relying on yaw. |
 | UAC screen shows the whole loop dead / `raw` in the millions but output ~1 | check the modem is open and the relays are running; the vector-rotation/scale bugs are fixed in this build. |
-| `function ... has more than 200 local variables` on load | you added a top-level `local`; put new tuning constants in a table — `CFG.NAME` in `uac.lua`, or the `DC` / `LG` / `RAD` tables in `autopilot.lua` — not as a bare `local`. (`luac -p` won't catch this; the VM counts a nested function's locals on top of the file's top-level ones.) |
+| `function ... has more than 200 local variables` on load | you added a top-level `local`; put new tuning constants in a table — `CFG.NAME` in `uacconf.lua`, or the `DC` / `LG` / `RAD` tables in `autopilot.lua` — not as a bare `local`. (`luac -p` won't catch this; the VM counts a nested function's locals on top of the file's top-level ones.) |
 | Attitude Indicator shows **"NO SUBLEVEL API"** | that computer isn't part of the Sable-tracked contraption — it must be built into the aircraft. |
 | HSI heading/map reads rotated or mirrored | the compass conversion is the one `toCompass()` in autopilot.lua (shared by both HSI modes). Course mode: the **CDI needle** deflection is a one-character sign flip in `drawCourseHSI`. Landing mode: the heading-bar turn direction is the sign on `err` in `drawLandingHSI`. |
 | AI bank pointer moves the **wrong way** | flip the roll sign on the pointer in `drawAI` (altcom.lua) — it's the one marked bank switch. |

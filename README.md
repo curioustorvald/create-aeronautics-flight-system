@@ -11,12 +11,13 @@ The centrepiece is the **Unified Attitude Controller (UAC)** — a quaternion-ba
 ## Features
 
 - **Quaternion attitude control** with an inner rate loop, inertia-tensor scaling and gyroscopic decoupling — stable through the whole envelope, including aggressive turns and upset recovery.
-- **Trajectory autopilot**: fly direct-to a point, or a multi-waypoint route flown as one **smooth curve** — the FMS fits a centripetal Catmull-Rom spline through the waypoints, rounds the corners, and pure-pursues an aim-point along it, so the bearing changes continuously with no snap at a waypoint.
-- **Curvature-based speed**: the FMS draws a *speed* curve to match the *path* curve — it holds cruise on the straights and slows through tight bends (and for the destination), braking **in advance**, all smoothly rate-limited.
+- **Trajectory autopilot**: fly direct-to a point, or a multi-waypoint route flown as one **smooth curve**. When you confirm a plan the FMS lays out a real flight-planned path — every interior waypoint gets a `straight → clothoid → arc → clothoid → straight` fly-by transition, sized from the turn-radius formula `R = V²/(g·tan(bank))` with a jerk-limited spiral entry, so lateral acceleration ramps in linearly instead of stepping. The aircraft then pure-pursues an aim-point along the baked path, so the bearing changes continuously with no snap at a waypoint.
+- **Planned speed profile**: the path is planned *with* its speed — a two-pass (brake-backward, accelerate-forward) profile over the whole route, so it holds cruise on the straights and arrives at each bend already slowed, with a separate steeper deceleration reserved for the final destination stop.
+- **Three flight modes**: the same airframe flies as a **VTOL** (strafes sideways to close on a target), a **FIXEDWING** (no strafe at all — turns are flown purely by banking, with a simulated coordinated turn), or a **HYBRID** of the two (banks like an aeroplane en route, but keeps the VTOL strafe for precise pad work). One switch in the UAC config; the flight plan's bank-angle knob means the planned path stays consistent across all three.
 - **Automatic landing**: align → translate over the pad → descend → flare → touchdown, with a pilot-override option to pause the descent and hand the vertical channel back to ALT-AP mid-approach.
 - **Full manual fly-by-wire**: with both autopilot switches off, hand-fly the whole aircraft — the **nav stick** commands fore/aft/strafe/yaw and the **vertical-speed stick** commands climb/descent, while the UAC keeps it level and holds heading between inputs. Independent of the autopilot, so it doubles as an emergency course-alteration override.
 - **Cockpit switches**: two **autopilot toggles** (navigation, altitude) select the flight mode live — full auto, navigate-only, altitude-only, or just-keep-level; three **engine switches** (master / altitude / attitude) are hardware cut-offs for the thruster banks.
-- **Holonomic navigation**: it's a VTOL, so it strafes sideways to close on a target instead of relying on the (slow, heavy) yaw axis.
+- **Holonomic navigation**: in VTOL mode it strafes sideways to close on a target instead of relying on the (slow, heavy) yaw axis. In HYBRID/FIXEDWING that lateral correction is flown by *banking* toward the track instead, the way an aeroplane does it.
 - **Attitude-aware thrust allocation**: "hold altitude" works even inverted or pitched 90° — the vertical effort is routed to whichever thruster is actually pointing up.
 - **Glass cockpit**: an Attitude Indicator (artificial horizon with a real-AI bank pointer on the bezel) and an HSI that switches modes — a heading-up VOR/HSI whose course needle follows the flown **curve** while navigating, and a top-down landing map (aircraft, pad, heading-error bar) once a landing engages — on external monitors.
 - **One touch-screen FMS** to build/edit waypoints and routes and to fly them.
@@ -63,7 +64,7 @@ create-aeronautics-flight-system/
 ├─ MANUAL.md                       (install, wiring, calibration, usage, troubleshooting)
 ├─ attitude-controller/            -> the UAC computer
 │  ├─ startup.lua
-│  └─ pid/  (uac.lua, pid.lua, probe.lua)
+│  └─ pid/  (uac.lua, uacconf.lua, pid.lua, probe.lua)
 ├─ flight-management-system/       -> the FMS computer
 │  ├─ startup.lua, autopilot.lua
 │  └─ points.db, course.db, landing.db   (example nav data)
