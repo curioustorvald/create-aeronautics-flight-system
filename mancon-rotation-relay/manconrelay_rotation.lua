@@ -26,22 +26,33 @@ function switchEngine()
     end
 end
 
+local function f(pred, str)
+    if pred then return str else return '---' end
+end
+
 local apnav, apalt = false
-function switchAutopilot()
+function switchApnav()
     while true do
-        local sender, msg, __ = rednet.receive("aertogekiss_apswitch", 1)
+        local sender, msg, __ = rednet.receive("aertogekiss_apswitch_1", 1)
         if sender ~= nil then
             apnav = msg.autopilot_nav
-            apalt = msg.autopilot_altitude
-            displayLine(5, 'AP-NAV: '..tostring(apnav)..' AP-ALT: '..tostring(apalt))
+            displayLine(5, 'AP-NAV: '..tostring(apnav))
         else
-            displayLine(5, "No AP switch signal received")
+            displayLine(5, "No APNAV signal received")
         end
     end
 end
 
-local function f(pred, str)
-    if pred then return str else return '---' end
+function switchApalt()
+    while true do
+        local sender, msg, __ = rednet.receive("aertogekiss_apswitch_2", 1)
+        if sender ~= nil then
+            apalt = msg.autopilot_altitude
+            displayLine(6, 'AP-ALT: '..tostring(apalt))
+        else
+            displayLine(6, "No APALT signal received")
+        end
+    end
 end
 
 displayLine(1, 'Aer Togekiss Rotational MANCON')
@@ -68,4 +79,14 @@ local function relayLoop()
     end
 end
 
-parallel.waitForAny(relayLoop, switchEngine, switchAutopilot)
+local function touchDownDetectionLoop()
+    while true do
+        local td = redstone.getInput('back')
+        rednet.broadcast({ ['touchedDown'] = td }, 'aertogekiss_touchdown_detection')
+        displayLine(3, 'Touched down: '..tostring(td))
+        
+        sleep(0.1)
+    end
+end
+
+parallel.waitForAny(relayLoop, touchDownDetectionLoop, switchEngine, switchApnav, switchApalt)

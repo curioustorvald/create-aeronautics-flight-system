@@ -37,6 +37,7 @@ CFG.AUTOLAND_PROTOCOL = 'aertogekiss_autoland'   -- in : FMS vertical channel
 CFG.APSWITCH_PROTOCOL = 'aertogekiss_apswitch'   -- in : pilot autopilot toggles (nav / altitude), #12
 CFG.MANCON_PROTOCOL   = 'aertogekiss_mancon'     -- in : manual wanted climb rate (m/s) from the VSC, #6
 CFG.MANNAV_PROTOCOL   = 'aertogekiss_mancon_nav' -- in : manual horizontal+yaw stick (m/s, rad/s) from the MIC, #14
+CFG.KBDJOY_PROTOCOL   = 'aertogekiss_kbdjoy'     -- in : keyboard joystick -- pitch/roll TARGET (rad) + throttle, #21
 CFG.STAB_PROTOCOL     = 'aertogekiss_stab'       -- out: pitch/roll thrusters
 CFG.NAVCTRL_PROTOCOL  = 'aertogekiss_navcontrol' -- out: yaw/thrust/strafe
 CFG.ALT_PROTOCOL      = 'aertogekiss_alt'        -- out: up/down thruster
@@ -409,10 +410,49 @@ CFG.BANK_RATE       = 0.35   -- rad/s slew on the bank command (smooth roll in/o
 -- forward thrust into climb. Suppressed during autoland/LANDING so the craft keeps
 -- a level pad approach. Flip CFG.PITCH_ALT_SIGN if the nose drops when it should
 -- rise to climb.
+-- The FIXEDWING vertical-by-pitch block below supersedes this overlay whenever it is live.
+-- These four stay at 0 (all four ways of switching this overlay off); it remains the
+-- HYBRID/VTOL cosmetic lean only. Never run both: two terms fighting over one pitch setpoint
+-- is the pitch version of the failure the BANK_XTK_SIGN history documents at length.
 CFG.PITCH_ALT_SIGN  = 0 -- -1
 CFG.PITCH_PER_MPS   = 0.0--0.04   -- rad of commanded pitch per m/s of desired vertical rate
 CFG.PITCH_ALT_MAX   = 0.0--0.3    -- rad (~23 deg) cap on commanded pitch
 CFG.PITCH_ALT_RATE  = 0.0--0.2    -- rad/s slew on the pitch command
+
+-- ============================================================================
+-- FIXEDWING VERTICAL-BY-PITCH -- the aeroplane climbs by pointing the nose up
+-- ============================================================================
+-- INERT ON THIS AIRFRAME. Everything here is gated on CFG.FLIGHT_MODE == "FIXEDWING" and this
+-- craft is VTOL, so not one of these values is read in normal operation -- they are defined
+-- because uac.lua is shared byte-for-byte across the fleet and reads them unconditionally at
+-- boot (the canary list names them for exactly that reason). They also become live the moment
+-- someone cycles the on-screen MODE button round to FW, which is worth knowing before doing it.
+--
+-- WHAT IT DOES, on the aeroplane it was written for: with no lift thruster the only way to
+-- change altitude is to fly at an angle to the horizon, so the altitude cascade's desired climb
+-- rate stops being a demand on a vertical thruster and becomes a commanded PITCH ANGLE that the
+-- stabiliser holds like any other attitude setpoint. The law is
+--   pitch = (FF*vsCmd + KP*(vsCmd - vsActual) + KI*integral) / max(speed, MIN_SPEED)
+-- -- dividing by the LIVE horizontal speed because tan(gamma) = vs/v, so the angle that buys a
+-- given climb rate is inversely proportional to speed and a fixed rad-per-m/s gain would be
+-- wrong by nearly an order of magnitude across this fleet's speed range. See #19's uacconf for
+-- the full commentary; the values below are that airframe's, carried over unchanged.
+CFG.FW_PITCH_ENABLE = true
+-- Inherits the in-flight-calibrated CFG.KJOY_PITCH_SIGN's convention ("+command = nose up"),
+-- which is the same physical thing -- not a fresh guess. Flip both together if ever wrong.
+CFG.FW_PITCH_SIGN   = 1
+CFG.FW_PITCH_FF     = 0.0    -- 1.0 = the honest geometric flight path angle for the commanded rate
+CFG.FW_PITCH_KP     = 3.0   -- dimensionless CORRECTION on top of FF, not a second FF
+CFG.FW_PITCH_KI     = 0.06   -- 1/s; weak on purpose -- a strong one pegs the nose up
+CFG.FW_PITCH_I_LIMIT = 100.0 -- clamp on |integral| (m); angle contribution is KI*LIMIT/speed
+CFG.FW_PITCH_MAX    = 0.45   -- rad (11.5 deg) hard stop; == CFG.TILT_YAW_MIN, so yaw never fades
+-- Fraction of FW_PITCH_MAX the FEEDFORWARD alone may use. Also the SPEED PROTECTION: the cap
+-- it makes (HEADROOM*MAX*speed) limits the commanded climb rate using the RAW speed, so a slow
+-- aeroplane asks for less climb instead of mushing nose-high. See #19's uacconf for the story.
+CFG.FW_PITCH_HEADROOM = 0.27
+CFG.FW_PITCH_RATE   = 0.15   -- rad/s slew; faster buys nothing against a multi-second loop
+CFG.FW_PITCH_MIN_SPEED = 20.0 -- m/s floor on the divisor (cf. CFG.HDG_SIM_MIN_SPEED)
+
 
 -- Cross-track (lateral-correction) BANK -- HYBRID/FIXEDWING only. In these modes the
 -- lateral course correction that VTOL flies by STRAFING is flown by BANKING instead:
@@ -534,11 +574,164 @@ CFG.HDG_SIM_MAX_RATE   = CFG.MAX_RATE_YAW   -- rad/s cap -- same ceiling the yaw
 CFG.HYBRID_STRAFE_FRAC = 0.25   -- fraction of the full course strafe kept while banking
 CFG.HYBRID_STRAFE_MAX  = 4      -- redstone-step cap on that sparing strafe
 
+-- EAGER STRAFE for SMALL corrections -- hands lateral control back from bank to strafe once
+-- the remaining correction is small. Added 2026-08-01 for: "HYBRID and FIXEDWING oscillate
+-- the yaw when they should be near stand-still; VTOL doesn't."
+--
+-- Why the two banking modes ring at rest and VTOL never does. Near a target the heading-error
+-- bank is ALREADY faded out (BANK_HDG_FADE_NEAR = 60 m), so latBank is the SOLE bank source
+-- there -- and latBank is fed by lastLatDemand, the translation law's body-right demand, which
+-- at a standstill is chasing nothing but velocity NOISE. In HYBRID that noise then goes through
+-- HDG_SIM with v floored at HDG_SIM_MIN_SPEED (5 m/s, its smallest legal divisor = its LARGEST
+-- gain), so a few steps of jitter demand omega = GRAVITY*tan(BANK_PER_LAT*jitter)/5 -- easily
+-- the full HDG_SIM_MAX_RATE. A metre of drift buys a full-rate yaw command. VTOL is immune
+-- because it simply strafes the metre out and never involves the nose at all.
+--
+-- So: below NEAR the correction is a job for translation, not for turning -- take latBank to
+-- zero and give the strafe channel its FULL authority back (undoing HYBRID_STRAFE_FRAC/MAX),
+-- restoring VTOL's behaviour in the small. FIXEDWING has no strafe thruster, so there the
+-- strafe half is a deliberate NO-OP and only the bank half bites: the aircraft simply stops
+-- trying to correct a trivial offset, which is exactly right -- no mini-swaying on the ground.
+-- Ramp, not a switch, so nothing chatters at the boundary. (This is NOT the BANK_XTK_FADE
+-- mistake above: that faded ONE of two OPPOSED terms on heading error, creating an attractor
+-- where the correction reversed. Here both channels push the SAME way and the fade only
+-- chooses which ACTUATOR flies it, so the boundary has no equilibrium to sit in.)
+--
+-- The measured "correction" is whatever the lateral law is actually nulling this tick: cross-
+-- track |xtk| on a plain ENROUTE leg, else distance to the target (which, with the FMS's
+-- carrot ~400 m ahead, stays far outside FAR all cruise -- so cruise banking is untouched).
+-- Set BOTH to 0 to disable the feature entirely. Raise NEAR if it still twitches at rest;
+-- lower it if HYBRID now strafes flat through corrections it should have banked.
+CFG.STRAFE_EAGER_NEAR = 8    -- m; at/below this correction, full strafe and NO cross-track bank
+CFG.STRAFE_EAGER_FAR  = 25   -- m; at/above this, the normal mode policy (bank steers)
+
+-- ============================================================================
+-- KEYBOARD JOYSTICK (#21 keyboardjoystick.lua, over KBDJOY_PROTOCOL) -- the pilot
+-- hand-flies the craft on a virtual stick + throttle quadrant read off a typewriter.
+-- The stick sends a pitch/roll TARGET (rad, trim-style: it holds where the pilot left it)
+-- and a 0..1 throttle lever; this block decides what the UAC does with them.
+--
+-- LIVE ONLY WHEN ALL THREE HOLD -- see kjLive in controlLoop:
+--   * CFG.FLIGHT_MODE == "FIXEDWING" (the pilot's own requirement). VTOL has no bank
+--     overlay at all and HYBRID keeps a strafe/pad-alignment policy the stick would fight;
+--     FIXEDWING is the mode where roll IS the lateral control, so a stick means something.
+--     Runtime-switchable: the on-screen MODE button re-derives it, so tapping to FW arms
+--     the stick and tapping past it disarms it, live.
+--   * AP-NAV OFF and no autoland (the same handoff gate the MIC uses) -- the FMS and a
+--     hand-held stick must never both own the attitude setpoint.
+--   * a packet fresher than KJOY_STALE_AFTER -- a crashed/unplugged #21 must not leave a
+--     stale bank latched in, so silence hands the craft straight back.
+-- When live the stick REPLACES the autopilot's bank/pitch targets rather than adding to
+-- them. Deliberate: this file's whole BANK_XTK_SIGN history is what happens when two terms
+-- share one bankTarget, and a pilot's stick is not a term to be blended with.
+CFG.KJOY_ENABLE      = true
+CFG.KJOY_STALE_AFTER = 0.5    -- s; joystick packet older than this -> no manual attitude
+-- Hard stops on what the stick may command (rad). +-60 deg per the #21 spec; keep in step
+-- with PITCH_MAX/ROLL_MAX over there, which clamps at source. NOTE these deliberately
+-- EXCEED CFG.BANK_MAX (45 deg, the autopilot's planned-corner limit): a pilot may bank
+-- harder than the FMS ever plans for. At 60 deg TILT_ALT_ALLOC leaves the alt thruster only
+-- cos(60) = 0.5 of its vertical authority, so expect real altitude sag in a sustained hard
+-- hand-flown bank -- that is the aerodynamics being honest, not a bug.
+CFG.KJOY_PITCH_MAX   = math.rad(60)
+CFG.KJOY_ROLL_MAX    = math.rad(60)
+-- Sign for the stick's PITCH command. It needs its own knob because the existing
+-- CFG.PITCH_ALT_SIGN -- the sign attitude() normally applies to pitchCmd -- is 0, i.e. the
+-- climb-pitch overlay is switched OFF; routing the stick through it would multiply the
+-- pilot's input by zero and silently do nothing. So controlLoop passes THIS as attitude()'s
+-- pitchCmdSign override whenever the stick is live. CALIBRATION, not a guess any more:
+-- FLIPPED -1 -> +1 (2026-07-31) after the pilot found the stick inverted in flight and
+-- corrected it by negating pitch in #21's broadcast; that fix was moved here, which is
+-- exactly equivalent at the thrusters (ex = ex - SIGN*cmd, so negating the command and
+-- negating the sign are the same thing) and keeps #21's display honest -- with the negation
+-- in the broadcast, the stick box drew the cursor down while the readout said +60.
+-- If E (nose up) ever drops the nose again, flip this, NOT #21.
+CFG.KJOY_PITCH_SIGN  = 1
+-- Sign for the stick's ROLL command. Multiplies bankTarget, which then rides the calibrated
+-- CFG.BANK_SIGN. Also FLIPPED +1 -> -1 (2026-07-31), same session and the same reason as
+-- KJOY_PITCH_SIGN above: it carries the roll half of that in-flight correction.
+-- CAUTION, per BANK_SIGN's own note: this is the stick's PRIVATE sign, so it is the right
+-- knob when the STICK alone works backwards. If the autopilot banks wrongly too, the fault
+-- is upstream in BANK_SIGN/BANK_XTK_SIGN and flipping this will only mask half of it.
+CFG.KJOY_ROLL_SIGN   = -1
+-- Slew rate on the commanded attitude WHILE THE STICK IS LIVE (rad/s), replacing BANK_RATE
+-- and PITCH_ALT_RATE. Two reasons it must override them, not add to them:
+--   * PITCH_ALT_RATE is 0.0 (the disabled climb-pitch overlay). slew() with a zero step
+--     freezes pitchCmd at 0 forever -- the stick's pitch would be eaten in silence.
+--   * #21's own STICK_RATE (45 deg/s) IS the pilot's roll rate. A second, slower slew here
+--     would just add lag between the stick and the craft. Keep this comfortably faster than
+--     STICK_RATE so the UAC tracks the demand instead of becoming the bottleneck.
+CFG.KJOY_SLEW_RATE   = 1.5    -- rad/s (~86 deg/s)
+-- Throttle. A throttle LEVER names engine power, not a speed, so 0..1 maps straight onto
+-- forward thruster steps -- no PID, no commanded airspeed (use the MIC #14 if you want
+-- velocity control instead). One-sided: idle is 0, there is no reverse.
+CFG.KJOY_THRUST_MAX  = CFG.THRUST_MAX   -- steps at full throttle; lower to detune the engine
+-- Bank -> turn for the HAND-FLOWN craft. FIXEDWING normally needs no bank/yaw coupling
+-- because, as CFG.HDG_SIM_ENABLE's note explains, its yaw law chases the live BEARING and
+-- so follows the banked craft's curving path round on its own. But that argument assumes
+-- there IS a bearing to chase -- with AP-NAV off, desiredHeading is frozen at the current
+-- heading, so the yaw loop would hold the nose rigidly straight while the banked lift slid
+-- the craft bodily sideways. Deriving the turn rate from the commanded bank restores "bank
+-- and the nose follows", which is the entire point of a stick.
+--
+-- Structurally this is SAFER than the HYBRID heading sim it borrows from, despite feeding
+-- the same wdy slot: HYBRID closes a real loop (hErr -> bank -> yaw -> hErr) and that loop
+-- is what needed BANK_HDG_KD, the fade, and three sign flips. Here there is no loop at all
+-- -- the bank comes from the pilot's fingers, so the pilot IS the outer loop. It reuses the
+-- same GRAVITY / HDG_SIM_MIN_SPEED / HDG_SIM_MAX_RATE / HDG_FROM_BANK_SIGN calibration.
+-- Set false for a pure heading-hold stick (bank leans the craft, nose stays put).
+-- If the nose turns the WRONG way for the bank, that is HDG_FROM_BANK_SIGN, shared with
+-- HYBRID -- flip it there and re-check HYBRID too, do not add a private sign here.
+--
+-- INTERACTION WITH THE MIC (#14), worth knowing before it surprises you: this feeds the same
+-- "rate is already known, skip the heading profile" slot manYawRate does, so while the stick
+-- is live yaw is RATE-controlled off the bank and the MIC's release-the-rudder-and-hold-this-
+-- heading behaviour no longer applies (at wings level the rate command is simply 0, i.e. a
+-- rate-null, which holds the nose steady but does not correct slow drift back). That is
+-- ordinary aeroplane behaviour and the intended feel. Actively holding the MIC rudder still
+-- wins over this (manYawRate takes priority); KJOY_BANK_TURN = false restores the heading-hold.
+CFG.KJOY_BANK_TURN   = true
+-- HOW MUCH turn a bank commands ------------------------------------------------------------
+-- Worth being precise about what is and is not simulated here, because it decides which knob
+-- to reach for. The PATH does curve correctly on its own: the alt thruster points along body-
+-- up, so at bank b the altitude loop must hold F*cos(b) = mg, leaving a sideways component
+-- F*sin(b) = mg*tan(b) -- exactly the centripetal force a real wing gives, hence the honest
+-- omega = g*tan(b)/v. What the game does NOT simulate is any WEATHERVANING: a real fin drags
+-- the nose round to follow that curving path, and nothing here does, which is why the yaw
+-- thrusters have to be commanded at all (that is what KJOY_BANK_TURN above is for).
+--
+-- The catch is the magnitude. At CRUISE_SPEED(280) the honest rate is only 2.3 deg/s at 45 deg
+-- of bank and 3.9 deg/s at 60 (a 4.1 km radius, 46 s to reverse course). That is correct
+-- aerodynamics for something this fast -- not a bug -- but it is glacial to hand-fly, and
+-- there are TWO reasons not to feel bound by it here:
+--   * at steep bank the alt thruster has to make mg/cos(b) -- DOUBLE hover thrust at 60 deg --
+--     so it saturates, the real sideways force falls short of mg*tan(b), and the actual path
+--     curves LESS than the formula claims. The honest rate is optimistic in practice.
+--   * the "wing" is a thruster and the engine points along the body, so yawing the nose drags
+--     the velocity vector round after it. A thrust-vectored craft turns by pointing, not by
+--     lift alone -- so leading the path is a legitimate way to fly this, not a fault.
+--
+-- KJOY_TURN_GAIN scales the derived rate. >1 makes the turn deliberately UNCOORDINATED (nose
+-- inside the flight path -- a skid, which on a real aircraft is a fault and here is the
+-- point). Start around 2-3 if the honest rate feels dead. HDG_SIM_MAX_RATE still caps the
+-- result, so this cannot run away however high it is set.
+CFG.KJOY_TURN_GAIN = 1.0
+-- Speed used in the divisor. nil = the craft's TRUE ground speed, i.e. honest physics: the
+-- same bank turns briskly when slow and lazily at cruise. Set a NUMBER to pin it, and turn
+-- rate then depends on BANK ALONE -- full stick always turns at the same rate whatever the
+-- throttle is doing, which is far more predictable to hand-fly. ~60 makes 60 deg of bank worth
+-- ~18 deg/s at any speed. Affects ONLY the joystick; HYBRID's autopilot sim always uses the
+-- true speed, since it is flying a planned radius the FMS computed from real physics.
+-- SET TO 60 (2026-07-31) at the pilot's choice, i.e. hand-flying is deliberately NOT
+-- speed-coordinated: 45 deg of bank turns at 18 deg/s and 60 deg saturates MAX_RATE_YAW
+-- (28.6 deg/s), whether the craft is doing 30 m/s or cruise. Raise it toward CRUISE_SPEED for
+-- lazier, more realistic turns; lower it for a twitchier stick.
+CFG.KJOY_TURN_REF_SPEED = 60
+
 
 -- ============================================================================
 -- TRANSLATION CONFIG -- ported from navcom.lua (yaw removed; it is attitude now)
 -- ============================================================================
-CFG.CRUISE_SPEED       = 280.0
+CFG.CRUISE_SPEED       = 320.0
 CFG.APPROACH_KP        = 0.20
 CFG.APPROACH_SPEED     = 30.0
 CFG.TERMINAL_MAX_SPEED = 10.0
@@ -579,6 +772,13 @@ CFG.WP_EPSILON  = 0.5
 -- ============================================================================
 -- ALTITUDE CONFIG -- ported from control.lua (the vertical cascade + autoland)
 -- ============================================================================
+-- DOES THIS AIRFRAME HAVE LIFT THRUSTERS AT ALL? A physical fact about the aeroplane, NOT a
+-- mode: FLIGHT_MODE says how the craft is flown, this says what it is built out of, and the
+-- two are set independently. TRUE here -- this craft has up/down thrusters and everything
+-- below runs exactly as it always has. It is FALSE on the Citation (#19), whose only vertical
+-- control is the pitch angle; with it false uac.lua skips the inner climb-rate loop and the
+-- tilt allocation entirely and CFG.FW_PITCH_* flies the vertical instead.
+CFG.HAS_ALT_THRUSTER = true
 -- The vertical channel now drives the up- and down-firing thrusters directly on
 -- two separate redstone lines (see sendAlt) -- the old single 0..14 line + external
 -- splitter box is gone. ALT_NEUTRAL is the balanced-hover level BOTH lines sit at
@@ -604,6 +804,13 @@ CFG.AP_ALT_MIN, CFG.AP_ALT_MAX = 5, 999
 CFG.AL_DESC_MAX    = CFG.DESCEND_MAX
 CFG.AL_CLIMB_MAX   = CFG.CLIMB_MAX
 CFG.AL_STALE_AFTER = 3.0
+-- Standing down-command (m/s) held while the aircraft is on its gear with the squat contact
+-- made -- see alGrounded in uac.lua. It is not a descent, it is a bias: it keeps the lift
+-- thrusters from ever answering a settle by firing UP, which is what unloads the gear and
+-- makes a craft skittish on the ground (and, on a runway rollout, stops the wheels braking).
+-- The velocity loop's integral is frozen while it applies, so this can never wind up.
+-- 0 disables the down-bias without re-enabling the altitude hold; raise it to press harder.
+CFG.AL_GROUND_VS   = 0.5
 
 -- Link freshness
 CFG.AP_STALE_AFTER = 5.0

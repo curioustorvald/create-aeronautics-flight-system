@@ -1,0 +1,28 @@
+; autolanding info
+; aerodrome/poi = type (heli,rwy,goaround), direction (n, w, s, e; x for don't care), altitude, runway length in meters (ignored for heli)
+; IF TYPE IS goaround, the format changes:
+; random id = "goaround", starting point X, starting point Y, ending point X, ending point Y, altitude
+; an FMS should be able to circle into the goaround route, fly straight, circle back to runway line, realign, and try landing again.
+; Minecraft coord convention:
+; North: Z-
+; East: X+
+; South: Z+
+; West: X-
+; Altitude: Y axis
+TMU=heli,n,69,0
+AGS=heli,n,73,0
+BZR=heli,w,69,0
+ZTP=heli,s,70,0
+KST=heli,w,71,0
+FRO=heli,s,73,0
+WAU=heli,s,120,0
+ARN=heli,s,70,0
+RNF=heli,n,70,0
+WCL=heli,e,226,0
+FRT=heli,w,93,0
+TWN=heli,e,73,0
+OLV=heli,w,73,0
+TMV=rwy,s,69,295
+TMA=rwy,n,69,295
+TMA_GA=goaround,780,262,780,1229,105
+TMV_GA=goaround,780,1229,780,262,105

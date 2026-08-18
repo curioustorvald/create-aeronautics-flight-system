@@ -9,6 +9,8 @@ ZTP=-6043,22794
 KST=9865,27891
 FRO=27880,18264
 WAU=-2419,22046
+TMV=609,598
+TMA=609,893
 
 ; waypoints (VORs are always five letters long)
 SPAWN=0,0

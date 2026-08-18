@@ -273,11 +273,23 @@ local mon = peripheral.find("monitor")
 local BLIT = {}
 for i = 0, 15 do BLIT[2 ^ i] = ("0123456789abcdef"):sub(i + 1, i + 1) end
 
-local function aiEuler(o)
-    local a, b, c = o:toEuler()
-    if type(a) == "number" then return a, b, c end
-    return a.x, a.y, a.z
+-- Rotate vector (x,y,z) by the UNIT quaternion q, PRESERVING its magnitude (q*vector
+-- normalises the intermediate product and silently discards it -- see uac.lua's rotateVec,
+-- copied here byte-for-byte).
+local function rotateVec(q, x, y, z)
+    local ux, uy, uz, a = q.v.x, q.v.y, q.v.z, q.a
+    local tx = 2 * (uy*z - uz*y)
+    local ty = 2 * (uz*x - ux*z)
+    local tz = 2 * (ux*y - uy*x)
+    return x + a*tx + (uy*tz - uz*ty),
+           y + a*ty + (uz*tx - ux*tz),
+           z + a*tz + (ux*ty - uy*tx)
 end
+
+-- One switch each, same pattern as every other sign in this project: flip if the
+-- horizon tilts/moves the wrong way in-game.
+local HZN_PITCH_SIGN = -1
+local HZN_ROLL_SIGN  = 1
 
 if mon then
     mon.setTextScale(0.5)
@@ -302,8 +314,12 @@ local function drawAI()
         return
     end
     local pose = sublevel.getLogicalPose()
-    local pitch = select(1, aiEuler(pose.orientation))
-    local roll  = select(3, aiEuler(pose.orientation))
+    local qInv = pose.orientation:inverse()
+    -- World "up" expressed in body frame. This single vector encodes pitch+roll with
+    -- NO ±90 deg clamp and no discontinuity when inverted (unlike Euler pitch, which
+    -- toEuler() bounds to ±90 deg and so can never represent "upside down" -- it's the
+    -- vector projection, not an angle, that makes this generalise through any attitude).
+    local ux, uy, uz = rotateVec(qInv, 0, 1, 0)
     local alt   = pose.position.y
     local v     = sublevel.getLinearVelocity()
     local gs    = math.sqrt(v.x * v.x + v.z * v.z)
@@ -311,18 +327,28 @@ local function drawAI()
 
     local midX = math.floor(W / 2) + 1
     local midY = math.floor(H / 2) + 0
-    local pxPerRad = H / 1.6                                  -- rows per rad of pitch
-    local slope    = math.tan(math.max(-1.3, math.min(1.3, -roll))) * (2 / 3)  -- char aspect
-    local pitchOff = pitch * pxPerRad                          -- +pitch (nose up) -> horizon down
+    local pxPerUnit = H / 1.6                                  -- rows per unit of tan(tilt)
+    -- Keep |uy| off zero so a knife-edge (90 deg bank) doesn't blow the divide up; the
+    -- SIGN of uy must survive the clamp -- it's what flips sky/ground below when inverted.
+    local uySafe   = (uy >= 0) and math.max(uy, 0.05) or math.min(uy, -0.05)
+    local pitchOff = HZN_PITCH_SIGN * pxPerUnit * uz / uySafe
+    local slope    = HZN_ROLL_SIGN * (2 / 3) * ux / uySafe     -- char aspect, same factor as before
+    local skyAbove = uy >= 0                                    -- false = more than 90 deg from level
 
-    -- horizon, one blit per row (sky above, ground below, white line at the boundary)
+    -- horizon, one blit per row (sky/ground swapped when skyAbove is false, white line
+    -- at the boundary)
     local sky, gnd, wht = BLIT[colours.blue], BLIT[colours.brown], BLIT[colours.white]
+    if not skyAbove then sky, gnd = gnd, sky end
     local spaces = string.rep(" ", W)
     local fg = string.rep("0", W)
+    local hrows = {}
+    for col = 1, W do
+        hrows[col] = math.floor(midY + pitchOff + (col - midX) * slope + 0.5)
+    end
     for row = 1, H do
         local bg = {}
         for col = 1, W do
-            local hrow = math.floor(midY + pitchOff - (col - midX) * slope + 0.5)
+            local hrow = hrows[col]
             bg[col] = (row < hrow) and sky or (row > hrow and gnd or wht)
         end
         mon.setCursorPos(1, row); mon.blit(spaces, fg, table.concat(bg))
@@ -357,8 +383,9 @@ local function drawAI()
         local x, y = rimXY(math.rad(d)); box(x, y, "'", colours.grey)
     end
     do local x, y = rimXY(0); box(x, y, "|", colours.white) end -- fixed 0 index
-    -- Moving roll pointer. Flip the sign if it banks the wrong way (this file's one switch).
-    local px, py = rimXY(math.max(-1.4, math.min(1.4, roll)))
+    -- Moving roll pointer -- true bank from world-up-in-body (ux,uy), continuous through
+    -- inverted (no clamp needed, unlike the old Euler roll reading).
+    local px, py = rimXY(HZN_ROLL_SIGN * math.atan2(ux, uy))
     mon.setCursorPos(px, py); mon.setBackgroundColour(colours.orange); mon.write(" ")
 
     -- fixed aircraft reference wings at centre
@@ -382,9 +409,17 @@ local function aiLoop()
     end
 end
 
+local function apAnnounceLoop()
+    while true do
+        local alt = redstone.getInput('front')
+        rednet.broadcast({ ['autopilot_altitude'] = alt }, 'aertogekiss_apswitch_2')
+        sleep(0.1)
+    end
+end
+
 term.clear()
 rednet.open('back')
 
 drawPanel(1) drawPanel(2) drawPanel(3) drawPanel(4)
 
-parallel.waitForAny(updateInput, broadcastAltiLoop, autolandLoop, aiLoop)
+parallel.waitForAny(updateInput, broadcastAltiLoop, autolandLoop, aiLoop, apAnnounceLoop)

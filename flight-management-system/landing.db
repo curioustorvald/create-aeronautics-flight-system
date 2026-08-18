@@ -14,3 +14,9 @@ KST=heli,w,71,0
 FRO=heli,s,73,0
 WAU=heli,s,120,0
 ARN=heli,s,70,0
+; A RUNWAY is the same strip listed twice, once per landing direction: the point is the
+; THRESHOLD you touch down past, and the strip runs from it for <length> m the way you land.
+; TMV (609,598) landing south + 295 m ends at 609,893, which is exactly where TMA sits --
+; land on TMA instead and you fly the identical strip northbound.
+TMV=rwy,s,69,295
+TMA=rwy,n,69,295

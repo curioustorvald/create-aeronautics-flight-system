@@ -8,11 +8,34 @@ local function displayLine(row, text)
     term.clearLine()
     term.write(text)
 end
+
+local alt = false
+local nav = false
+
+local function relayLoop1()
+    while true do
+        local sender, msg = rednet.receive(PROTOCOL_AUTOPILOT_SWITCH..'_1', 1)
+        if sender and type(msg) == "table" and msg.autopilot_nav ~= nil then
+            nav = msg.autopilot_nav
+        end
+        
+        sleep(0.1)
+    end
+end
+
+local function relayLoop2()
+    while true do
+        local sender, msg = rednet.receive(PROTOCOL_AUTOPILOT_SWITCH..'_2', 1)
+        if sender and type(msg) == "table" and msg.autopilot_altitude ~= nil then
+            alt = msg.autopilot_altitude
+        end
+        
+        sleep(0.1)
+    end
+end
+
 local function relayLoop()
     while true do
-        local alt = redstone.getInput('right')
-        local nav = redstone.getInput('left')
-    
         rednet.broadcast({ ['autopilot_altitude'] = alt, ['autopilot_nav'] = nav }, PROTOCOL_AUTOPILOT_SWITCH)
 
         displayLine(1, "AP NAV: "..tostring(nav))
@@ -22,4 +45,4 @@ local function relayLoop()
     end
 end
 
-parallel.waitForAny(relayLoop)
+parallel.waitForAny(relayLoop, relayLoop1, relayLoop2)

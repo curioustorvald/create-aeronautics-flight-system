@@ -28,39 +28,65 @@
 --   colours.green   inactive 2  (dimmed lime / "done")
 --   colours.white   body text, on colours.black background
 
-local APNAV_PROTOCOL = "aertogekiss_navap" -- must match navcom.lua's APNAV_PROTOCOL
--- Vertical channel to the Stabiliser+Altitude control during an automatic landing.
--- Must match control.lua's AUTOLAND_PROTOCOL.
-local AUTOLAND_PROTOCOL = "aertogekiss_autoland"
--- AS -> FMS: the altitude selector pings this when the pilot taps a panel while it is
--- overshadowed by a landing, asking for ALT-AP back (see overrideLoop / LND.paused).
-local ALTOVERRIDE_PROTOCOL = "aertogekiss_altoverride"
-
-local POINTS_FILE = "points.db"
-local COURSE_FILE = "course.db"
-local LANDING_FILE = "landing.db"
-
--- Pass radii: how close counts as "at" a waypoint before we advance to the
--- next one. Contextual per navigation-planning convention: VORs are flown
--- past at a distance (fly-by fix), aerodromes/POIs mid-route get a moderate
--- radius, and the very last point of a plan is drawn in tight since that is
--- an actual arrival.
--- ARRIVED_FRACTION: inside this fraction of the final point's own pass radius, the phase sent
--- to navcom becomes ARRIVED rather than TERMINAL. Scales with the same contextual radius as
--- everything else here, so a VOR final gets a looser "arrived" than a POI final does.
--- (Tabled, not one local each -- see the 200-locals note at the top of the tuning section.)
-local RAD = {
-    VOR_RADIUS         = 240,
-    POI_ENROUTE_RADIUS = 120,
-    POI_FINAL_RADIUS   = 60,
-    ARRIVED_FRACTION   = 0.25,
-}
-
-local PING_INTERVAL = 0.2  -- s; how often the current target is re-broadcast. Matches TICK_INTERVAL
-                           -- because cruiseCap now carries a LIVE commanded speed (with the nose-
-                           -- alignment / cross-track gates folded in), not just a slow keep-alive --
-                           -- at 1 s the craft would accelerate for a whole second before a gate bit.
-local TICK_INTERVAL = 0.05  -- s; how often position vs target is checked
+-- CONFIG ----------------------------------------------------------------------
+-- Every tuning value, sign convention, protocol name and filename lives in apconf.lua
+-- beside this program (see its header). This block loads it and binds the names the rest of
+-- the file already used, so a knob is still just `DC.CURVE` or `LG.RWY_GS_DEG` down there.
+--
+-- There is deliberately NO fallback copy of any of it here: a second set of defaults would
+-- let an edit in apconf.lua silently do nothing, which is precisely what would make an
+-- empirically-calibrated sign untrustworthy. A missing or truncated file is a hard BOOT
+-- error naming the missing knob, not a nil-arithmetic crash halfway through a flight.
+--
+-- Everything but CFG itself is scoped inside the do-block so the load temporaries do not
+-- occupy top-level registers (see the 200-locals note in apconf.lua's DC block). Net cost
+-- of the loader is therefore ONE local, CFG -- which the rarely-read knobs use directly
+-- (CFG.TOUCHDOWN / NAVDATA / APSWITCH / PALETTE); the hot ones are bound to their old names.
+local CFG
+local APNAV_PROTOCOL, AUTOLAND_PROTOCOL, ALTOVERRIDE_PROTOCOL
+local POINTS_FILE, COURSE_FILE, LANDING_FILE
+local PING_INTERVAL, TICK_INTERVAL, HEADING_SIGN, HEADING_OFFSET
+local SPEED_FULL, SPEED_SLOW, NEXT_CRUISE, RESUME_BACKTRACK_WEIGHT
+local RAD, DC, LG, HSICFG
+do
+    local ok, res = pcall(require, "apconf")
+    if not ok then
+        error("Cannot load apconf.lua (the FMS configuration): " .. tostring(res)
+            .. "\nIt must sit beside autopilot.lua and end with 'return CFG'.", 0)
+    end
+    if type(res) ~= "table" then
+        error("apconf.lua did not return the CFG table (got " .. type(res) .. ").", 0)
+    end
+    -- Canary check: catch a truncated or half-saved config at BOOT, naming what is missing,
+    -- rather than as a nil-arithmetic crash mid-flight. One representative key per section --
+    -- not exhaustive, but a file carrying all of these is the real configuration, not a
+    -- fragment. The second pass goes one level down, where a half-finished edit tends to land.
+    for _, k in ipairs({ "APNAV_PROTOCOL", "AUTOLAND_PROTOCOL", "ALTOVERRIDE_PROTOCOL",
+            "TOUCHDOWN", "NAVDATA", "APSWITCH", "POINTS_FILE", "COURSE_FILE", "LANDING_FILE",
+            "PING_INTERVAL", "TICK_INTERVAL", "HEADING_SIGN", "HEADING_OFFSET", "RAD",
+            "SPEED_FULL", "SPEED_SLOW", "NEXT_CRUISE", "RESUME_BACKTRACK_WEIGHT",
+            "DC", "LG", "HSI", "PALETTE", "HSI_TEXT_SCALE" }) do
+        if res[k] == nil then
+            error("apconf.lua is missing CFG." .. k .. " -- the file looks incomplete.", 0)
+        end
+    end
+    for t, k in pairs({ RAD = "VOR_RADIUS", DC = "CURVE", LG = "RWY_GS_DEG",
+            HSI = "CDI_FULLSCALE_M", TOUCHDOWN = "PROTOCOL", NAVDATA = "PROTOCOL",
+            APSWITCH = "SIDE", PALETTE = "HSI", NEXT_CRUISE = "full" }) do
+        if type(res[t]) ~= "table" or res[t][k] == nil then
+            error("apconf.lua's CFG." .. t .. " is missing " .. k .. ".", 0)
+        end
+    end
+    CFG = res
+    APNAV_PROTOCOL, AUTOLAND_PROTOCOL = CFG.APNAV_PROTOCOL, CFG.AUTOLAND_PROTOCOL
+    ALTOVERRIDE_PROTOCOL                   = CFG.ALTOVERRIDE_PROTOCOL
+    POINTS_FILE, COURSE_FILE, LANDING_FILE = CFG.POINTS_FILE, CFG.COURSE_FILE, CFG.LANDING_FILE
+    PING_INTERVAL, TICK_INTERVAL           = CFG.PING_INTERVAL, CFG.TICK_INTERVAL
+    HEADING_SIGN, HEADING_OFFSET           = CFG.HEADING_SIGN, CFG.HEADING_OFFSET
+    SPEED_FULL, SPEED_SLOW, NEXT_CRUISE    = CFG.SPEED_FULL, CFG.SPEED_SLOW, CFG.NEXT_CRUISE
+    RESUME_BACKTRACK_WEIGHT                = CFG.RESUME_BACKTRACK_WEIGHT
+    RAD, DC, LG, HSICFG                    = CFG.RAD, CFG.DC, CFG.LG, CFG.HSI
+end
 
 -- AUTO-LANDING ---------------------------------------------------------------
 -- The FMS runs the landing state machine itself: it reads position, heading,
@@ -70,151 +96,9 @@ local TICK_INTERVAL = 0.05  -- s; how often position vs target is checked
 -- the pad plus hold the landing heading, via a new "LANDING" phase) and the
 -- Stabiliser+Altitude control vertically (a commanded descent rate, via
 -- AUTOLAND_PROTOCOL). Landing sites and their approach heading/altitude come from
--- landing.db.
-
--- Landing gates/profile, tabled rather than one local each (see the 200-locals note below).
---   ALIGN/FINE_HDG_DEG, POS_TOL_M : step 1 coarse heading, then step 3's tight heading+position
---                                   that begins the descent.
---   RECAPTURE_*  : once descending, allow a little more slop before we call it "drifted" and
---                  pause to re-capture the pad -- the descent burn nods the craft and the
---                  vertical thrusters have no vectoring, so X/Z gets shoved.
---   DESCEND_*/FLARE_AGL/TOUCHDOWN_AGL : descent profile, quick up high easing to a gentle rate.
---                  Keep DESCEND_FAST within what the vertical channel can fly (its DESCEND_MAX).
---   TD_SETTLE_*  : touchdown backup for when the pad altitude is a touch off -- if we are
---                  commanding descent but the craft stopped sinking near the pad, that is a landing.
-local LG = {
-    ALIGN_HDG_DEG = 15, FINE_HDG_DEG = 2, POS_TOL_M = 3,
-    RECAPTURE_M = 4, RECAPTURE_HDG_DEG = 8,
-    DESCEND_FAST = 3.0, DESCEND_SLOW = 0.8, FLARE_AGL = 10.0, TOUCHDOWN_AGL = 1.0,
-    TD_SETTLE_VEL = 0.15, TD_SETTLE_AGL = 2.0, TD_SETTLE_TICKS = 3,
-}
-
--- Heading measurement -- MUST match navcom.lua's HEADING_SIGN / HEADING_OFFSET,
--- since this is the same aircraft and the same sublevel orientation. If navcom's
--- convention is ever recalibrated, change it here too: NAVCOM would still fly the
--- craft to the right heading (it owns those constants), but this alignment gate
--- would open at the wrong moment.
-local HEADING_SIGN   = 1
-local HEADING_OFFSET = math.pi
-
--- CRUISE SPEED ---------------------------------------------------------------
--- Pilot-selectable cruise-speed cap, sent to NAVCOM as msg.cruiseCap and applied only
--- by its ENROUTE law (so the status-screen button "only works in cruising mode"). Three
--- presets; COAST is a plain 0.
-local SPEED_FULL = 240   -- m/s "FULL" cruise (kept below navcom's CRUISE_SPEED ceiling) Choose fastest speed that does not outrun chunk loading
-local SPEED_SLOW = 50   -- m/s "SLOW"; mirror of navcom.lua's APPROACH_SPEED
--- Cycle order when the button is tapped.
-local NEXT_CRUISE = { full = "slow", slow = "coast", coast = "full" }
-
--- DYNAMIC CRUISE (pre-planned clothoid path + baked speed profile) -----------
--- The en-route path is now planned ONCE, when the pilot confirms a plan (setDirectTo /
--- setRoute / RTR.setSolvedRoute call planPath()): each interior waypoint gets an explicit
--- LineSegment -> ClothoidSegment -> CircularArc -> ClothoidSegment -> LineSegment fly-by
--- transition sized from a real turn radius R = V^2/(g*tan(bank)), and the whole route is
--- walked into a dense arc-length-sampled polyline (PLAN.samples) with the speed profile
--- baked in. Runtime (dynamicSpeedTarget/broadcastCurrent/drawCourseHSI) just looks values
--- up on that polyline -- no per-tick curve math. See the PLAN table below planPath().
---
--- This function is still the SINGLE source of commanded speed: the destination-arrival
--- brake and cross-track gate are applied HERE, not in the UAC, so the CMD on the HSI is
--- exactly what the aircraft is flown to. The UAC just tracks it as cruiseCap (schedSpeed=true).
--- ROUTE START: point the nose at the first target BEFORE applying any throttle. While the
--- heading error to the target exceeds LG.ALIGN_HDG_DEG the commanded speed is 0, so the craft
--- simply yaws onto the bearing instead of accelerating off on the old heading and arcing round.
--- Cleared for good once aligned (per plan, not per leg).
---
--- ADVANCE_*_MULT -- turn-aware pass radius, used only as the FALLBACK advance test when
--- DC.CURVE is off (PLAN.passed, from the baked transition midpoints, is the primary test
--- while curve-following). 1.0 / 1.0 disables (plain radiusFor).
---
--- NOTE (200-locals): CC's Lua VM caps a function at 200 locals and counts a nested function's
--- own locals ON TOP of the enclosing scope's, so late/large functions (drawLandingHSI etc.) blow
--- up once the file has too many TOP-LEVEL locals. Keep tuning knobs in tables like this one --
--- add new ones as DC.X, never `local X`. (luac -p does NOT model this; it will pass regardless.)
-local DC = {
-    DYNAMIC_CRUISE = true,         -- false -> fall back to the flat pilot cruise cap
-    CURVE          = true,         -- en-route: steer to a carrot on the planned clothoid path
-                                   -- (smooth continuous bearing, jerk-controlled rounded corners)
-                                   -- instead of straight at the fix. false -> aim at the waypoint.
-    CURVE_LOOKAHEAD = 400,         -- m: how far ahead on the path the carrot sits. Larger = smoother /
-                                   -- cuts corners more; smaller = tracks the waypoints tighter.
-    GRAVITY        = 11.0,         -- m/s^2: Minecraft's gravity, used in the turn-radius formula.
-    MAX_BANK_DEG   = 45,           -- deg: the bank angle the turn-radius formula assumes --
-                                   -- R = V^2/(GRAVITY*tan(MAX_BANK_DEG)). One physical knob that
-                                   -- means the same thing whether the UAC is presently flying
-                                   -- VTOL/HYBRID/FIXEDWING, so corner geometry "just works" across
-                                   -- all three without the FMS needing to know the flight mode.
-                                   -- Retune in-game like every other knob here; the old flat
-                                   -- A_LAT_MAX=20 this replaces implied a much steeper ~61 deg.
-    JERK_MAX       = 8,            -- m/s^3: caps the rate lateral accel may ramp through a
-                                   -- clothoid -- this is what makes the turn jerk-controlled.
-                                   -- Clothoid length Ls = V^3/(R*JERK_MAX). Lower = longer, gentler
-                                   -- spiral entry/exit; higher = shorter spiral, closer to a plain
-                                   -- circular fillet.
-    MIN_RADIUS     = 40,           -- m: floor on a corner's turn radius.
-    MAX_RADIUS     = 3000,         -- m: ceiling on a corner's turn radius (sanity cap for a very
-                                   -- gentle turn at high speed).
-    LEG_FIT_FRACTION = 0.45,       -- max fraction of EITHER adjacent leg's length a corner's
-                                   -- tangent length may consume. Kept well under 0.5 so two
-                                   -- corners sharing one leg (fed from each end) can never overlap
-                                   -- even if both want their full share.
-    SAMPLE_SPACING = 5,            -- m: density of the baked polyline. Smaller = smoother carrot/
-                                   -- speed/course lookups and more precise geometry, at the cost of
-                                   -- more samples (memory) for a long route.
-    PLAN_MAX_ITERS = 6,            -- global speed<->geometry passes before planPath() gives up and
-                                   -- uses whatever it has (see the iterative solver in planPath).
-    PLAN_CONV_EPS  = 2,            -- m: a corner's radius changing less than this between passes
-                                   -- counts as converged -- stops iterating early on easy routes.
-    BRAKE_DECEL    = 12,            -- m/s^2: deceleration the CORNER speed profile plans with (how
-                                   -- early/hard it brakes INTO a turn). Braking distance to a slow
-                                   -- point = (v^2 - v_target^2)/(2*DECEL): at 3 it was ~2000 m to a
-                                   -- stop from 110 (half of a 4000 m leg spent slowing!); 8 -> ~750 m.
-                                   -- The profile ALREADY cruises the middle of a long leg -- this only
-                                   -- sets how LATE/short the braking into a turn is. Set it to what the
-                                   -- craft can REALLY brake at: too high and it overshoots the turn;
-                                   -- too low and it crawls in early. (See ARRIVE_DECEL for the
-                                   -- destination stop specifically -- it is NOT governed by this.)
-    ARRIVE_DECEL   = 30,           -- m/s^2: deceleration for the FINAL destination stop specifically --
-                                   -- deliberately STEEPER than BRAKE_DECEL. A gentle corner-speed
-                                   -- profile can legitimately let the craft carry full cruise almost to
-                                   -- the last waypoint (that's the point of curvature-based cornering),
-                                   -- but that means the LAST leg alone has to shed all of it; using the
-                                   -- lazy BRAKE_DECEL there let the craft arrive "hot" (still 80+ m/s)
-                                   -- whenever the final leg was shorter than BRAKE_DECEL's stopping
-                                   -- distance. Baked into the profile as an ADDITIONAL backward-only
-                                   -- sweep from the route end (PLAN.build), min'd against the corner
-                                   -- profile, plus the runtime destination brake in dynamicSpeedTarget --
-                                   -- so nothing downstream of the last corner can out-run it. Keep
-                                   -- DECEL_MAX >= this or the NAV.cmdSpeed slew becomes the bottleneck
-                                   -- instead. Raise/lower to match the craft's REAL stopping power.
-    TURN_GENTLE    = math.rad(12), -- turn <= this: full advance radius (fly-by); see ADVANCE_*_MULT.
-    TURN_SHARP     = math.rad(90), -- turn >= this: tight advance radius. (Speed is curvature-based now.)
-    FINAL_ARRIVE_SPEED = 12,       -- commanded speed AT the destination; TERMINAL takes over
-    ACCEL_MAX      = 12,            -- m/s^2: max rate the COMMANDED speed may RISE (NAV.cmdSpeed slew).
-                                   -- Eases the throttle up OUT of a turn instead of jumping to cruise
-                                   -- while still yawing onto the new leg. Lower = gentler spool-up.
-    DECEL_MAX      = 32,           -- m/s^2: max rate the COMMANDED speed may FALL. Rounds off sudden
-                                   -- steps in the raw envelope into a smooth curve. Keep >= ARRIVE_DECEL
-                                   -- (the steepest of the two) so real slowdowns aren't delayed by this
-                                   -- slew rather than by the actual physics; lower = smoother but slows later.
-    XTK_SLOW_LO    = 50,           -- m off the leg: below this, no cross-track slowdown
-    XTK_SLOW_HI    = 180,           -- m off the leg: at/above this, the full XTK_SLOW_MIN cut
-    XTK_SLOW_MIN   = 0.30,         -- floor speed fraction when far off the leg (fly in to intercept)
-    ADVANCE_GENTLE_MULT = 1.3333,  -- gentle turn: advance this * base pass radius (cut the corner)
-    ADVANCE_SHARP_MULT  = 0.7,     -- sharp turn: hold in to this * base radius
-}
-
--- RESUME MID-ROUTE -----------------------------------------------------------
--- FLY ROUTE can join a plan at the nearest sensible waypoint instead of always flying it
--- from the first point (see bestResumeIndex). "Nearest" is heading-aware: a waypoint behind
--- the aircraft costs a U-turn, so its straight-line distance is inflated -- by this weight
--- times the backward component of the displacement -- before the cheapest waypoint is
--- chosen. So the penalty in metres = weight * (how far behind us the waypoint is): a
--- waypoint dead astern at distance d is judged as costing d*(1+weight); one abeam or ahead
--- pays nothing. At 1.0 a waypoint dead behind must be nearer than HALF the distance of one
--- dead ahead to still win -- i.e. turning back has to be substantially cheaper. Raise it to
--- lean harder toward "press on"; drop toward 0 to just pick the geometrically nearest.
-local RESUME_BACKTRACK_WEIGHT = 1.0
+-- landing.db. The one thing it does NOT work out for itself is when the wheels are
+-- actually down: that arrives from the gear's squat switch on TD.PROTOCOL (see the TD
+-- table), with the AGL test kept as the fallback for when that sensor is silent.
 
 -- GEOMETRY / HEADING HELPERS --------------------------------------------------
 
@@ -480,7 +364,34 @@ local function loadLanding()
         local t = line:match("^%s*(.-)%s*$")
         if t ~= "" and t:sub(1, 1) ~= ";" then
             local name, ty, dir, alt, rwy = t:match("^(%a+)=(%a+),(%a+),(%-?%d+),(%-?%d+)$")
-            if name then
+            -- GO-AROUND routes are a SECOND record shape in the same file: an arbitrary id,
+            -- then the two ends of a straight leg and the altitude to fly it at. They are NOT
+            -- landing sites (see isLandingSite) -- nothing flies TO one -- but they belong to
+            -- the runway they serve, so they live here. Which route serves which runway is
+            -- decided by geometry, not by the id: see LND.gaFor.
+            local gid, gx1, gz1, gx2, gz2, galt =
+                t:match("^([%w_]+)=goaround,(%-?%d+),(%-?%d+),(%-?%d+),(%-?%d+),(%-?%d+)$")
+            -- ...and a THIRD, which is the one to publish: the same circuit written as a list
+            -- of ordinary points instead of one leg -- an id, the minimum altitude to fly the
+            -- pattern at, then the waypoint names, starting AND ending at the runway served.
+            -- Naming the runway is the point: this shape says which runway it belongs to
+            -- outright, where the straight-leg one has to be matched by geometry. When a
+            -- runway publishes both, this is the one flown (see LND.gaFor).
+            local wid, walt, wseq =
+                t:match("^([%w_]+)=goaround%-wp,(%-?%d+),(.+)$")
+            if gid then
+                LANDING[gid] = {
+                    type = "goaround",
+                    x1 = tonumber(gx1), z1 = tonumber(gz1),
+                    x2 = tonumber(gx2), z2 = tonumber(gz2), alt = tonumber(galt),
+                }
+            elseif wid then
+                local seq = {}
+                for p in wseq:gmatch("[^,]+") do
+                    table.insert(seq, (p:match("^%s*(.-)%s*$")))
+                end
+                LANDING[wid] = { type = "goaround-wp", alt = tonumber(walt), seq = seq }
+            elseif name then
                 LANDING[name] = {
                     type   = ty:lower(),
                     dir    = dir:lower(),
@@ -493,8 +404,13 @@ local function loadLanding()
     f:close()
 end
 
+-- A place the autopilot can be told to LAND at. Go-around routes share landing.db but are not
+-- one: they have no point of their own, and nothing may offer one as a destination. Both
+-- published shapes are excluded by the one prefix test, so a third one cannot be added to the
+-- file and quietly become a destination.
 local function isLandingSite(name)
-    return LANDING[name] ~= nil
+    local l = LANDING[name]
+    return l ~= nil and l.type:sub(1, 8) ~= "goaround"
 end
 
 local function loadPoints()
@@ -720,20 +636,31 @@ local NAV = {
     landSite  = nil,    -- snapshot {name, dir, alt, type} taken when the plan is set, so
                         -- editing landing.db mid-flight cannot move a landing in progress
     -- Extra pose, read every tick for the landing state machine.
-    posY = 0, velY = 0, heading = 0, haveHeading = false, groundSpeed = 0,
+    posY = 0, velY = 0, velX = 0, velZ = 0, heading = 0, haveHeading = false, groundSpeed = 0,
     cmdSpeed = 0,   -- rise-rate-limited commanded speed (dynamicSpeedTarget through DC.ACCEL_MAX);
                     -- the value actually sent as cruiseCap and shown as CMD, updated once per navTick.
     -- Route start: hold throttle at 0 until the nose is within LG.ALIGN_HDG_DEG of the first target.
     aligning = false,
     aimX = nil, aimZ = nil,   -- the point broadcastCurrent last steered to (carrot or waypoint)
+    -- "This plan must be flown FROM ITS FIRST WAYPOINT, not joined at the nearest point."
+    -- Normal plans are the opposite -- joining wherever the aircraft already is, is the whole
+    -- point of RESUME -- but a go-around circuit starts BEHIND the aeroplane and beside the
+    -- runway the circuit ends at, so locating ourselves by projection onto it would report the
+    -- entire circuit as already flown. Cleared the moment the first waypoint is genuinely
+    -- reached; until then the plan is navigated waypoint-to-waypoint (see PLAN.onPath).
+    fromStart = false,
 }
 
 -- Auto-landing sequence state. Distinct from NAV: the plan can be flown (NAV) long
 -- before the landing (LND) actually engages on arrival, and the landing outlives the
 -- plan by a moment at touchdown (NAV is cancelled, LND lingers on the LANDED screen).
+-- It also carries the runway-approach machinery itself (LND.rwy* below the nav engine):
+-- functions on the state table rather than a dozen more top-level locals, the same shape TD
+-- uses -- see the 200-locals note in the DC block.
 local LND = {
     active = false,
-    phase  = "OFF",     -- OFF | ALIGN | TRANSLATE | DESCEND | FLARE | LANDED
+    phase  = "OFF",     -- pad:    OFF | ALIGN | TRANSLATE | DESCEND | FLARE | LANDED
+                        -- runway: OFF | INTERCEPT | GLIDE | FLARE | ROLLOUT | MISSED | LANDED
     paused = false,     -- pilot overrode the descent (AS override): hand VERTICAL to
                         -- ALT-AP while position/heading alignment keeps running. Set by
                         -- overrideLoop, cleared by RESUME LANDING / any teardown.
@@ -743,7 +670,94 @@ local LND = {
     vs = 0,             -- current commanded vertical speed (m/s, negative = down)
     agl = 0, posErr = 0, hdgErrDeg = 0,
     settle = 0,         -- consecutive "not sinking" ticks, for the touchdown backup
+    tdBy = nil,         -- which test called the touchdown ("squat" | "AGL" | "settle"), for the HUD
+    vertHold = false,   -- this tick the vertical channel is told "hold", not "descend"
+
+    -- ---- runway approach (LG.RWY_*; all zero/false for a pad landing) ----
+    rwy   = false,      -- this landing is a straight-in runway approach, not a pad descent
+    ux = 0, uz = 0,     -- unit vector along the runway, pointing the way we land
+    gsTan = 0,          -- tan(glideslope)
+    aimX = 0, aimZ = 0, -- touchdown aim point (a little way past the threshold)
+    stopX = 0, stopZ = 0,   -- where the rollout is meant to finish (short of the far end)
+    endX = 0, endZ = 0,     -- the far end itself -- for the map, not for guidance
+    rwyLen = 0,             -- ...and its distance from the threshold, likewise
+    tgtX = 0, tgtZ = 0,     -- the point currently broadcast to the UAC (carrot, or stop point)
+    holdX = 0, holdZ = 0,   -- where a missed approach levels off and stops
+    -- ---- go-around (LG.RWY_GA_*; see LND.goAround) ----
+    ga    = false,      -- a published go-around circuit is being flown. LND.active is FALSE:
+                        -- the ROUTE machinery has the horizontal, and all this flag means is
+                        -- that the FMS still owns the vertical channel (holding LND.gaAlt).
+    gaWp  = false,      -- ...and it is the PUBLISHED-WAYPOINT kind, not the straight-leg kind.
+                        -- The horizontal is the same either way (a plan is a plan); this picks
+                        -- the vertical profile, which is not (see LND.gaTick).
+    gaAlt = 0,          -- ...that altitude, from the route's landing.db entry -- a minimum for
+                        -- a waypoint circuit, the height to fly for a straight-leg one
+    gaExitAlt = 0,      -- ...and the glidepath height to be at where the approach is rejoined
+                        -- (straight-leg only: a waypoint circuit works this out as it goes)
+    gaCount = 0,        -- attempts used on THIS landing; reset only when a new plan is set
+    navPhase = "APPROACH",  -- ...and the phase it is broadcast with
+    navHold = nil,          -- ...and the heading, once holding one matters (the rollout)
+    glide = false,      -- tells the UAC this is a FLYING descent: it may keep steering by
+                        -- bank even though the vertical channel is commanded down
+    appSpeed = 0,       -- approach speed the glideslope and the runway length allow
+    cmdSpeed = 0,       -- ...slewed, and what actually goes out as cruiseCap
+    along = 0,          -- m still to run to the aim point, along the runway axis
+    xtk = 0,            -- m off the extended centreline (+ = right of it)
+    gsDev = 0,          -- m above (+) / below (-) the nominal glidepath
 }
+
+-- SQUAT SWITCH ---------------------------------------------------------------
+-- The gear now has a real weight-on-wheels contact: computer #15 (manconrelay_rotation.lua)
+-- reads it off a redstone input and broadcasts {touchedDown = <bool>} on TD.PROTOCOL. That is
+-- ground TRUTH, where AGL is only an inference -- landing.db's pad altitude can be a metre or
+-- two out, and a pad can be rebuilt higher. So landingTick takes touchdown from EITHER this
+-- signal or the AGL test, whichever trips first.
+--
+-- Two guards, because a false touchdown at height cuts the navigation and drops the craft:
+--   * FRESH -- the signal only counts while #15 is actually being heard from. Without this the
+--     last value would latch forever: #15 off, out of range or crashed with a stale "true" from
+--     the previous landing would cut the NEXT descent at altitude.
+--   * HOLD  -- it has to stay on for TD.HOLD seconds, so one bounce of the contact (or a
+--     redstone flicker as the gear brushes something) is not a landing.
+-- With no sender at all, TD.confirmed() is simply always false and the landing falls back to
+-- the AGL test plus the settle backup -- exactly how this program behaved before.
+local TD = {
+    PROTOCOL = CFG.TOUCHDOWN.PROTOCOL,   -- link + guards: see CFG.TOUCHDOWN in apconf.lua
+    HOLD     = CFG.TOUCHDOWN.HOLD,
+    STALE    = CFG.TOUCHDOWN.STALE,
+
+    signal    = false, -- last value received
+    since     = nil,   -- os.clock() when the signal last went true (nil while it reads false)
+    lastHeard = nil,   -- os.clock() of the last message, whatever its value
+}
+
+-- Is the sensor alive? Also drives the HUD line, since "no signal" is the difference between
+-- a landing that can end on the gear contact and one that is back to AGL alone.
+function TD.fresh()
+    return TD.lastHeard ~= nil and (os.clock() - TD.lastHeard) <= TD.STALE
+end
+
+-- The debounced, freshness-gated "we are on the ground" that the landing machine trusts.
+function TD.confirmed()
+    return TD.fresh() and TD.signal and TD.since ~= nil
+        and (os.clock() - TD.since) >= TD.HOLD
+end
+
+-- Its own listener rather than a poll inside navTick: the sender broadcasts on its own
+-- cadence, and the guards above are written against os.clock() stamps, not tick counts.
+function TD.loop()
+    while true do
+        local sender, msg = rednet.receive(TD.PROTOCOL, 1)
+        if sender and type(msg) == "table" and msg.touchedDown ~= nil then
+            -- redstone.getInput hands back a boolean; tolerate 0/1 rather than read a 1 as
+            -- "airborne" if the sender is ever rewritten to send numbers.
+            local down = (msg.touchedDown ~= false and msg.touchedDown ~= 0)
+            if down and not TD.signal then TD.since = os.clock() end   -- rising edge starts the hold
+            if not down then TD.since = nil end
+            TD.signal, TD.lastHeard = down, os.clock()
+        end
+    end
+end
 
 -- True on the penultimate or final leg of a multi-point plan (never on a
 -- single-point direct-to, which has no penultimate leg to speak of). Shared
@@ -895,10 +909,12 @@ end
 local PLAN = {
     samples  = {},  -- arc-length ordered: {x, z, hdg, kappa, s, speed}
     totalLen = 0,
-    wpS      = {},  -- wpS[i] = arc length of interior waypoint i's transition midpoint --
-                     -- the "abeam" point PLAN.passed uses to advance NAV.index
+    wpS      = {},  -- wpS[i] = arc length of waypoint i's "abeam" point (its transition
+                     -- midpoint, or the waypoint itself where it isn't rounded; 0 and totalLen
+                     -- for the two ENDS) -- what PLAN.passed compares against to advance NAV.index
     cursor   = 1,   -- last-known nearest-sample index; advances monotonically at runtime
     lastX = nil, lastZ = nil, lastS = 0,       -- cache for updateCursor (see below)
+    lastD2 = math.huge,                        -- ...and how far off the path that left us (m^2)
     SEARCH_WINDOW = 120,                        -- samples either side of cursor to search each tick
     RESCAN_DIST2  = 1000 * 1000,                 -- if the window search is still this far off (m^2),
                                                  -- do one full O(n) rescan (route resume, teleport, etc.)
@@ -1051,6 +1067,11 @@ function PLAN.buildGeometry(pts, corners, out, wpS)
     local n = #pts
     local x, z, s = pts[1].x, pts[1].z, 0
     table.insert(out, {x = x, z = z, hdg = legBearing(x, z, pts[2].x, pts[2].z), kappa = 0, s = 0})
+    -- The FIRST waypoint's abeam point is the start of the path. It has no transition, so the
+    -- interior loop below never sets it -- and a nil here used to make PLAN.passed(1) return
+    -- false forever, which is what stranded NAV.index on waypoint 1 whenever the aircraft
+    -- joined a plan without physically flying through that waypoint's pass radius.
+    wpS[1] = 0
     for i = 2, n - 1 do
         local c = corners[i]
         local bIn = legBearing(pts[i - 1].x, pts[i - 1].z, pts[i].x, pts[i].z)
@@ -1068,6 +1089,9 @@ function PLAN.buildGeometry(pts, corners, out, wpS)
     end
     local bInLast = legBearing(pts[n - 1].x, pts[n - 1].z, pts[n].x, pts[n].z)
     s = PLAN.marchStraightInto(x, z, bInLast, pts[n].x, pts[n].z, s, DC.SAMPLE_SPACING, out)
+    wpS[n] = s   -- ...and the last one's is the end of it. PLAN.passed is never asked about the
+                 -- final waypoint (arrival is the pass-radius test's job), but leaving a hole
+                 -- at either end of this table is exactly the trap that produced the bug above.
     return s
 end
 
@@ -1115,7 +1139,7 @@ end
 -- plan (setDirectTo / setRoute / RTR.setSolvedRoute).
 function PLAN.build(pts)
     PLAN.samples, PLAN.wpS, PLAN.cursor = {}, {}, 1
-    PLAN.lastX, PLAN.lastZ, PLAN.lastS = nil, nil, 0
+    PLAN.lastX, PLAN.lastZ, PLAN.lastS, PLAN.lastD2 = nil, nil, 0, math.huge
     local n = #pts
     if n < 3 then
         -- Nothing to round -- just the straight run between however many points exist. A lone
@@ -1131,6 +1155,7 @@ function PLAN.build(pts)
             s = PLAN.marchStraightInto(pts[1].x, pts[1].z, bIn, pts[2].x, pts[2].z, 0, DC.SAMPLE_SPACING, samples)
             for _, sm in ipairs(samples) do sm.speed = SPEED_FULL end
             PLAN.applyArriveBrake(samples, DC.ARRIVE_DECEL, DC.FINAL_ARRIVE_SPEED)
+            PLAN.wpS[1], PLAN.wpS[2] = 0, s   -- same endpoints as buildGeometry fills in
         end
         PLAN.samples, PLAN.totalLen = samples, s
         return
@@ -1202,7 +1227,7 @@ function PLAN.updateCursor(x, z)
     local samples = PLAN.samples
     local n = #samples
     if n == 0 then
-        PLAN.lastX, PLAN.lastZ, PLAN.lastS = x, z, 0
+        PLAN.lastX, PLAN.lastZ, PLAN.lastS, PLAN.lastD2 = x, z, 0, math.huge
         return 0
     end
     local lo = math.max(1, PLAN.cursor - PLAN.SEARCH_WINDOW)
@@ -1222,6 +1247,7 @@ function PLAN.updateCursor(x, z)
     end
     PLAN.cursor = bestI
     PLAN.lastX, PLAN.lastZ, PLAN.lastS = x, z, samples[bestI].s
+    PLAN.lastD2 = bestD   -- how far off the path we actually are; PLAN.passed gates on it
     return PLAN.lastS
 end
 
@@ -1268,10 +1294,265 @@ end
 -- transition midpoint, or the waypoint itself if it wasn't rounded)? Replaces the old
 -- tangent-plane checkpointPassed with a direct arc-length compare -- the plan already knows
 -- exactly where each waypoint's abeam point is.
-function PLAN.passed(i)
-    if not PLAN.wpS[i] then return false end
+-- Is the aircraft actually ON the planned path? EVERYTHING the plan can tell us -- the
+-- carrot, the baked speed, the course, which waypoint is behind us -- is read by projecting
+-- the aircraft onto the polyline, and that projection only means anything while it is near it.
+-- Off the path (a plan just set from somewhere else, a go-around circuit whose start lies
+-- BEHIND us, a diversion, a teleport) the honest answer is "navigate straight to the active
+-- waypoint until you have joined", which is what every caller below falls back to.
+-- Without this a go-around projected onto its own new circuit at the far END of the path --
+-- the aircraft being beside the runway, which the circuit finishes at -- and so declared the
+-- whole circuit already flown, re-arming the approach in the same tick it was abandoned.
+function PLAN.onPath()
+    if #PLAN.samples == 0 or NAV.fromStart then return false end
     PLAN.updateCursor(NAV.posX, NAV.posZ)
-    return PLAN.lastS >= PLAN.wpS[i]
+    return PLAN.lastD2 <= DC.PASS_CORRIDOR * DC.PASS_CORRIDOR
+end
+
+function PLAN.passed(i)
+    local wp = PLAN.wpS[i]
+    if not wp then return false end
+    -- The corridor matters most at i == 1, whose abeam point is s = 0: every projection is at
+    -- or past it, so without it a craft anywhere off the route would "pass" the first waypoint
+    -- from anywhere at all.
+    if not PLAN.onPath() then return false end
+    -- STRICTLY past, not "at": the aircraft parked exactly on the route start projects to
+    -- s = 0 = wpS[1], and it has not passed anything yet. (For interior waypoints the two
+    -- readings differ by at most one sample spacing, so this is immaterial there.)
+    return PLAN.lastS > wp
+end
+
+-- GO-AROUND PATH ---------------------------------------------------------------
+-- A go-around is NOT a list of waypoints. The en-route planner rounds a corner by cutting it
+-- (a fly-by transition), which is right for a route and completely wrong here: the published
+-- leg is an ORIENTED LINE SEGMENT that must be entered at its start, ON its heading, and flown
+-- end to end -- and it may point anywhere at all relative to where the missed approach left us,
+-- including straight back at it. Handed to the fly-by planner that produces the nonsense the
+-- first attempt flew.
+--
+-- So the circuit is built as an explicit CURVATURE-LIMITED path instead: the shortest
+-- turn-straight-turn (Dubins) join from where we are, pointing where we point, to the leg's
+-- start pointing along the leg. That is one construction that covers every case -- already
+-- aligned (it degenerates to a straight), a right-angle join, a full course reversal (it comes
+-- out as the teardrop you would fly by hand) -- with no special cases and no assumption that
+-- the leg is parallel to the runway or any particular length. The turn radius comes from the
+-- speed we will actually be doing, which is why the circuit is flown at RWY_GA_SPEED and not
+-- at cruise: you cannot spiral a 320 m/s aeroplane onto a 200 m leg.
+local GA = {}
+
+-- Unit vector along a heading, and the vector 90 degrees to its LEFT. Turning left increases
+-- the heading in this frame (u(h+e) = u(h) + e*left(h)), which is what fixes every sign below.
+function GA.dir(h)  return math.sin(h), math.cos(h) end
+function GA.left(h) return math.cos(h), -math.sin(h) end
+
+-- Centre of the turning circle for a craft at (x,z) heading h turning s (+1 left, -1 right).
+function GA.centre(x, z, h, s, R)
+    local lx, lz = GA.left(h)
+    return x + s * R * lx, z + s * R * lz
+end
+
+-- Shortest turn-straight-turn path from (x0,z0,h0) to (x1,z1,h1) at radius R. Returns
+-- {s1, d1, ls, hs, s2, d2, len} -- turn direction and arc ANGLE for each end, the straight's
+-- length and heading, and the total. nil if no such path exists (the two circles overlap and
+-- the geometry needs a turn-turn-turn solution; the caller flies straight on and re-tries,
+-- which opens the geometry up).
+function GA.dubins(x0, z0, h0, x1, z1, h1, R)
+    local best
+    for _, s1 in ipairs({1, -1}) do
+        for _, s2 in ipairs({1, -1}) do
+            local c1x, c1z = GA.centre(x0, z0, h0, s1, R)
+            local c2x, c2z = GA.centre(x1, z1, h1, s2, R)
+            local vx, vz = c2x - c1x, c2z - c1z
+            local d = math.sqrt(vx * vx + vz * vz)
+            local hs, ls
+            if s1 == s2 then
+                -- Same-handed turns: the connecting straight is simply parallel to the line
+                -- joining the two centres.
+                if d > 1e-6 then hs, ls = atan2(vx, vz), d end
+            elseif d >= 2 * R then
+                -- Opposite-handed: an inner tangent, which only exists once the circles are
+                -- clear of each other.
+                local th = atan2(vx, vz)
+                hs = th - math.asin(R * (s2 - s1) / d)
+                ls = math.sqrt(d * d - 4 * R * R)
+            end
+            if hs then
+                local d1 = (s1 * (hs - h0)) % (2 * math.pi)
+                local d2 = (s2 * (h1 - hs)) % (2 * math.pi)
+                local len = R * (d1 + d2) + ls
+                if not best or len < best.len then
+                    best = {s1 = s1, d1 = d1, ls = ls, hs = hs, s2 = s2, d2 = d2, len = len}
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Walk a straight into `out`, returning the arc length reached. Shares the sample shape the
+-- en-route planner bakes (x, z, hdg, kappa, s, speed) so every runtime lookup -- carrot,
+-- speed, course, which waypoint is behind us -- works on a go-around exactly as it does on a
+-- route, with no code downstream knowing the difference.
+function GA.straight(x, z, h, len, s0, out)
+    local ux, uz = GA.dir(h)
+    local n = math.max(1, math.ceil(len / DC.SAMPLE_SPACING))
+    for i = 1, n do
+        local f = (i / n) * len
+        table.insert(out, {x = x + ux * f, z = z + uz * f, hdg = h, kappa = 0,
+                           s = s0 + f, speed = LG.RWY_GA_SPEED})
+    end
+    return s0 + len, x + ux * len, z + uz * len
+end
+
+-- ...and an arc, turning s through `ang` radians at radius R.
+function GA.arc(x, z, h, s, ang, R, s0, out)
+    local cx, cz = GA.centre(x, z, h, s, R)
+    local n = math.max(1, math.ceil(ang * R / DC.SAMPLE_SPACING))
+    local ex, ez, eh = x, z, h
+    for i = 1, n do
+        local a = h + s * ang * (i / n)
+        local lx, lz = GA.left(a)
+        ex, ez, eh = cx - s * R * lx, cz - s * R * lz, a
+        table.insert(out, {x = ex, z = ez, hdg = a, kappa = s / R,
+                           s = s0 + ang * R * (i / n), speed = LG.RWY_GA_SPEED})
+    end
+    return s0 + ang * R, ex, ez, eh
+end
+
+-- HOW FAR TO FLY STRAIGHT FIRST. "Commence go-around, fly straight, THEN turn in" is not just
+-- for separation: the join geometry needs room. Turning onto a leg that runs the SAME way as
+-- you are already going, a few hundred metres to one side, is the hard case -- a curvature-
+-- limited path has to arrive at an exact point on an exact heading, and from close abeam the
+-- only way to do that is a full 360. Run on a little first and the same join becomes a gentle
+-- S. So rather than guess a distance, search it: try running on 0, 50, 100 ... m and keep
+-- whichever gives the shortest TOTAL path. One cheap one-dimensional search, done once, and it
+-- needs no case analysis -- it produces the run-and-turn for a parallel leg and the teardrop
+-- for a reversed one out of the same code.
+function GA.bestRun(x, z, h, tx, tz, th, R, lo, hi)
+    local ux, uz = GA.dir(h)
+    local bestL, bestLen
+    local step = math.max((hi - lo) / 40, 10)
+    local L = lo
+    while L <= hi do
+        local p = GA.dubins(x + ux * L, z + uz * L, h, tx, tz, th, R)
+        if p and (not bestLen or L + p.len < bestLen) then bestL, bestLen = L, L + p.len end
+        L = L + step
+    end
+    return bestL
+end
+
+-- Fly a straight run-out and then a whole Dubins join into `out`. Returns the arc length
+-- reached, or nil if no turn-straight-turn solution exists at any run-out length.
+function GA.join(x, z, h, tx, tz, th, R, s0, out, lo, hi)
+    local run = GA.bestRun(x, z, h, tx, tz, th, R, lo, hi)
+    if not run then return nil end
+    local s, cx, cz, ch = s0, x, z, h
+    if run > 1e-6 then s, cx, cz = GA.straight(cx, cz, h, run, s, out) end
+    local p = GA.dubins(cx, cz, ch, tx, tz, th, R)
+    if not p then return nil end
+    s, cx, cz, ch = GA.arc(cx, cz, ch, p.s1, p.d1, R, s, out)
+    if p.ls > 1e-6 then s, cx, cz = GA.straight(cx, cz, p.hs, p.ls, s, out) ; ch = p.hs end
+    s = GA.arc(cx, cz, ch, p.s2, p.d2, R, s, out)
+    return s
+end
+
+-- Build the whole circuit and install it as the flight plan. The shape is exactly the
+-- procedure: fly straight out from the miss, join the published leg at its start on its
+-- heading, run its FULL length, and only then turn back onto the approach line.
+--   1. a straight run at the missed-approach heading (RWY_GA_STRAIGHT_M) -- clears the runway,
+--      settles the speed, and opens up the geometry so a join exists at all;
+--   2. a curvature-limited join to the leg's START, arriving ON the leg heading;
+--   3. the leg itself, start to end, at its own heading and its own length;
+--   4. a second join from the leg's END to the approach line, arriving on the RUNWAY heading
+--      at a point far enough out to fly the circuit altitude off (see dApp) -- this is the
+--      "only after passing the goaround-end" turn;
+--   5. the run in from there to the threshold, where the approach re-arms as usual.
+-- Returns false if no join exists (circles overlapping at this radius); the caller then holds.
+function GA.build(ga, site, thrX, thrZ)
+    local R = math.max(LG.RWY_GA_SPEED ^ 2 / (DC.GRAVITY * math.tan(math.rad(DC.MAX_BANK_DEG))),
+        DC.MIN_RADIUS)
+    local legH = atan2(ga.x2 - ga.x1, ga.z2 - ga.z1)
+    local legL = math.sqrt((ga.x2 - ga.x1) ^ 2 + (ga.z2 - ga.z1) ^ 2)
+    if legL < 1e-3 then return false end
+    local v    = DIR_VECTORS[site.dir]
+    local rwyH = headingForDir(site.dir)
+
+    -- Where the approach is rejoined. Rejoin AT the leg's end if the leg finishes on the
+    -- approach side of the threshold -- that is the tight circuit the published geometry is
+    -- obviously drawn for -- and otherwise (a leg that finishes beyond the runway, i.e. an
+    -- escape leg) at the shortest final worth flying. Either way the height to arrive at is
+    -- then whatever the glidepath is at that distance, and the circuit DESCENDS to it: holding
+    -- the circuit altitude to the rejoin is what left the first versionpermanently high.
+    local dEnd = (thrX - ga.x2) * v[1] + (thrZ - ga.z2) * v[2]   -- +ve = before the threshold
+    local dApp = math.max(LG.RWY_FINAL_MIN, dEnd)
+    local appX, appZ = thrX - v[1] * dApp, thrZ - v[2] * dApp
+    LND.gaExitAlt = site.alt + dApp * math.tan(math.rad(LG.RWY_GS_DEG))
+
+    local out, wpS = {}, {}
+    table.insert(out, {x = NAV.posX, z = NAV.posZ, hdg = NAV.heading, kappa = 0, s = 0,
+                       speed = LG.RWY_GA_SPEED})
+    -- RWY_GA_STRAIGHT_M is the MINIMUM run-out (clear the runway, settle the speed); the
+    -- search above picks the actual one.
+    local s = GA.join(NAV.posX, NAV.posZ, NAV.heading, ga.x1, ga.z1, legH, R, 0, out,
+        LG.RWY_GA_STRAIGHT_M, LG.RWY_GA_STRAIGHT_M + LG.RWY_GA_RUNOUT_M)
+    if not s then return false end
+    wpS[1] = s                                            -- the leg's start
+    s = GA.straight(ga.x1, ga.z1, legH, legL, s, out)
+    wpS[2] = s                                            -- ...and its end
+    -- The turn back onto the approach happens only AFTER the leg's end, so its run-out starts
+    -- at zero -- but it may run on past the end if that makes the reversal shorter.
+    s = GA.join(ga.x2, ga.z2, legH, appX, appZ, rwyH, R, s, out, 0, LG.RWY_GA_RUNOUT_M)
+    if not s then return false end
+    wpS[3] = s                                            -- back on the approach line
+    s = GA.straight(appX, appZ, rwyH, dApp, s, out)
+    wpS[4] = s                                            -- the threshold
+
+    PLAN.samples, PLAN.wpS, PLAN.totalLen = out, wpS, s
+    PLAN.cursor, PLAN.lastX, PLAN.lastZ, PLAN.lastS, PLAN.lastD2 = 1, nil, nil, 0, math.huge
+    NAV.points = {
+        {name = "GAENT", x = ga.x1, z = ga.z1, kind = "poi"},
+        {name = "GAEND", x = ga.x2, z = ga.z2, kind = "poi"},
+        {name = "FINAL", x = appX,  z = appZ,  kind = "poi"},
+        {name = site.name, x = thrX, z = thrZ, kind = "poi"},
+    }
+    return true
+end
+
+-- ...and the WAYPOINT form of the same thing, which needs almost none of the above. Everything
+-- the Dubins construction is for -- entering an oriented leg at its start, on its heading, from
+-- wherever the miss left us -- exists because that record publishes a LINE and leaves the way
+-- onto it to the aeroplane. A `goaround-wp` record publishes the whole pattern instead, fix by
+-- fix, so there is no join to solve: it is a route, and the en-route planner already flies
+-- routes -- with the same jerk-limited corner rounding, the same baked speed profile, and
+-- LND.rwyPrep's straight-in final at the end of it. So this builds an ordinary plan and gets
+-- out of the way.
+--
+-- The published list starts and ends at the runway it serves. The leading entry is dropped: it
+-- is the threshold we have just missed and are sitting over, and flying TO it would turn the
+-- circuit inside out. The trailing one is replaced by (thrX, thrZ) -- the landing fix the
+-- approach was already flying to, snapshotted at engagement -- so the circuit ends at exactly
+-- the point the retry starts from, whatever points.db says today.
+--
+-- Returns false when nothing in the middle of the list resolves against points.db: there is no
+-- circuit there to fly, and the caller falls back rather than flying the empty shape.
+function GA.buildWp(ga, site, thrX, thrZ)
+    local seq = ga.seq
+    local first, last = 1, #seq
+    if seq[first] == site.name then first = first + 1 end
+    if seq[last]  == site.name then last  = last  - 1 end
+    local pts = {}
+    for i = first, last do
+        local p = POINTS[seq[i]]
+        -- An unknown name is skipped, not fatal -- exactly what setRoute does with a course
+        -- naming a point that has since been deleted.
+        if p then table.insert(pts, {name = p.name, x = p.x, z = p.z, kind = p.kind}) end
+    end
+    if #pts == 0 then return false end
+    table.insert(pts, {name = site.name, x = thrX, z = thrZ, kind = "poi"})
+    LND.rwyPrep(pts)          -- MUTATES pts: must come before PLAN.build, as everywhere else
+    NAV.points = pts
+    PLAN.build(NAV.points)
+    return true
 end
 
 -- Heading error (rad) from the nose to the CURRENT target, or nil if we lack a fix/heading.
@@ -1310,12 +1591,23 @@ end
 -- BRAKE_DECEL = how early the runtime destination brake starts.)
 local function dynamicSpeedTarget()
     local capBase = cruiseCapValue()
+    -- A go-around circuit is flown at approach speed, not at cruise. Both shapes, for their own
+    -- reasons: the straight-leg one is BUILT at a turn radius computed from RWY_GA_SPEED, so
+    -- flying it faster would not fit the path at all; and either one ends by descending onto
+    -- the glidepath and handing straight back to the approach, which the airframe's descent
+    -- authority caps at about this speed anyway (RWY_VS_MAX * RWY_GS_MARGIN / tan(GS)). A
+    -- published waypoint circuit is kilometres long and this makes it a slow few minutes --
+    -- which is what a go-around is.
+    if LND.ga then capBase = math.min(capBase, LG.RWY_GA_SPEED) end
     if not DC.DYNAMIC_CRUISE or capBase <= 0 then return capBase end
     local total = #NAV.points
     if total == 0 then return capBase end
     if NAV.aligning then return 0 end          -- route start: yaw onto the bearing before throttling
 
-    local best = PLAN.speedAt()                -- baked speed profile (bends + the endpoint)
+    -- Baked speed profile (bends + the endpoint) -- but only while we are ON the path to read
+    -- it from; joining one from elsewhere is flown at the plain cruise cap.
+    local best = capBase
+    if PLAN.onPath() then best = PLAN.speedAt() end
 
     -- Destination arrival on the FINAL leg (also covers a single-point direct-to, where the
     -- plan has nothing to walk): brake straight-line to FINAL_ARRIVE_SPEED at the last fix,
@@ -1332,7 +1624,8 @@ local function dynamicSpeedTarget()
     -- is the PLANNED PATH, not the straight leg: a craft correctly on a rounded corner is off the
     -- LEG by design, which would FALSELY trip this. Measure deviation from the path there.
     local xtk
-    if DC.CURVE and NAV.phase == "ENROUTE" and NAV.index >= 2 and NAV.index ~= total then
+    if DC.CURVE and NAV.phase == "ENROUTE" and NAV.index >= 2 and NAV.index ~= total
+            and PLAN.onPath() then
         local _, cxtk = PLAN.course()
         xtk = math.abs(cxtk or 0)
     else
@@ -1361,6 +1654,23 @@ local function broadcastCurrent()
         -- -- do not re-broadcast a LANDING target, or we would re-engage its position
         -- hold on the ground.
         if LND.phase == "LANDED" then return end
+        if LND.rwy then
+            -- RUNWAY: a moving point on the centreline (or, once rolling, the far end of the
+            -- runway) rather than a pad to hover over. schedSpeed hands the UAC the approach
+            -- speed the glideslope and the runway length allowed, exactly as en route, so the
+            -- HSI's CMD stays the one true commanded speed; carrot makes it pure-pursue that
+            -- point; glide tells it this is still a FLYING leg, so HYBRID/FIXEDWING may bank
+            -- to hold the centreline even though the vertical channel is descending. On the
+            -- rollout it becomes an ordinary LANDING position hold on the stop point, whose
+            -- decelerate-to-zero law is the brake.
+            rednet.broadcast({
+                x = LND.tgtX, y = LND.tgtZ, type = "rwy", name = LND.name,
+                phase = LND.navPhase, holdHeading = LND.navHold,
+                cruiseCap = LND.cmdSpeed, schedSpeed = true,
+                carrot = LND.glide or nil, glide = LND.glide or nil,
+            }, APNAV_PROTOCOL)
+            return
+        end
         -- LANDING: hold the pad position and the commanded landing heading. Same target
         -- coords the plan's final point had (a rebroadcast to navcom, not a new leg), but
         -- with phase LANDING + a heading to hold.
@@ -1377,7 +1687,7 @@ local function broadcastCurrent()
     -- controlled rounded corners). The precise capture phases (APPROACH/TERMINAL/ARRIVED) and
     -- the final fix keep aiming at the real waypoint, unchanged -- a different, precise job.
     local tx, tz, ptype, carrot
-    if DC.CURVE and NAV.phase == "ENROUTE" and not isFinal then
+    if DC.CURVE and NAV.phase == "ENROUTE" and not isFinal and PLAN.onPath() then
         tx, tz = PLAN.carrot(DC.CURVE_LOOKAHEAD)
         ptype, carrot = "carrot", true
     else
@@ -1392,12 +1702,22 @@ local function broadcastCurrent()
         schedSpeed = DC.DYNAMIC_CRUISE,       -- tell the UAC this cap is a speed to TRACK, not just a
                                            -- ceiling, so it drops its own decelerate-at-every-fix law
         carrot = carrot,           -- UAC: pure-pursue this moving point (velocity-vector, no cross-track)
+        -- On a go-around the vertical channel is in a commanded CLIMB, which otherwise makes
+        -- the UAC treat this as a pad manoeuvre and fly wings-level -- leaving a FIXEDWING
+        -- with no lateral control at all. Same flag, same reason, as the glideslope.
+        glide = LND.ga or nil,
     }, APNAV_PROTOCOL)
 end
 
 -- Vertical command to the Stabiliser+Altitude control during a landing. Streamed every
 -- tick (not just on the 1 s ping) so the flare is smooth as LND.vs eases with altitude.
 local function broadcastVertical()
+    -- A go-around keeps the vertical channel even though LND.active is false -- the route
+    -- machinery is flying the circuit, but its altitude is ours to hold, not ALT-AP's.
+    if LND.ga then
+        rednet.broadcast({ cmd = "descend", vs = LND.vs }, AUTOLAND_PROTOCOL)
+        return
+    end
     if not LND.active then return end
     if LND.paused then
         -- Pilot override: hand the vertical channel back to ALT-AP. The UAC treats
@@ -1407,13 +1727,27 @@ local function broadcastVertical()
         return
     end
     local p = LND.phase
-    if p == "ALIGN" or p == "TRANSLATE" then
-        -- Hold altitude and take ALT-AP offline while we line up over the pad.
+    -- ROLLOUT is "down" as far as the vertical channel is concerned -- the wheels are on the
+    -- runway and only the brakes are still working. LND.vertHold is the runway machine's way
+    -- of saying "level off" (lining up, or a missed approach); the pad phases name themselves.
+    if p == "LANDED" or p == "ROLLOUT" then
+        -- `squat` tells the vertical channel WHICH REFERENCE it is down on. With the gear
+        -- contact alive and made, that is ground truth: the UAC holds the craft down on it and
+        -- must never fire the lift thrusters UP, which is what an altitude hold does every time
+        -- the craft settles a few centimetres (and what keeps it skittish and stops the gear
+        -- loading). With no gear contact to believe, the altimeter is all there is, so it falls
+        -- back to holding the altitude it touched down at. Latched through the rollout on
+        -- LND.tdBy so one bounce of the contact cannot flip it back to an altitude hold.
+        rednet.broadcast({ cmd = "landed",
+            squat = TD.fresh() and (TD.signal or LND.tdBy == "squat") or nil,
+        }, AUTOLAND_PROTOCOL)
+    elseif LND.vertHold or p == "ALIGN" or p == "TRANSLATE" then
+        -- Hold altitude and take ALT-AP offline while we line up.
         rednet.broadcast({ cmd = "hold" }, AUTOLAND_PROTOCOL)
-    elseif p == "DESCEND" or p == "FLARE" then
+    elseif p == "DESCEND" or p == "FLARE" or p == "GLIDE" or p == "INTERCEPT" then
+        -- INTERCEPT belongs here too: a runway approach descends toward the glidepath while it
+        -- lines up, and only levels off (via vertHold, above) at the approach minimum.
         rednet.broadcast({ cmd = "descend", vs = LND.vs }, AUTOLAND_PROTOCOL)
-    elseif p == "LANDED" then
-        rednet.broadcast({ cmd = "landed" }, AUTOLAND_PROTOCOL)
     end
 end
 
@@ -1426,6 +1760,435 @@ local function descentRateFor(agl)
     return -(LG.DESCEND_SLOW + (LG.DESCEND_FAST - LG.DESCEND_SLOW) * f)
 end
 
+-- The three touchdown tests, factored out so both landing machines ask the same question:
+--   1. the squat switch -- the gear is loaded, so we are down at whatever height landing.db
+--      thinks the surface is. Believed at any AGL (TD.confirmed already debounces it and
+--      gates it on freshness), which is the whole point of having the sensor.
+--   2. AGL against the site altitude -- the original test, and the one that still works with
+--      the sensor offline.
+--   3. "commanding descent but no longer sinking" near the surface -- the backup for a site
+--      altitude that is a metre or two off and a sensor that is not there.
+-- Returns which test tripped ("squat"/"AGL"/"settle"), or nil. Owns LND.settle.
+function LND.touched(agl)
+    if TD.confirmed() then return "squat" end
+    if agl <= LG.TOUCHDOWN_AGL then return "AGL" end
+    if LND.vs < 0 and agl <= LG.TD_SETTLE_AGL and math.abs(NAV.velY) < LG.TD_SETTLE_VEL then
+        LND.settle = LND.settle + 1
+        if LND.settle >= LG.TD_SETTLE_TICKS then return "settle" end
+    elseif LND.vs < 0 and math.abs(NAV.velY) >= LG.TD_SETTLE_VEL then
+        LND.settle = 0
+    end
+    return nil
+end
+
+-- RUNWAY APPROACH ------------------------------------------------------------
+-- See the LG.RWY_* block for what this is and why it lives entirely in the FMS.
+
+-- Can this site actually be flown as a runway? It needs a length to touch down on and a
+-- direction to land in; 'x' (any direction) is meaningless for a strip. Anything that fails
+-- here quietly falls back to the pad descent, which works for any site.
+function LND.rwyUsable(site)
+    return site ~= nil and site.type == "rwy" and (site.rwyLen or 0) > 0
+        and DIR_VECTORS[site.dir] ~= nil
+end
+
+-- PLAN TIME: give a runway destination a straight-in final leg. The plan's last point is the
+-- THRESHOLD; this inserts a FINAL fix RWY_FINAL_M back down the extended centreline just
+-- before it, so the en-route planner flies its own jerk-limited turn onto the runway heading
+-- and hands the approach over already lined up -- the landing machine's INTERCEPT is then a
+-- safety net rather than the normal way in. When the point before the runway is nearer than
+-- the full leg wants, the leg is SHORTENED to fit rather than abandoned (a short aligned
+-- final still beats none), and only dropped when even RWY_FINAL_MIN will not fit.
+-- MUTATES pts, which is why every caller runs it after setLandFinal but BEFORE PLAN.build
+-- and before NAV.index is chosen -- the planner and the waypoint index must both see it.
+function LND.rwyPrep(pts)
+    if not (LG.RWY_FINAL_FIX and NAV.landAtEnd and LND.rwyUsable(NAV.landSite)) then return end
+    local n   = #pts
+    local thr = pts[n]
+    local d   = LG.RWY_FINAL_M
+    local px, pz
+    if n >= 2 then px, pz = pts[n - 1].x, pts[n - 1].z
+    elseif NAV.haveFix then px, pz = NAV.posX, NAV.posZ end
+    if px then
+        local dx, dz = thr.x - px, thr.z - pz
+        -- Keep the final leg well under the run in from the point before it, so the planner
+        -- has room to turn onto it (the same reason DC.LEG_FIT_FRACTION exists).
+        d = math.min(d, math.sqrt(dx * dx + dz * dz) / 1.2)
+    end
+    if d < LG.RWY_FINAL_MIN then return end
+    local v = DIR_VECTORS[NAV.landSite.dir]
+    table.insert(pts, n, { name = "FINAL", kind = "poi",
+        x = thr.x - v[1] * d, z = thr.z - v[2] * d })
+end
+
+-- Everything the approach needs from the current fix, in RUNWAY coordinates: how far there
+-- is still to run to the aim point along the centreline, how far off that centreline we are,
+-- and how far above/below the nominal glidepath. The steering point is a carrot on the
+-- centreline RWY_CARROT_M ahead of our own projection onto it -- pure pursuit, exactly as en
+-- route, so joining the centreline and staying on it are one law needing no separate mode.
+-- Deliberately NOT clamped at the runway end: through the flare the carrot must stay ahead of
+-- the aircraft, or the nose would swing round to chase a point already behind it.
+function LND.rwyGeom()
+    local ux, uz = LND.ux, LND.uz
+    local dx, dz = NAV.posX - LND.x, NAV.posZ - LND.z          -- from the THRESHOLD
+    LND.s     = dx * ux + dz * uz                               -- + = past the threshold
+    LND.xtk   = ux * dz - uz * dx                               -- + = right of the centreline
+    LND.xtkRate = ux * NAV.velZ - uz * NAV.velX                 -- ...and how fast that is changing
+    LND.along = (LND.aimX - NAV.posX) * ux + (LND.aimZ - NAV.posZ) * uz
+    LND.gsDev = (NAV.posY - LND.siteAlt) - math.max(LND.along, 0) * LND.gsTan
+
+    -- THE LOCALIZER. The steering point is deliberately NOT just "a point on the centreline
+    -- RWY_CARROT_M ahead": pure-pursuing that commands an intercept angle of only
+    -- atan(xtk / lookahead), which at a 400 m lookahead is 3.6 deg for a 25 m offset. That is
+    -- far too soft to actually centre the aircraft -- it settles onto a track PARALLEL to the
+    -- centreline and stays there, which is exactly what a VTOL makes obvious (it crabs
+    -- sideways instead of turning, so the offset is plain to see).
+    -- Instead: command a lateral closure RATE proportional to the cross-track error, damped by
+    -- the rate at which it is already closing, capped at a maximum intercept angle. That is a
+    -- real localizer, with a gain that means something. It is expressed as a carrot placed in
+    -- the commanded DIRECTION, because the direction to the target is precisely what the UAC's
+    -- velocity-vector law flies -- so this drives all three flight modes without either of us
+    -- knowing which one is active.
+    local lat = -(LG.RWY_LOC_KP * LND.xtk + LG.RWY_LOC_KD * LND.xtkRate)
+    local cap = LND.appSpeed * math.sin(math.rad(LG.RWY_LOC_MAX_DEG))
+    lat = clamp(lat, -cap, cap)
+    local fwd = math.sqrt(math.max(LND.appSpeed * LND.appSpeed - lat * lat, 1))
+    -- "right of the runway" is (-uz, ux) -- moving that way raises xtk by 1 m per metre, which
+    -- is the sign convention xtk itself is written in, so a positive `lat` means "go right".
+    local vx, vz = ux * fwd - uz * lat, uz * fwd + ux * lat
+    local n = math.sqrt(vx * vx + vz * vz)
+    LND.tgtX = NAV.posX + vx / n * LG.RWY_CARROT_M
+    LND.tgtZ = NAV.posZ + vz / n * LG.RWY_CARROT_M
+end
+
+-- GO-AROUND -------------------------------------------------------------------
+-- Which go-around route serves this runway? A field may publish either shape, and the WAYPOINT
+-- one wins wherever both exist: it names its runway outright and draws the whole pattern, so
+-- flying it is carrying out a published procedure. The straight-leg form names nothing and
+-- draws one line -- which runway it serves is inferred, and most of the circuit is invented by
+-- the FMS around it. A drawn procedure beats a deduced one every time, so it is only reached
+-- when there is no waypoint circuit for this runway at all.
+function LND.gaFor(site, thrX, thrZ)
+    if not LG.RWY_GA_ENABLE then return nil end
+    return LND.gaWpFor(site) or LND.gaPathFor(site, thrX, thrZ)
+end
+
+-- The waypoint form, matched BY NAME: its list starts and ends at the runway it belongs to, so
+-- there is nothing to infer. A circuit has to END at the runway (otherwise it is a departure,
+-- not a go-around); one written the other way round -- only its first entry naming the runway
+-- -- is flown backwards rather than refused, which is also what makes the two ends of a single
+-- strip pick out their own circuit and not each other's.
+function LND.gaWpFor(site)
+    if not (site and site.name) then return nil end
+    for _, e in pairs(LANDING) do
+        local seq = (e.type == "goaround-wp") and e.seq or nil
+        if seq and #seq >= 2 then
+            if seq[#seq] == site.name then return e end
+            if seq[1] == site.name then
+                local rev = {}
+                for i = #seq, 1, -1 do table.insert(rev, seq[i]) end
+                return {type = e.type, alt = e.alt, seq = rev}
+            end
+        end
+    end
+    return nil
+end
+
+-- The straight-leg form, matched GEOMETRICALLY: the id in landing.db is explicitly arbitrary,
+-- so the route whose leg runs the same way as the landing direction is the one that CONTINUES
+-- a missed approach rather than opposing it. Ties (a field with several parallel routes) go to
+-- whichever starts nearest the threshold.
+function LND.gaPathFor(site, thrX, thrZ)
+    local v = DIR_VECTORS[site and site.dir]
+    if not v then return nil end
+    local best, bestD
+    for _, e in pairs(LANDING) do
+        if e.type == "goaround" then
+            local lx, lz = e.x2 - e.x1, e.z2 - e.z1
+            local ll = math.sqrt(lx * lx + lz * lz)
+            if ll > 1e-6 and (lx / ll * v[1] + lz / ll * v[2]) >= LG.RWY_GA_ALIGN then
+                local dx, dz = e.x1 - thrX, e.z1 - thrZ
+                local d = dx * dx + dz * dz
+                if not bestD or d < bestD then best, bestD = e, d end
+            end
+        end
+    end
+    return best
+end
+
+-- Fly the missed approach as an ordinary ROUTE. Everything the circuit needs already exists:
+-- the path planner turns with jerk-limited clothoids, so "circle into the route" and "circle
+-- back to the runway line" come free; LND.rwyPrep re-inserts the straight-in final leg if
+-- there is room for one; and arriving at the last point re-arms the approach exactly as any
+-- other plan does. So the go-around is not a new state machine, it is a new PLAN.
+-- The one thing that does NOT go back to normal is the VERTICAL channel: handing it to ALT-AP
+-- would climb to whatever the pilot last selected, which is not where the route lives, so the
+-- FMS keeps it (LND.ga) and holds the route's own altitude until the approach re-arms.
+function LND.goAround(ga)
+    local name, thrX, thrZ = LND.name, LND.x, LND.z
+    LND.gaCount = LND.gaCount + 1
+    LND.ga, LND.gaAlt = true, ga.alt
+    LND.gaWp = (ga.type == "goaround-wp")
+    LND.active, LND.rwy, LND.paused, LND.phase = false, false, false, "OFF"
+    -- NAV.landAtEnd / NAV.landSite are still the ones set when the pilot committed to this
+    -- landing, so the circuit lands at the same runway without re-deciding anything.
+    local built
+    if LND.gaWp then
+        built = GA.buildWp(ga, NAV.landSite, thrX, thrZ)
+        if not built then
+            -- Its waypoints are not in points.db, so the published circuit is not flyable on
+            -- this aircraft's data. A straight-leg route for the same runway is still a far
+            -- better answer than levelling off, so try that before giving up.
+            local alt = LND.gaPathFor(NAV.landSite, thrX, thrZ)
+            if alt then
+                LND.gaWp, LND.gaAlt = false, alt.alt
+                built = GA.build(alt, NAV.landSite, thrX, thrZ)
+            end
+        end
+    else
+        built = GA.build(ga, NAV.landSite, thrX, thrZ)
+    end
+    if not built then
+        -- Nothing flyable came out of either shape -- an unresolvable waypoint list, or no
+        -- curvature-limited join from here (the turn circles overlap). Level off and hold
+        -- rather than fly something arbitrary; the pilot has ABORT.
+        LND.ga = false
+        LND.active, LND.rwy, LND.phase = true, true, "MISSED"
+        LND.vs, LND.vertHold = 0, true
+        LND.holdX, LND.holdZ = NAV.posX + LND.ux * LG.RWY_CARROT_M, NAV.posZ + LND.uz * LG.RWY_CARROT_M
+        return
+    end
+    NAV.index    = 1
+    NAV.active   = true
+    NAV.aligning = false   -- already flying: do NOT hold the throttle at 0 to swing the nose
+    NAV.fromStart = true   -- ...but DO fly the circuit from its start. Either shape ENDS at the
+                           -- runway we are sitting over, so projecting ourselves onto it would
+                           -- report the whole circuit as already flown (see PLAN.onPath)
+    NAV.planName = "GO-AROUND " .. name
+    NAV.phase    = "ENROUTE"
+    updatePhase()
+    broadcastCurrent()
+    LND.gaTick()        -- set the CLIMB before announcing it: LND.vs still holds the approach's
+    broadcastVertical() -- last sink rate, and broadcasting that would dig in for one more tick
+end
+
+-- How much of the circuit is still to fly: to the active waypoint, then along every leg after
+-- it. Not PLAN.lastS, deliberately -- that only means anything while we are ON the path, and
+-- the vertical channel needs an answer during the join at the start, which is exactly when we
+-- are not (see PLAN.onPath / NAV.fromStart).
+function LND.gaRemaining()
+    local pts = NAV.points
+    local n = #pts
+    if n == 0 then return 0 end
+    local i = math.min(math.max(NAV.index, 1), n)
+    local dx, dz = pts[i].x - NAV.posX, pts[i].z - NAV.posZ
+    local d = math.sqrt(dx * dx + dz * dz)
+    for k = i, n - 1 do d = d + legLength(pts[k], pts[k + 1]) end
+    return d
+end
+
+-- The vertical channel during a go-around: an altitude capture flown on the same commanded-rate
+-- channel the approach uses. Runs from navTick while the route machinery flies the horizontal.
+function LND.gaTick()
+    LND.agl = NAV.posY - LND.siteAlt
+    local want, ff = LND.gaAlt, 0
+    if LND.gaWp then
+        -- A WAYPOINT circuit has no single "leg end" to start down after: it is a whole
+        -- pattern, and the place the descent belongs is wherever the glidepath -- extended back
+        -- along however much of the route is still to fly -- comes down through the published
+        -- minimum. So: hold the minimum until the glidepath sinks below it, then ride the
+        -- glidepath in. That lands the aircraft ON the path at the threshold whatever the
+        -- pattern's shape or length, and needs no geometry the aerodrome has to get right --
+        -- the rule the straight-leg form imposes ("end the leg far enough out to fly the
+        -- altitude off") is answered here by construction instead.
+        -- The published figure is a MINIMUM, and nothing above puts us under it: the pattern is
+        -- flown AT it, and the only thing that ever commands lower is the glidepath itself.
+        -- Measured to the THRESHOLD, so the arrival is a shade high (the aim point is a little
+        -- way past it) -- which is the side to be on, since the approach can catch a glidepath
+        -- from above and cannot from below (RWY_GS_MARGIN).
+        local gsTan = math.tan(math.rad(LG.RWY_GS_DEG))
+        local path  = LND.siteAlt + LND.gaRemaining() * gsTan
+        if path < want then
+            -- FEED-FORWARD. Once the glidepath binds, `want` is a RAMP falling at
+            -- groundSpeed*gsTan every second, and a plain proportional law tracks a ramp with a
+            -- standing error of rate/KP -- nearly 30 m high, all the way down, at these
+            -- numbers. Command the ramp's own rate and let the gain work on the deviation
+            -- about it instead.
+            want, ff = path, -NAV.groundSpeed * gsTan
+        end
+    else
+        -- Circuit altitude round the pattern; once past the leg's end and turning back onto the
+        -- approach, the height the glidepath will want at the rejoin. Descending on the way
+        -- round is what a circuit is for -- arriving at the runway line still at pattern
+        -- altitude just means going around again.
+        if NAV.index >= 3 then want = LND.gaExitAlt end
+    end
+    LND.vs = clamp(ff + (want - NAV.posY) * LG.RWY_GA_ALT_KP,
+        -LG.RWY_VS_MAX, LG.RWY_GA_CLIMB_VS)
+end
+
+-- Lay out the runway and size the approach, once, at engagement.
+function LND.rwySetup(site, fp)
+    local v    = DIR_VECTORS[site.dir]
+    local aim  = math.min(site.rwyLen * LG.RWY_AIM_FRAC, LG.RWY_AIM_MAX)
+    local stop = math.max(site.rwyLen - LG.RWY_STOP_MARGIN, aim + 1)
+    LND.rwy    = true
+    LND.phase  = "INTERCEPT"
+    LND.rwyLen = site.rwyLen
+    LND.ux, LND.uz     = v[1], v[2]
+    LND.gsTan          = math.tan(math.rad(LG.RWY_GS_DEG))
+    LND.aimX,  LND.aimZ  = fp.x + v[1] * aim,          fp.z + v[2] * aim
+    LND.stopX, LND.stopZ = fp.x + v[1] * stop,         fp.z + v[2] * stop
+    LND.endX,  LND.endZ  = fp.x + v[1] * site.rwyLen,  fp.z + v[2] * site.rwyLen
+    LND.stopS = stop
+    -- APPROACH SPEED. Three caps: what we asked for; what the glideslope can be flown at with
+    -- the vertical channel's descent authority, keeping RWY_GS_MARGIN in hand to rejoin the
+    -- path from above; and what the rollout can stop from in the runway that is genuinely left.
+    --
+    -- "Genuinely left" is the bit that was wrong: the FLARE FLOATS the aircraft a long way down
+    -- the strip before the wheels arrive, and that float was not being budgeted. It is easily
+    -- the biggest consumer of a short runway -- easing from the glideslope sink to RWY_TD_VS
+    -- through RWY_FLARE_AGL takes 2*FLARE_AGL/(V*gsTan + TD_VS) seconds, which at 37 m/s is
+    -- ~90 m of runway. Sizing the speed off (stop - aim) alone therefore promised a touchdown
+    -- at the aim point and delivered one ~90 m later, so the same approach randomly ran out of
+    -- room. Solved by iteration, since the float depends on the very speed it is limiting; the
+    -- speed only ever decreases, so four passes converge.
+    -- RWY_ROLLOUT_FRAC then reserves part of what remains as deliberate go-around slack, so the
+    -- planned touchdown sits comfortably before the point of no return rather than on it.
+    local v = math.min(LG.RWY_APP_SPEED, LG.RWY_VS_MAX * LG.RWY_GS_MARGIN / LND.gsTan)
+    local float = 0
+    for _ = 1, 4 do
+        float = 2 * LG.RWY_FLARE_AGL * v / (v * LND.gsTan + LG.RWY_TD_VS)
+        local usable = math.max((stop - aim - float) * LG.RWY_ROLLOUT_FRAC, 5)
+        v = math.min(v, math.sqrt(2 * LG.RWY_BRAKE_DECEL * usable))
+    end
+    LND.appSpeed = v
+    LND.tdS      = aim + float    -- where the wheels are actually expected to arrive
+    LND.cmdSpeed = NAV.cmdSpeed   -- pick the speed up where the en-route profile left it
+    LND.rwyGeom()                 -- so the broadcast that follows engagement is already right
+end
+
+-- THE RUNWAY APPROACH, one step per navTick (readouts and geometry are refreshed by
+-- landingTick before this runs). It names a point, a speed and a vertical speed -- never an
+-- attitude -- so the profile is identical whatever the UAC is flying as.
+function LND.rwyTick()
+    local agl = LND.agl
+    local p   = LND.phase
+    -- Default posture: a flying approach chasing the centreline carrot at the approach speed.
+    LND.navPhase, LND.navHold, LND.glide, LND.vertHold = "APPROACH", nil, true, false
+    local want = LND.appSpeed
+
+    if p == "INTERCEPT" or p == "GLIDE" or p == "FLARE" then
+        -- ESTABLISHED on the centreline? Captured inside RWY_CAPT_XTK, and not given up again
+        -- until RWY_LOSE_XTK.
+        -- (written out rather than as `cond and a or b`: with a FALSE capture test that idiom
+        -- falls straight through to the wider keep test, i.e. it would capture at RWY_LOSE_XTK)
+        local est
+        if p == "INTERCEPT" then est = math.abs(LND.xtk) <= LG.RWY_CAPT_XTK
+        else                     est = math.abs(LND.xtk) <= LG.RWY_LOSE_XTK end
+        -- The glideslope: sink at the rate the geometry needs AT THE SPEED WE ARE ACTUALLY
+        -- FLYING (so the path angle is right whatever the craft is doing), plus a proportional
+        -- pull back onto the path. Arriving HIGH is the normal case -- we join at whatever
+        -- altitude ALT-AP was holding -- so this saturates at RWY_VS_MAX and descends at the
+        -- maximum until the path is caught. It can only catch it at all because RWY_GS_MARGIN
+        -- kept the nominal sink rate below that limit; see the approach-speed cap.
+        local vs = -(NAV.groundSpeed * LND.gsTan) - LG.RWY_GS_KP * LND.gsDev
+        if est and agl <= LG.RWY_FLARE_AGL then
+            -- Flare: blend the glideslope rate into a gentle constant touchdown sink.
+            local f = math.max(agl, 0) / LG.RWY_FLARE_AGL
+            vs = f * vs - (1 - f) * LG.RWY_TD_VS
+        end
+        -- BELOW the glidepath the correction is a CLIMB, and it has to be allowed or the
+        -- approach can only ever level off and wait for the path to descend onto it -- which is
+        -- not glidepath capture, it is just a vertical-speed command that happens to be zero.
+        -- Never inside the flare, though: down there the only way is down.
+        LND.vs = clamp(vs, -LG.RWY_VS_MAX,
+            (agl > LG.RWY_FLARE_AGL) and LG.RWY_VS_UP_MAX or 0)
+
+        if not est then
+            -- Descending while still lining up is fine, and is what the length of the final
+            -- leg is FOR -- but never below the approach minimum until the centreline is
+            -- captured, or we would end up low and wide of the runway.
+            LND.phase = "INTERCEPT"
+            if agl <= LG.RWY_MIN_AGL then LND.vs, LND.vertHold = 0, true end
+        else
+            LND.phase = (agl <= LG.RWY_FLARE_AGL) and "FLARE" or "GLIDE"
+        end
+
+        -- TOUCHDOWN IS GROUND TRUTH, WHEREVER IT HAPPENS. Tested in every airborne phase, not
+        -- only once established: the gear being loaded means the aircraft is DOWN, and ignoring
+        -- that because it is a few metres wide of the centreline is how a landing ends up
+        -- flying along at the approach minimum with its wheels already on the runway.
+        local td = LND.touched(agl)
+        if td then
+            LND.tdBy, LND.phase, LND.settle = td, "ROLLOUT", 0
+        elseif LND.s > 0 and
+               LND.stopS - LND.s < NAV.groundSpeed * NAV.groundSpeed / (2 * LG.RWY_BRAKE_DECEL) then
+            -- (only once past the THRESHOLD -- before it the whole strip is still ahead, and
+            -- the aircraft may legitimately still be shedding cruise speed, which would make
+            -- the stopping distance below read as thousands of metres.)
+            -- MISSED APPROACH -- and the test is "there is no longer enough runway left to stop
+            -- in from the speed we are doing", NOT "we drifted past the aiming point". The old
+            -- test fired RWY_STOP_MARGIN past the aim point, which on a 295 m strip meant
+            -- giving up with 200 m of perfectly good runway still ahead -- and since a normal
+            -- flare floats most of the way to that line anyway, the same approach would land or
+            -- go around more or less at random. This one uses the whole strip, and agrees with
+            -- the sizing above by construction (both are RWY_BRAKE_DECEL).
+            -- ...and if this runway has a go-around route in landing.db, FLY IT: climb away on
+            -- the published circuit and come back for another attempt. RWY_GA_MAX bounds that,
+            -- so a runway that cannot be landed on ends up parked in the air rather than
+            -- circling until the fuel or the patience runs out.
+            local ga = nil
+            if LND.gaCount < LG.RWY_GA_MAX then ga = LND.gaFor(NAV.landSite, LND.x, LND.z) end
+            if ga then LND.goAround(ga); return end
+            -- Nothing published (or out of attempts): level off and stop, wings level on the
+            -- runway heading. No blind climb-away -- without a route there is no altitude the
+            -- FMS can be sure is clear -- so the pilot gets a stable aircraft and ABORT.
+            LND.phase, LND.vs, LND.vertHold = "MISSED", 0, true
+            LND.holdX = NAV.posX + LND.ux * LG.RWY_CARROT_M
+            LND.holdZ = NAV.posZ + LND.uz * LG.RWY_CARROT_M
+        end
+
+    elseif p == "ROLLOUT" then
+        -- On the runway: hand the UAC the stop point as an ordinary LANDING position hold --
+        -- its decelerate-to-zero law IS the brake -- with the runway heading held so we track
+        -- the centreline while slowing. RWY_BRAKE_DECEL, which sized the approach speed, is
+        -- the assumption this is meant to satisfy.
+        LND.navPhase, LND.navHold, LND.glide = "LANDING", LND.holdHeading, false
+        LND.tgtX, LND.tgtZ = LND.stopX, LND.stopZ
+        LND.vs, want = 0, 0
+        if NAV.groundSpeed <= LG.RWY_STOP_SPEED then
+            -- Stopped. Same teardown as a pad touchdown: NAVCOM coasts (control handed back),
+            -- the vertical channel is told "landed" so it holds the ground and keeps ignoring
+            -- ALT-AP, and the LANDED screen offers AP OFF / RESUME ALT-AP.
+            LND.phase = "LANDED"
+            rednet.broadcast({ cancel = true }, APNAV_PROTOCOL)
+            NAV.active, NAV.landAtEnd = false, false
+            broadcastVertical()
+        end
+
+    elseif p == "MISSED" then
+        -- Levelled off past the runway. Hand the UAC the frozen point ahead as an ordinary
+        -- LANDING position hold, so the aircraft decelerates and STOPS there on the runway
+        -- heading instead of flying away down the extended centreline while nobody is
+        -- watching. ABORT is the go-around; RESUME LND retries from here.
+        LND.navPhase, LND.navHold, LND.glide = "LANDING", LND.holdHeading, false
+        LND.tgtX, LND.tgtZ = LND.holdX, LND.holdZ
+        LND.vs, LND.vertHold, want = 0, true, 0
+
+    elseif p == "LANDED" then
+        LND.vs, want = 0, 0
+    end
+
+    -- Same slew as the en-route commanded speed, and for the same reason: cruiseCap is a live
+    -- command now, so it has to be a curve rather than a staircase.
+    if want > LND.cmdSpeed then
+        LND.cmdSpeed = math.min(want, LND.cmdSpeed + DC.ACCEL_MAX * TICK_INTERVAL)
+    else
+        LND.cmdSpeed = math.max(want, LND.cmdSpeed - DC.DECEL_MAX * TICK_INTERVAL)
+    end
+end
+
 -- Arm the landing sequence. Called once, when a landAtEnd plan has genuinely arrived at
 -- its final (landing) point. Everything it needs was snapshotted into NAV.landSite when
 -- the plan was set, so a mid-flight landing.db edit cannot move the landing under us.
@@ -1435,6 +2198,10 @@ local function engageAutoland()
     LND.active      = true
     LND.phase       = "ALIGN"
     LND.paused      = false
+    LND.rwy         = false
+    LND.ga          = false   -- (LND.gaCount deliberately NOT reset -- it bounds the retries)
+    LND.gaWp        = false
+    LND.vertHold    = false
     LND.x, LND.z    = fp.x, fp.z
     LND.name        = site.name
     LND.holdHeading = headingForDir(site.dir)
@@ -1442,6 +2209,11 @@ local function engageAutoland()
     LND.siteType    = site.type
     LND.vs          = 0
     LND.settle      = 0
+    LND.tdBy        = nil
+    -- A usable runway is flown straight in on a glideslope instead of hovered onto; anything
+    -- else (a helipad, or a runway entry missing a length or a direction) keeps the pad
+    -- descent below. LND.rwySetup replaces the phase and lays the strip out.
+    if LND.rwyUsable(site) then LND.rwySetup(site, fp) end
 end
 
 -- The landing state machine, one step per navTick. Reads the pose NAV published this
@@ -1458,6 +2230,16 @@ local function landingTick()
     LND.posErr    = posErr
     LND.hdgErrDeg = math.deg(hdgErr)
     LND.agl       = agl
+
+    -- A runway approach keeps its errors in runway coordinates instead: how far off the
+    -- centreline, not how far from the point (which we are deliberately flying past).
+    if LND.rwy then
+        LND.rwyGeom()
+        LND.posErr = math.abs(LND.xtk)
+        if LND.paused then return end
+        LND.rwyTick()
+        return
+    end
 
     -- Paused by a pilot override: ALT-AP owns the vertical, position/heading alignment
     -- keeps running via broadcastCurrent. Freeze the descent/touchdown state machine (the
@@ -1493,18 +2275,10 @@ local function landingTick()
         end
         LND.phase = (agl <= LG.FLARE_AGL) and "FLARE" or "DESCEND"
 
-        -- Touchdown: primarily from AGL (pad altitude is known); backed up by "commanding
-        -- descent but no longer sinking" for when the configured pad altitude is a bit off.
-        local touchdown = (agl <= LG.TOUCHDOWN_AGL)
-        if not touchdown and LND.vs < 0 and agl <= LG.TD_SETTLE_AGL
-                and math.abs(NAV.velY) < LG.TD_SETTLE_VEL then
-            LND.settle = LND.settle + 1
-            if LND.settle >= LG.TD_SETTLE_TICKS then touchdown = true end
-        elseif LND.vs < 0 and math.abs(NAV.velY) >= LG.TD_SETTLE_VEL then
-            LND.settle = 0
-        end
-
-        if touchdown then
+        -- Touchdown, from whichever of the three tests trips first (see LND.touched).
+        local tdBy = LND.touched(agl)
+        if tdBy then
+            LND.tdBy = tdBy
             -- Step 5: stop the navigation. NAVCOM coasts (hands control back); the vertical
             -- channel is told "landed" so it holds the ground and keeps ignoring ALT-AP.
             LND.phase  = "LANDED"
@@ -1527,7 +2301,8 @@ local function setLandFinal(finalName, wantLand)
     if wantLand and isLandingSite(finalName) then
         local li = LANDING[finalName]
         NAV.landAtEnd = true
-        NAV.landSite  = { name = finalName, dir = li.dir, alt = li.alt, type = li.type }
+        NAV.landSite  = { name = finalName, dir = li.dir, alt = li.alt, type = li.type,
+                          rwyLen = li.rwyLen }
     else
         NAV.landAtEnd = false
         NAV.landSite  = nil
@@ -1542,14 +2317,23 @@ local function setDirectTo(name, landAtEnd)
     if not p then return false end
     LND.active = false
     LND.phase  = "OFF"
+    LND.rwy    = false
+    LND.ga     = false
+    LND.gaCount = 0   -- a plan the pilot just committed to gets its full allowance of attempts
     NAV.cruiseMode = "full"   -- a fresh plan starts at full cruise, never a stale COAST
     NAV.aligning   = true     -- ...and points the nose at the first target before throttling up
+    NAV.fromStart  = false    -- ...and joins the plan wherever it already is
     NAV.planName = landAtEnd and "LAND" or "DIRECT"
-    NAV.points = {{name = p.name, x = p.x, z = p.z, kind = p.kind}}
+    local pts = {{name = p.name, x = p.x, z = p.z, kind = p.kind}}
+    -- The landing site is snapshotted BEFORE the plan is built, because a runway destination
+    -- adds a straight-in final leg to the point list that the path planner and the waypoint
+    -- index must both be built over (LND.rwyPrep).
+    setLandFinal(name, landAtEnd)
+    LND.rwyPrep(pts)
+    NAV.points = pts
     NAV.index = 1
     NAV.active = true
     PLAN.build(NAV.points)
-    setLandFinal(name, landAtEnd)
     updatePhase() -- against the last known fix, so the first broadcast isn't stale
     broadcastCurrent()
     return true
@@ -1605,15 +2389,21 @@ local function setRoute(name, resume)
     if #pts == 0 then return false end
     LND.active = false
     LND.phase  = "OFF"
+    LND.rwy    = false
+    LND.ga     = false
+    LND.gaCount = 0   -- a plan the pilot just committed to gets its full allowance of attempts
     NAV.cruiseMode = "full"   -- a fresh plan starts at full cruise, never a stale COAST
     NAV.aligning   = true     -- ...and points the nose at the first target before throttling up
+    NAV.fromStart  = false    -- ...and joins the plan wherever it already is (see RESUME)
     NAV.planName = name
+    -- A route ending at a landing site auto-lands there on arrival (fully automatic). Both
+    -- calls come before PLAN.build / NAV.index: a runway destination gains a final leg here.
+    setLandFinal(pts[#pts].name, true)
+    LND.rwyPrep(pts)
     NAV.points = pts
     NAV.index = resume and bestResumeIndex(pts) or 1
     NAV.active = true
     PLAN.build(NAV.points)
-    -- A route ending at a landing site auto-lands there on arrival (fully automatic).
-    setLandFinal(pts[#pts].name, true)
     updatePhase()
     broadcastCurrent()
     return true
@@ -1757,15 +2547,21 @@ function RTR.setSolvedRoute(destName)
     if #pts == 0 then return false, "No route to " .. destName end
     LND.active = false
     LND.phase  = "OFF"
+    LND.rwy    = false
+    LND.ga     = false
+    LND.gaCount = 0   -- a plan the pilot just committed to gets its full allowance of attempts
     NAV.cruiseMode = "full"    -- a fresh plan starts at full cruise, never a stale COAST
     NAV.aligning   = true      -- ...and points the nose at the first target before throttling up
+    NAV.fromStart  = false     -- ...and joins the plan wherever it already is
     NAV.planName = "TO " .. destName
+    -- The destination is a hub landing site: auto-land on arrival, same as a route to it --
+    -- and, if it is a runway, gain a straight-in final leg before the plan is built.
+    setLandFinal(pts[#pts].name, true)
+    LND.rwyPrep(pts)
     NAV.points = pts
     NAV.index = bestResumeIndex(pts)     -- heading-aware mid-route join, same as RESUME
     NAV.active = true
     PLAN.build(NAV.points)
-    -- The destination is a hub landing site: auto-land on arrival, same as a route to it.
-    setLandFinal(pts[#pts].name, true)
     updatePhase()
     broadcastCurrent()
     return true
@@ -1788,12 +2584,15 @@ local function cancelNav(vertCmd)
     if NAV.active or LND.active then
         rednet.broadcast({cancel = true}, APNAV_PROTOCOL)
     end
-    if LND.active then
+    if LND.active or LND.ga then
         rednet.broadcast({cmd = vertCmd or "cancel"}, AUTOLAND_PROTOCOL)
     end
     LND.active = false
     LND.phase  = "OFF"
     LND.paused = false
+    LND.rwy    = false
+    LND.ga     = false
+    LND.gaCount = 0
     NAV.active = false
     NAV.aligning = false
     NAV.cmdSpeed = 0
@@ -1804,7 +2603,7 @@ local function cancelNav(vertCmd)
     NAV.index = 1
     NAV.phase = "ENROUTE"
     PLAN.samples, PLAN.wpS, PLAN.totalLen, PLAN.cursor = {}, {}, 0, 1
-    PLAN.lastX, PLAN.lastZ, PLAN.lastS = nil, nil, 0
+    PLAN.lastX, PLAN.lastZ, PLAN.lastS, PLAN.lastD2 = nil, nil, 0, math.huge
 end
 
 local function navTick()
@@ -1817,6 +2616,9 @@ local function navTick()
     NAV.haveHeading = true
     local vel = sublevel.getLinearVelocity()
     NAV.velY = vel.y
+    NAV.velX, NAV.velZ = vel.x, vel.z   -- horizontal velocity VECTOR: the runway localizer needs
+                                        -- the rate its cross-track error is closing at, not just
+                                        -- the speed (see LND.rwyGeom)
     NAV.groundSpeed = math.sqrt(vel.x * vel.x + vel.z * vel.z)   -- horizontal speed, for the HSI readout
 
     if LND.active then
@@ -1825,6 +2627,12 @@ local function navTick()
         landingTick()
         broadcastVertical()
         return
+    end
+    -- A go-around is the other way round: the plan below flies the circuit, and all the
+    -- landing machinery still does is hold the route's altitude.
+    if LND.ga then
+        LND.gaTick()
+        broadcastVertical()
     end
 
     -- Route start: hold throttle at 0 (dynamicSpeedTarget) until the nose swings onto the first
@@ -1861,13 +2669,19 @@ local function navTick()
             or (not isFinal and DC.CURVE and NAV.phase == "ENROUTE" and PLAN.passed(NAV.index))
         if passed and not isFinal then
             NAV.index = NAV.index + 1
+            NAV.fromStart = false   -- first waypoint genuinely reached: the plan is joined
             updatePhase() -- against the point we just switched to, not the one we passed
             broadcastCurrent() -- resend immediately on advance, not just on the 1s tick
         else
             updatePhase()
             -- Arrived at a landing-capable final point: engage the landing sequence
             -- automatically (fully automatic, per config).
-            if isFinal and NAV.landAtEnd and NAV.phase == "ARRIVED" then
+            -- A RUNWAY arms far earlier -- ARRIVED means "stopped over the point", which for a
+            -- strip is already the far side of the touchdown zone. It takes the aircraft at
+            -- RWY_ARM_M out (i.e. as the planned FINAL fix goes by) and flies the approach in
+            -- itself, so the en-route arrival brake never gets to slow it to a hover first.
+            if isFinal and NAV.landAtEnd and (NAV.phase == "ARRIVED"
+                    or (LND.rwyUsable(NAV.landSite) and dist <= LG.RWY_ARM_M)) then
                 engageAutoland()
                 broadcastCurrent()  -- switch NAVCOM into LANDING at once
                 broadcastVertical() -- and take ALT-AP offline / hold altitude at once
@@ -1921,6 +2735,227 @@ local pointForm = {nameStr = "", xStr = "", zStr = ""}
 
 local editingCourseName = nil
 local courseForm = {nameStr = "", seq = {}}
+
+-- NAV DATA UPDATE (NDU) --------------------------------------------------------
+-- Keeps this aircraft's points.db / course.db / landing.db in step with the fleet's
+-- master copy on the nav data update server (computer #24) without ever disturbing a
+-- course being flown.
+--
+-- The aircraft still OWNS its files and still reads them at boot, so an aeroplane out of
+-- radio contact has a complete database and flies normally -- the server only refreshes
+-- them. The sync message carries the three .db files as plain text, so applying an update
+-- is: write the files, then call the very same loadPoints()/loadCourses()/loadLanding()
+-- used at boot. One parser in the fleet, and no way for the server's idea of the format to
+-- drift from this program's.
+--
+-- WHY THIS CANNOT MOVE AN ACTIVE COURSE. NAV.points is a snapshot copied at plan-set time
+-- and NAV.landSite likewise (see the NAV ENGINE header), so the flown plan holds no live
+-- reference into POINTS/COURSES/LANDING. Swapping those tables therefore re-arms every
+-- FUTURE plan and leaves the current one exactly as it was -- the same property that
+-- already let the pilot edit a point mid-flight on the EDIT DATA screens.
+--
+-- What is NOT safe is swapping the database under a screen that is listing or editing it:
+-- a picker would renumber under the pilot's finger between the draw and the tap, and the
+-- point editor could save a record that no longer exists. So an update is held until the
+-- FMS is back on HOME or STATUS -- see NDU.SAFE. Held updates are not lost; the server
+-- re-broadcasts every 30 s and NDU.tryApply runs once a second regardless.
+--
+-- Data flows one way. Edits made here on EDIT DATA still work but are transient: the next
+-- update from #24 overwrites them. Changes meant to last belong on the server.
+local NDU = {
+    PROTOCOL    = CFG.NAVDATA.PROTOCOL,     -- link + timings: see CFG.NAVDATA in apconf.lua
+    PULL_EVERY  = CFG.NAVDATA.PULL_EVERY,
+    STALE_AFTER = CFG.NAVDATA.STALE_AFTER,
+
+    TMP         = CFG.NAVDATA.TMP,          -- suffix of the staging file each .db goes through
+
+    rev = nil, stamp = nil,   -- the revision/checksum of what we currently hold
+    serverId  = nil,
+    lastHeard = nil,          -- os.clock() of the last message from the server
+    lastApply = nil,
+    pending   = nil,          -- a newer payload, waiting for a safe screen
+    applied   = 0,            -- refreshes this session, for the status line
+    fault     = nil,          -- why the last refresh could not be written, if it could not
+}
+
+-- The only two screens that neither list nor edit navigation data.
+NDU.SAFE = {home = true, status = true}
+
+-- A payload has to still look like a points file before it is allowed to replace one --
+-- an empty or unparseable points.db arriving over the air would otherwise wipe the
+-- aircraft's navigation database. courses/landing are accepted as sent (both can be
+-- legitimately empty; points cannot, since everything else references them).
+function NDU.sane(m)
+    if type(m.points) ~= "string" or type(m.courses) ~= "string" then return false end
+    if type(m.landing) ~= "string" then return false end
+    return m.points:find("%a+=%-?%d+,%-?%d+") ~= nil
+end
+
+-- Write one file BESIDE the live one, never over it.
+--
+-- Opening a file for writing truncates it immediately, so the obvious version -- open the
+-- real file and write -- destroys the aircraft's database the instant the write itself
+-- fails. It does fail: a CC computer has a hard space limit (computer_space_limit, 1 MB by
+-- default) and a computer that has accumulated old program versions can sit over it, at
+-- which point every write throws "Out of space" and points.db is left at zero bytes with
+-- the error swallowed by tryApply's pcall. Staging first makes a full disk harmless -- the
+-- temp write fails, the live file is never opened, and the aeroplane keeps flying on the
+-- database it already had.
+--
+-- The length actually on disk is checked rather than the return of write(): a partial
+-- write is the exact failure this has to catch, and it is not always an error.
+function NDU.stage(path, body)
+    local tmp = path .. NDU.TMP
+    pcall(fs.delete, tmp)
+    local f = io.open(tmp, "w")
+    if not f then return false end
+    local ok = pcall(function() f:write(body) end)
+    pcall(function() f:close() end)
+    if ok and fs.exists(tmp) and fs.getSize(tmp) == #body then return true end
+    pcall(fs.delete, tmp)
+    return false
+end
+
+function NDU.swap(path)
+    local tmp = path .. NDU.TMP
+    if not fs.exists(tmp) then return end
+    pcall(fs.delete, path)      -- frees the old file's space; the move is only a rename
+    pcall(fs.move, tmp, path)
+end
+
+function NDU.applyNow(m)
+    -- Stage ALL THREE, then swap all three. A part-applied refresh is worse than none:
+    -- new points beside old courses is a database whose routes name waypoints that are
+    -- not there, and the FMS silently shortens a route around a missing waypoint.
+    local files = {
+        {POINTS_FILE, m.points}, {COURSE_FILE, m.courses}, {LANDING_FILE, m.landing},
+    }
+    for _, fl in ipairs(files) do
+        if not NDU.stage(fl[1], fl[2]) then
+            for _, g in ipairs(files) do pcall(fs.delete, g[1] .. NDU.TMP) end
+            -- Recorded, not reported here: applyNow returning false leaves NDU.applied
+            -- unchanged, so the loop's own once-per-broadcast report goes out carrying
+            -- this fault. Reporting here as well would send it twice.
+            NDU.fault = "cannot write - disk full?"
+            return false
+        end
+    end
+    for _, fl in ipairs(files) do NDU.swap(fl[1]) end
+    NDU.fault = nil
+    loadPoints()
+    loadCourses()
+    loadLanding()
+    -- Everything derived from the old tables goes: a list page can now point past the end
+    -- of its list, and the DIRECT-TO picker holds a 1 Hz cache of the sorted point list.
+    -- (The route graph needs no invalidation -- RTR rebuilds it from scratch per solve.)
+    pointsPage, coursesPage = 1, 1
+    pickDirectPage, pickRoutePage, pickLandPage, coursePickPage = 1, 1, 1, 1
+    pickDirectStamp = 0
+    NDU.rev, NDU.stamp = m.rev, m.stamp
+    NDU.lastApply = os.clock()
+    NDU.applied = NDU.applied + 1
+    NDU.report()
+    return true
+end
+
+-- What this aircraft holds, and what it is sitting on and cannot load yet. Sent after
+-- every apply AND after a broadcast that had to be deferred: without the second case a
+-- client parked on a data screen looks exactly like one that never heard the server at
+-- all -- same "?" name, same "?" revision, same never-in-sync -- which is the one thing
+-- the dashboard exists to tell apart.
+function NDU.report()
+    if not NDU.serverId then return end
+    rednet.send(NDU.serverId, {
+        t      = "ack",
+        rev    = NDU.rev,
+        stamp  = NDU.stamp,
+        held   = NDU.pending and NDU.pending.rev or nil,   -- the revision we are holding
+        screen = NDU.pending and screen or nil,            -- ...and the screen blocking it
+        fault  = NDU.fault,                                -- ...or why it could not be stored
+        who    = os.getComputerLabel() or ("computer " .. os.getComputerID()),
+    }, NDU.PROTOCOL)
+end
+
+-- A corner marker for the screens that block an update but have no room for the full
+-- status line (the point/course lists, the pickers, the two detail editors). HOME and
+-- EDIT DATA carry NDU.status() itself. Nobody should be able to sit on a blocking screen
+-- without being told that is what they are doing.
+function NDU.mark()
+    if not NDU.pending then return end
+    local w = term.getSize()
+    term.setTextColour(colours.orange)
+    term.setCursorPos(w - 8, 1)
+    term.write("UPD HELD")
+end
+
+function NDU.tryApply()
+    if not NDU.pending then return end
+    if not NDU.SAFE[screen] then return end
+    local m = NDU.pending
+    NDU.pending = nil
+    -- If the write half fails (read-only disk, no space) the stamp is never adopted, so
+    -- the next 30 s broadcast simply offers the same update again.
+    pcall(NDU.applyNow, m)
+end
+
+-- One line for the pilot: where the database came from, and whether anything is waiting.
+function NDU.status()
+    -- A refresh that cannot be written is the one state the pilot must not have to guess
+    -- at: the aeroplane is flying valid but possibly outdated data and will keep failing
+    -- every 30 s until the disk is cleared.
+    if NDU.fault then
+        return "NAV DATA " .. NDU.fault .. " (rev " .. tostring(NDU.rev or "local") .. " in use)",
+            colours.red
+    end
+    if NDU.pending then
+        return "NAV DATA rev " .. tostring(NDU.pending.rev) .. " held - back out to load",
+            colours.orange
+    end
+    if not NDU.lastHeard then
+        return "NAV DATA local copy, no server heard", colours.green
+    end
+    local age = os.clock() - NDU.lastHeard
+    if age > NDU.STALE_AFTER then
+        return string.format("NAV DATA rev %s, server silent %ds",
+            tostring(NDU.rev or "?"), math.floor(age)), colours.brown
+    end
+    return string.format("NAV DATA rev %s from server #%s",
+        tostring(NDU.rev or "?"), tostring(NDU.serverId or "?")), colours.green
+end
+
+function NDU.loop()
+    local nextPull = 0
+    while true do
+        local sender, msg = rednet.receive(NDU.PROTOCOL, 1)
+        if sender and type(msg) == "table" and msg.t == "sync" then
+            NDU.serverId, NDU.lastHeard = sender, os.clock()
+            -- Stamp, not rev: content equality is the real question, and it survives the
+            -- server being rebuilt with its revision counter lost. A boot always applies
+            -- once (our stamp starts nil) even if the content matches -- harmless, and it
+            -- is what puts this aircraft on the server's roster.
+            if msg.stamp ~= NDU.stamp and NDU.sane(msg) then NDU.pending = msg end
+            -- Answer every broadcast, once, whatever the outcome -- applied, already had
+            -- it, or holding it. That is what keeps this aircraft's row on the server's
+            -- roster alive; reporting only on a change would let a perfectly healthy
+            -- aeroplane age out to SILENT 90 s after its last edit. (If tryApply did
+            -- apply, applyNow has already reported, so do not send twice.)
+            local was = NDU.applied
+            NDU.tryApply()
+            if NDU.applied == was then NDU.report() end
+        end
+        -- The idle path: a held update lands within a second of the pilot leaving the
+        -- screen, without waiting for the next broadcast. It reports through applyNow.
+        NDU.tryApply()
+        -- Ask, until the server has been heard from AT ALL. The condition is "never heard",
+        -- not "never applied": an aircraft holding an update it cannot apply yet already
+        -- has the data, and pulling for it again every 5 s would spam the server with full
+        -- payloads for as long as the pilot stayed on a data screen.
+        if not NDU.lastHeard and os.clock() >= nextPull then
+            rednet.broadcast({t = "pull"}, NDU.PROTOCOL)
+            nextPull = os.clock() + NDU.PULL_EVERY
+        end
+    end
+end
 
 -- LIST HELPERS -----------------------------------------------------------------
 
@@ -2068,6 +3103,7 @@ local function renderList(title, items, page, showAdd, addLabel)
     term.setTextColour(colours.orange)
     term.setCursorPos(2, 1)
     term.write(title)
+    NDU.mark()   -- every list screen is one that defers an update
 
     local rows = rowsAvailable()
     local first = (page - 1) * rows + 1
@@ -2134,6 +3170,13 @@ local function drawHome()
         term.setTextColour(colours.green)
         term.write("IDLE - no course set")
     end
+
+    -- Where the navigation database came from. Worth a line on the home page: a plan is
+    -- only as current as the points it was built from.
+    local ndText, ndCol = NDU.status()
+    term.setCursorPos(2, 5)
+    term.setTextColour(ndCol)
+    term.write(ndText:sub(1, w - 2))
 
     button(2, 7, 20, 3, "DIRECT", "DIRECT TO", true, colours.orange)
     button(2, 11, 20, 3, "ROUTE", "FLY ROUTE", true, colours.orange)
@@ -2493,14 +3536,23 @@ local function drawLandingStatus()
     term.clear()
 
     term.setTextColour(colours.orange)
-    term.setCursorPos(2, 1); term.write("AUTOLAND " .. LND.name)
+    term.setCursorPos(2, 1)
+    -- A runway approach names the two numbers it sized itself with: the approach speed the
+    -- glideslope and the runway length allowed, and the glideslope being flown.
+    term.write("AUTOLAND " .. LND.name .. (LND.rwy
+        and string.format(" RWY %.0fm/s %sdeg", LND.appSpeed, tostring(LG.RWY_GS_DEG)) or ""))
     term.setCursorPos(math.max(2, w - #LND.phase), 1); term.write(LND.phase)
 
     term.setTextColour(colours.white)
     term.setCursorPos(2, 3)
     term.write(string.format("POS  X %.1f  Z %.1f", NAV.posX, NAV.posZ))
     term.setCursorPos(2, 4)
-    term.write(string.format("POS ERR  %5.1f m  (<=%d)", LND.posErr, LG.POS_TOL_M))
+    if LND.rwy then
+        -- Runway: the errors that matter are along/across the strip, not range to a point.
+        term.write(string.format("XTK %+6.1f m  (<=%d)", LND.xtk, LG.RWY_CAPT_XTK))
+    else
+        term.write(string.format("POS ERR  %5.1f m  (<=%d)", LND.posErr, LG.POS_TOL_M))
+    end
     term.setCursorPos(2, 5)
     if LND.holdHeading then
         term.write(string.format("HDG ERR %+5.1f deg", LND.hdgErrDeg))
@@ -2508,19 +3560,45 @@ local function drawLandingStatus()
         term.write("HDG ERR   -- (any)")
     end
     term.setCursorPos(2, 6)
-    term.write(string.format("AGL  %6.1f m", LND.agl))
+    if LND.rwy then
+        term.write(string.format("AGL %6.1f m   GS %+6.1f m", LND.agl, LND.gsDev))
+    else
+        term.write(string.format("AGL  %6.1f m", LND.agl))
+    end
     term.setCursorPos(2, 7)
-    term.write(string.format("VS   %+5.2f m/s", LND.vs))
+    if LND.rwy then
+        term.write(string.format("VS  %+5.2f m/s  TO RUN %5.0f m  CMD %3.0f",
+            LND.vs, LND.along, LND.cmdSpeed))
+    else
+        term.write(string.format("VS   %+5.2f m/s", LND.vs))
+    end
+
+    -- Squat switch. Always shown, including "no signal": whether the gear contact is being
+    -- heard decides whether this landing can end on it or is back to the altimeter alone.
+    local sq, sqCol
+    if not TD.fresh()  then sq, sqCol = "no signal (AGL only)", colours.brown
+    elseif TD.signal   then sq, sqCol = "DOWN", colours.lime
+    else                    sq, sqCol = "airborne", colours.white end
+    if LND.phase == "LANDED" then sq = sq .. " - by " .. (LND.tdBy or "?") end
+    term.setTextColour(sqCol)
+    term.setCursorPos(2, 8); term.write("SQUAT  " .. sq)
+    term.setTextColour(colours.white)
 
     local hint = {
         ALIGN     = "aligning heading...",
         TRANSLATE = "closing on the pad...",
         DESCEND   = "descending",
         FLARE     = "flare - easing for touchdown",
-        LANDED    = "LANDED - engines on ground hold. Disengage AP NOW",
+        LANDED    = "LANDED - engines on ground hold. STOP engine NOW",
+        -- runway approach
+        INTERCEPT = "lining up on the centreline (level)",
+        GLIDE     = "on the glideslope",
+        ROLLOUT   = "rolling out - braking on the runway",
+        MISSED    = "PAST THE TOUCHDOWN ZONE - level. ABORT to go around",
     }
     local hintText = LND.paused and "PILOT ALT-AP -- descent PAUSED" or (hint[LND.phase] or "")
-    term.setTextColour((LND.phase == "LANDED" or LND.paused) and colours.lime or colours.orange)
+    term.setTextColour((LND.phase == "MISSED" and colours.red)
+        or ((LND.phase == "LANDED" or LND.paused) and colours.lime) or colours.orange)
     term.setCursorPos(2, 9); term.write(hintText)
 
     -- Same layout convention as the en-route screen: HOME on the left, the destructive /
@@ -2671,6 +3749,19 @@ local function drawDataMenu()
     term.write("EDIT DATA")
     button(2, 4, 20, 3, "POINTS", "POINTS", true, colours.orange)
     button(2, 8, 20, 3, "COURSES", "COURSES", true, colours.orange)
+
+    -- An update that arrived while the pilot is in here is held rather than applied (see
+    -- NDU.SAFE), so say so, and say plainly that this editor is no longer the master copy
+    -- once a server is on the air.
+    local ndText, ndCol = NDU.status()
+    term.setTextColour(ndCol)
+    term.setCursorPos(2, 12); term.write(ndText:sub(1, w - 2))
+    if NDU.lastHeard then
+        term.setTextColour(colours.brown)
+        term.setCursorPos(2, 13); term.write("edits here last only until the next")
+        term.setCursorPos(2, 14); term.write("update - edit on the data server")
+    end
+
     button(2, h - 2, 10, 1, "BACK", "BACK", true, colours.brown)
 end
 
@@ -2719,6 +3810,7 @@ local function drawPointDetail()
     term.setTextColour(colours.orange)
     term.setCursorPos(2, 1)
     term.write(editingPointName and ("EDIT POINT " .. editingPointName) or "NEW POINT")
+    NDU.mark()
 
     local kindLbl = "?"
     if #pointForm.nameStr == 3 then kindLbl = "POI"
@@ -2819,6 +3911,7 @@ local function drawCourseDetail()
     term.setTextColour(colours.orange)
     term.setCursorPos(2, 1)
     term.write(editingCourseName and ("EDIT COURSE " .. editingCourseName) or "NEW COURSE")
+    NDU.mark()
 
     term.setTextColour(colours.white)
     term.setCursorPos(2, 3); term.write("NAME")
@@ -2985,9 +4078,19 @@ end
 local function overrideLoop()
     while true do
         local sender = rednet.receive(ALTOVERRIDE_PROTOCOL, 1)
-        if sender and LND.active then
+        if sender and LND.ga then
+            -- Pilot wants the altitude back mid-circuit: hand the vertical channel to ALT-AP
+            -- and let the route carry on flying itself. The approach will still re-arm at the
+            -- end of the plan; it simply arrives at whatever altitude the pilot chose.
+            LND.ga = false
+            rednet.broadcast({ cmd = "cancel" }, AUTOLAND_PROTOCOL)
+        elseif sender and LND.active then
             local p = LND.phase
-            if p == "ALIGN" or p == "TRANSLATE" or p == "DESCEND" or p == "FLARE" then
+            -- Every airborne phase of either machine can be paused. ROLLOUT is deliberately
+            -- not one of them: the aircraft is braking on a finite runway, and handing the
+            -- vertical channel back mid-rollout would achieve nothing but confusion.
+            if p == "ALIGN" or p == "TRANSLATE" or p == "DESCEND" or p == "FLARE"
+                    or p == "INTERCEPT" or p == "GLIDE" or p == "MISSED" then
                 if not LND.paused then
                     LND.paused = true
                     broadcastVertical()   -- send "release" at once so the UAC/AS react now
@@ -3016,9 +4119,19 @@ local HSICFG = {
     -- COURSE mode (CDI):
     CDI_FULLSCALE_M = 80,   -- metres of cross-track at full needle deflection
     CDI_ONCOURSE_M  = 10,  -- inside this the needle turns green
+    -- TO/FROM: the course arrow is drawn as a compass needle, the tip that points at the
+    -- waypoint lit and the other dark. Within this many degrees of abeam the question has no
+    -- meaningful answer (the classic VOR ambiguity zone) and both tips go grey rather than
+    -- flickering; the number is |cos| of the angle between the course and the bearing, so
+    -- 0.09 ~ 5 deg either side of 90.
+    TOFROM_DEAD     = 0.09,
     -- LANDING mode (map):
     HDG_BAR_FS_DEG  = 45,   -- heading error (deg) at full-width bar deflection
     HDG_ALIGN_DEG   = 5,    -- within this the bar marker turns green
+    -- Runway approach: the glideslope pointer up the right-hand edge. It marks WHERE THE
+    -- GLIDEPATH IS (fly toward it), same convention as the CDI needle.
+    GS_FULLSCALE_M  = 40,   -- metres off the glidepath at full-scale deflection
+    GS_ONPATH_M     = 5,    -- inside this the pointer turns green
     -- Map range steps (metres to the ring edge): the smallest that still frames the target
     -- wins, so the target creeps inward as you close and the scale only jumps occasionally.
     RANGES          = {5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000},
@@ -3028,11 +4141,11 @@ local HSICFG = {
 local hsiMon = peripheral.find("monitor")
 if hsiMon then
     hsiMonName = peripheral.getName(hsiMon)
-    hsiMon.setTextScale(0.5)
+    hsiMon.setTextScale(CFG.HSI_TEXT_SCALE)
     pcall(function()
-        hsiMon.setPaletteColour(colours.cyan,   0x33bbdd)
-        hsiMon.setPaletteColour(colours.orange, 0xffbb00)
-        hsiMon.setPaletteColour(colours.grey,   0x555555)
+        for name, rgb in pairs(CFG.PALETTE.HSI) do
+            hsiMon.setPaletteColour(colours[name], rgb)
+        end
     end)
 end
 
@@ -3077,6 +4190,7 @@ local function drawCourseHSI()
 
     -- course + cross-track for the active leg (prev -> current waypoint)
     local hasCourse, dtk, xtk, dist, tgtName = false, heading, 0, 0, nil
+    local toFrom = 0        -- cos(bearing to the waypoint - course): >0 = TO, <0 = FROM
     if NAV.active and NAV.points[NAV.index] then
         local tgt = NAV.points[NAV.index]
         tgtName = tgt.name
@@ -3095,10 +4209,15 @@ local function drawCourseHSI()
         -- reads what the aircraft actually flies (and on-course when it's on the path). DTK = the
         -- path's heading at our projection; XTK/CDI = signed perpendicular deviation FROM the path
         -- (same +=right-of-course sign as the leg version). DIST stays to the real waypoint.
-        if DC.CURVE and NAV.phase == "ENROUTE" and NAV.index >= 2 and NAV.index ~= #NAV.points then
+        if DC.CURVE and NAV.phase == "ENROUTE" and NAV.index >= 2 and NAV.index ~= #NAV.points
+                and PLAN.onPath() then
             local cdtk, cxtk = PLAN.course()   -- path heading (DTK) + signed deviation FROM the path
             if cdtk then dtk, xtk = cdtk, cxtk end
         end
+        -- TO/FROM -- the same question a VOR's flag answers: is the waypoint ahead of us along
+        -- the course, or behind? Measured against whichever course is actually displayed (leg
+        -- or planned path), so it flips exactly as the fix goes abeam.
+        toFrom = math.cos(atan2(dx, dz) - dtk)
     end
 
     local midX, midY = math.floor(W/2) + 1, math.floor(H/2) + 1
@@ -3128,9 +4247,20 @@ local function drawCourseHSI()
     if hasCourse then
         cdtk = toCompass(dtk)
         local cAng = cdtk - chdg
-        local a1x, a1y = sp(cAng + 180, 0.95)
-        local a2x, a2y = sp(cAng, 0.95)
-        hLine(a1x, a1y, a2x, a2y, colours.cyan)                                     -- course line
+        -- The course arrow, drawn as a two-tone compass needle: the tip that points at the
+        -- waypoint is LIT, the tip pointing the opposite way is DARK -- so TO/FROM is read at
+        -- a glance from the instrument itself, without hunting for a flag. Both tips grey in
+        -- the abeam ambiguity zone (see HSICFG.TOFROM_DEAD).
+        local amb  = math.abs(toFrom) < HSICFG.TOFROM_DEAD
+        local lit  = (toFrom >= 0) and cAng or (cAng + 180)   -- the half the waypoint lies on
+        local a1x, a1y = sp(lit + 180, 0.95)
+        local a2x, a2y = sp(lit, 0.95)
+        hLine(midX, midY, a1x, a1y, amb and colours.grey or colours.blue)   -- dark (away) tip
+        hLine(midX, midY, a2x, a2y, amb and colours.grey or colours.cyan)   -- lit (toward) tip
+        if not amb then                       -- ...and an arrowhead on the lit tip
+            local bx, by = sp(lit - 14, 0.78); hFill(bx, by, colours.cyan)
+            bx, by = sp(lit + 14, 0.78);       hFill(bx, by, colours.cyan)
+        end
         local pr = math.rad(cAng + 90)                                             -- perpendicular
         for _, d in ipairs({-1, -0.5, 0.5, 1}) do                                   -- deviation dots
             hFill(midX + d*(Rc*0.6)*math.sin(pr), midY - d*(Rr*0.6)*math.cos(pr), colours.grey)
@@ -3146,9 +4276,12 @@ local function drawCourseHSI()
     end
 
     hText(midX, midY - Rr - 1, "v", colours.orange)   -- fixed lubber index (top = heading)
-    hText(midX, midY, "^", colours.white)             -- aircraft symbol (nose up)
+    hText(midX, midY, "A", colours.white)             -- aircraft symbol (nose up)
 
-    hText(midX - 3, 1, string.format("HDG %03d", math.floor(chdg + 0.5) % 360), colours.orange)
+    local phdg = math.floor(chdg + 0.5) % 360
+    if phdg == 0 then phdg = 360 end
+    
+    hText(midX - 3, 1, string.format("HDG %03d", phdg), colours.orange)
     -- Commanded (scheduled) speed vs actual ground speed -- realtime speed-law debugging.
     if NAV.active then
         if NAV.aligning then
@@ -3159,7 +4292,10 @@ local function drawCourseHSI()
         hText(W - 7, 1, string.format("GS%4.0f", NAV.groundSpeed or 0), colours.cyan)
     end
     if hasCourse then
-        hText(2, H, string.format("%-6s DTK%03d", (tgtName or ""):sub(1,6), math.floor(cdtk + 0.5) % 360), colours.cyan)
+        hText(2, H, string.format("%-6s DTK%03d %s", (tgtName or ""):sub(1,6),
+            math.floor(cdtk + 0.5) % 360,
+            (math.abs(toFrom) < HSICFG.TOFROM_DEAD) and "--" or (toFrom >= 0 and "TO" or "FR")),
+            colours.cyan)
         hText(W - 16, H, string.format("XTK%4.1f%s D%4.0f", math.abs(xtk), xtk >= 0 and "R" or "L", dist), colours.white)
     else
         hText(2, H, "NO ACTIVE LEG", colours.grey)
@@ -3234,7 +4370,22 @@ local function drawLandingHSI()
 
     if haveTgt then
         local sx, sy = sp(brg - chdg, math.min(dist / range, 1))
-        if landing and desired then                              -- pad's approach axis (landing heading)
+        if landing and LND.rwy then
+            -- The STRIP itself, drawn from the threshold along the landing direction, so the
+            -- map shows the thing being lined up on instead of a point to hover over. Only as
+            -- much of it as the current range step can show (the geometry stays exact; the
+            -- length is what gets cut), which also bounds the line to a couple of radii.
+            local rl = math.min(LND.rwyLen, range * 1.2)
+            local ex, ez = (LND.x + LND.ux*rl) - NAV.posX, (LND.z + LND.uz*rl) - NAV.posZ
+            local px, py = sp(toCompass(atan2(ex, ez)) - chdg,
+                math.sqrt(ex*ex + ez*ez) / range)
+            hLine(sx, sy, px, py, colours.orange)
+            if rl >= LND.rwyLen then hFill(px, py, colours.brown) end   -- the far end
+            -- ...and the touchdown aim point we are actually flying at.
+            ex, ez = LND.aimX - NAV.posX, LND.aimZ - NAV.posZ
+            px, py = sp(toCompass(atan2(ex, ez)) - chdg, math.sqrt(ex*ex + ez*ez) / range)
+            hFill(px, py, colours.lime)
+        elseif landing and desired then                          -- pad's approach axis (landing heading)
             local ax = desired - chdg
             local ex, ey = Rx*0.16*math.sin(math.rad(ax)), -Ry*0.16*math.cos(math.rad(ax))
             hLine(sx - ex, sy - ey, sx + ex, sy + ey, colours.orange)
@@ -3242,6 +4393,18 @@ local function drawLandingHSI()
         hText(sx, sy, tgtGlyph, tgtCol)
     end
     hText(cx, cy, "^", colours.white)                            -- aircraft, always nose-up
+
+    -- ---- glideslope pointer (right-hand edge), runway approach only ----
+    -- Marks WHERE THE GLIDEPATH IS -- fly toward it -- the same convention as the CDI needle,
+    -- so being high on the approach puts the pointer below the centre tick.
+    if landing and LND.rwy then
+        local half = math.max(1, Ry - 1)
+        for y = mapTop + 1, mapBot do hFill(W, y, colours.grey) end
+        hText(W, cy, "-", colours.white)                          -- on-path index
+        local gy = cy + clamp((LND.gsDev or 0) / HSICFG.GS_FULLSCALE_M, -1, 1) * half
+        hFill(W, gy, (math.abs(LND.gsDev or 0) <= HSICFG.GS_ONPATH_M)
+            and colours.lime or colours.orange)
+    end
 
     -- ---- heading-error bar (top row): where the wanted heading sits vs the nose ----
     for x = 1, W do hText(x, 1, "-", colours.grey) end
@@ -3255,7 +4418,14 @@ local function drawLandingHSI()
 
     -- ---- numbers (bottom row) ----
     local bottom, bcol
-    if landing then
+    if landing and LND.rwy then
+        -- Runway numbers: how far off the glidepath and the centreline, and how much runway
+        -- there is still to run to the aim point (negative = past it).
+        bcol   = colours.orange
+        bottom = string.format("%-8s AGL%d GS%+.0f XT%+.0f R%.0f V%+.1f%s",
+            (LND.phase or ""):sub(1, 8), math.floor((LND.agl or 0) + 0.5), LND.gsDev or 0,
+            LND.xtk or 0, LND.along or 0, LND.vs or 0, LND.paused and " PSE" or "")
+    elseif landing then
         bcol   = colours.orange
         bottom = string.format("%-8s AGL%d VS%+.1f PE%.1f HE%+d%s",
             (LND.phase or ""):sub(1, 8), math.floor((LND.agl or 0) + 0.5), LND.vs or 0,
@@ -3280,7 +4450,15 @@ end
 
 local function hsiLoop()
     if not hsiMon then while true do sleep(1) end end
-    while true do pcall(drawHSI); sleep(0.05) end
+    while true do pcall(drawHSI); sleep(HSICFG.REDRAW) end
+end
+
+local function apAnnounceLoop()
+    while true do
+        local nav = redstone.getInput(CFG.APSWITCH.SIDE)
+        rednet.broadcast({ ['autopilot_nav'] = nav }, CFG.APSWITCH.PROTOCOL)
+        sleep(CFG.APSWITCH.INTERVAL)
+    end
 end
 
 -- MAIN -------------------------------------------------------------------------
@@ -3300,13 +4478,11 @@ loadLanding()
 local nativeTerm = term.current()
 
 if term.isColour and term.isColour() then
-    term.setPaletteColour(colours.orange, 0xffbb00)
-    term.setPaletteColour(colours.brown, 0x553322)
-    term.setPaletteColour(colours.green, 0x116611)
+    for name, rgb in pairs(CFG.PALETTE.TERM) do term.setPaletteColour(colours[name], rgb) end
 end
 
 local ok, err = pcall(function()
-    parallel.waitForAny(navLoop, uiLoop, overrideLoop, hsiLoop)
+    parallel.waitForAny(navLoop, uiLoop, overrideLoop, hsiLoop, NDU.loop, TD.loop, apAnnounceLoop)
 end)
 
 term.redirect(nativeTerm)

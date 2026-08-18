@@ -27,15 +27,26 @@ function switchEngine()
 end
 
 local apnav, apalt = false
-function switchAutopilot()
+function switchApnav()
     while true do
-        local sender, msg, __ = rednet.receive("aertogekiss_apswitch", 1)
+        local sender, msg, __ = rednet.receive("aertogekiss_apswitch_1", 1)
         if sender ~= nil then
             apnav = msg.autopilot_nav
-            apalt = msg.autopilot_altitude
-            displayLine(5, 'AP-NAV: '..tostring(apnav)..' AP-ALT: '..tostring(apalt))
+            displayLine(5, 'AP-NAV: '..tostring(apnav))
         else
-            displayLine(5, "No AP switch signal received")
+            displayLine(5, "No APNAV signal received")
+        end
+    end
+end
+
+function switchApalt()
+    while true do
+        local sender, msg, __ = rednet.receive("aertogekiss_apswitch_2", 1)
+        if sender ~= nil then
+            apalt = msg.autopilot_altitude
+            displayLine(6, 'AP-ALT: '..tostring(apalt))
+        else
+            displayLine(6, "No APALT signal received")
         end
     end
 end
@@ -72,4 +83,4 @@ local function relayLoop()
     end
 end
 
-parallel.waitForAny(relayLoop, switchEngine, switchAutopilot)
+parallel.waitForAny(relayLoop, switchEngine, switchApnav, switchApalt)
