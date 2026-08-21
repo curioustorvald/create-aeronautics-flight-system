@@ -40,6 +40,8 @@ CFG.MANNAV_PROTOCOL   = 'aertogekiss_mancon_nav' -- in : manual horizontal+yaw s
 CFG.KBDJOY_PROTOCOL   = 'aertogekiss_kbdjoy'     -- in : keyboard joystick -- pitch/roll TARGET (rad) + throttle, #21
 CFG.STAB_PROTOCOL     = 'aertogekiss_stab'       -- out: pitch/roll thrusters
 CFG.NAVCTRL_PROTOCOL  = 'aertogekiss_navcontrol' -- out: yaw/thrust/strafe
+CFG.THRUSTF_PROTOCOL  = 'aertogekiss_thrustf'      -- out: fore/aft demand as ONE float, -1..1
+                                             --      (additive; NAVCTRL above is unchanged)
 CFG.ALT_PROTOCOL      = 'aertogekiss_alt'        -- out: up/down thruster
 
 -- MASTER ENABLES -- bring the craft up one channel at a time (it is still ONE
@@ -64,6 +66,46 @@ CFG.ENABLE_ALTITUDE    = true
 CFG.AP_NAV_DEFAULT = false
 CFG.AP_ALT_DEFAULT = false
 CFG.MANCON_STALE_AFTER = 0.5   -- s; manual vertical older than this -> treat as neutral hover
+
+-- SCRAMBLE -- the VS stick's TOP DETENT (level 15 on the VSC), and the one vertical command
+-- in the whole system that is NOT a rate: "lift engine to full throttle, climb as fast as
+-- this airframe can". It bypasses the inner rate loop entirely and drives the alt thruster
+-- to CFG.ALT_SWING outright, routed by attitude like every other vertical command.
+--
+-- WHY IT NEEDED A CHANNEL OF ITS OWN. It used to be sent as a rate -- vs = 100 m/s off the
+-- stick's top step -- and there were three independent layers between that and the thrusters,
+-- any ONE of which was enough to defeat it:
+--   1. the VSC's own command slew (VS_SLEW, 4 m/s per second) ramped toward the 100, so the
+--      command took ~25 s to arrive -- and, worse, left the accumulator parked up there
+--      afterwards, so the stick stayed disconnected from the aeroplane for another ~25 s
+--      after the pilot let go of the detent;
+--   2. this file clamped the wanted rate to CFG.CLIMB_MAX before the rate loop ever saw it,
+--      so what actually survived was the SAME command a level-14 stick already gives;
+--   3. with ALT-AP on, the mancon rate is not read at all -- the altitude cascade owns the
+--      channel -- so in the aircraft's normal cruise state the detent was a plain no-op.
+-- No value of `vs` could have cleared all three. A flag does, and it leaves the rate channel
+-- and its envelope -- which the autoland also flies inside -- completely untouched.
+--
+-- FALSE disables the detent here: the VSC still shows SCRAMBLE on its own screen, the flag
+-- simply goes unread, and level 15 flies the frozen rate travelling beside it (i.e. whatever
+-- the proportional part of the stick last asked for).
+CFG.MANCON_SCRAMBLE = true
+-- Does a scramble outrank the ALTITUDE CASCADE -- ALT-AP holding a level, and an autoland
+-- already flying the craft down?
+--   true  -- yes. The detent is then an override the pilot can reach for without switching
+--            anything off first, which is what makes it usable as a hand-flown go-around and
+--            as a terrain escape: at the moment either is wanted, ALT-AP or the autoland is
+--            precisely what is holding the craft where it must not stay. Note what it does
+--            NOT do -- it neither cancels the autoland nor clears the FMS's target. It takes
+--            the vertical for exactly as long as the detent is held and hands the channel
+--            straight back on release, so announce the go-around on the FMS as usual if the
+--            approach is actually being abandoned.
+--   false -- the detent works only with the vertical already in manual (ALT-AP off and no
+--            autoland running). Safer against a stray redstone 15 on the stick line, at the
+--            cost of the two cases anyone would want a scramble for in the first place.
+-- Either way it outranks the ON-THE-GEAR rules (CFG.AL_GROUND_CUT and CFG.AL_GROUND_VS):
+-- scrambling off a pad is half the point of having one, and a cut engine cannot answer it.
+CFG.MANCON_SCRAMBLE_OVERRIDE = true
 
 -- MANUAL HORIZONTAL + YAW (the nav MANCON stick, via the MIC #14 over MANNAV_PROTOCOL).
 -- Active only with AP-NAV OFF and a fresh MIC packet; then the pilot's wanted body-frame
@@ -139,6 +181,138 @@ CFG.PD_KD_YAW   = 1.4    -- old navcom hands-off yaw damping was 1.4
 -- the fixed CFG.ATT_KP corner. If it still overshoots, LOWER CFG.ATT_KP (3 -> 2). If it buzzes
 -- (fast oscillation) you have over-gained -- back CFG.RATE_KP/ROT_GAIN off.
 CFG.ATT_KP      = 1.5    -- outer: desired angular velocity per rad of error (1/s)
+-- ---------------------------------------------------------------------------------------
+-- PER-AXIS OUTER GAINS (nil => fall back to CFG.ATT_KP; uac.lua reads them as
+-- `CFG.ATT_KP_PITCH or CFG.ATT_KP`, so absent is a valid answer and this is a no-op on any
+-- airframe that does not set them). PITCH and ROLL added 2026-08-20 alongside ATT_KP_YAW.
+--
+-- THE ONE THING TO UNDERSTAND BEFORE TOUCHING THESE. The rate loop's true gain is
+--     G = ROT_GAIN * I * (rad/s^2 per step) * RATE_KP
+-- and the accel per step is itself (torque per step)/I, so
+--     G = ROT_GAIN * (torque per step) * RATE_KP        -- THE INERTIA CANCELS.
+-- ROT_GAIN_* is therefore NOT an inertia-compensation knob -- the live tensor multiply in
+-- uac.lua already does that job, which is why it adapts to cargo for free. ROT_GAIN_* is purely
+-- the THRUSTER's torque-per-step calibration, and the loop gain does not care how heavy the
+-- craft is. Two consequences that matter here:
+--   * the SAME stability ceiling applies to all three axes, whatever their inertia. With the
+--     ~0.5 s transport delay measured on this rig (see CFG.ATT_KP_YAW) that ceiling is
+--     G = pi/(2T) = 3.14 /s, and 60 deg of phase margin wants G ~ 1.05 /s.
+--   * the three axes still need three DIFFERENT ROT_GAIN and ATT_KP values, because they hang
+--     off three different thruster sets with three different torque-per-step.
+--
+-- PITCH AND ROLL ARE THE UNTOUCHED TWIN OF THE YAW FAULT. They carry ROT_GAIN 5e-6 against the
+-- shared ATT_KP 1.5 -- the exact pair that was just proven to sit ON the stability boundary on
+-- yaw, which had to come down to 5.7e-7 to get off it. Nothing has ever been done to them: the
+-- 2026-08-20 work fixed yaw, fore/aft and strafe and left these two exactly as they were. The
+-- pilot's report of nose nodding in level flight, and of heavy roll+pitch swaying whenever the
+-- craft is climbing or descending, is what that predicts.
+--
+-- MEASURED 2026-08-20: nose nodding with a 3-5 s period while STAB stayed at a FEW STEPS OF 15.
+-- Those two facts together pin one cell of the table, and it is NOT the cell yaw was in.
+--
+-- Simulated pitch cascade, T = 0.50 s, 6 deg upset -- ring period / peak STAB step:
+--
+--     ATT_KP \ G      0.80        1.05        1.60        2.20        3.14
+--     1.50            4.9s/0.4    4.1s/0.7    4.6s/15     5.0s/15     5.1s/15
+--     0.60            7.6s/0.1    5.6s/0.1    3.2s/0.1    2.6s/0.4    2.4s/15
+--     0.45            9.6s/0.1    5.7s/0.1    3.1s/0.0    2.6s/0.2    2.3s/15
+--     0.33           15.9s/0.0    none/0.04   none/0.02   2.5s/0.1    2.2s/15
+--     0.25            none/0.02   none/0.02   none/0.02   none/0.08   2.2s/15
+--
+-- Only the top row at G 0.80-1.05 produces a 3-5 s ring with a SMALL command; every G at or
+-- above 1.60 saturates STAB, which the pilot did not see. So on this axis the RATE LOOP GAIN IS
+-- ALREADY ABOUT RIGHT -- G ~ 1, which is exactly the 60-deg-phase-margin target -- and what is
+-- ringing is the shared outer gain ATT_KP = 1.5 sitting on top of it.
+--
+-- THIS IS THE OPPOSITE OF THE YAW DIAGNOSIS, and the difference is real, not a contradiction.
+-- G = ROT_GAIN * (torque per step) * RATE_KP, so with pitch/roll at ROT_GAIN 5e-6 and G ~ 1, a
+-- stab step is worth ~4.2e4 N.m, against ~3.7e5 N.m for a yaw step at ROT_GAIN_YAW's measured
+-- G ~ 3.14. A yaw step being ~9x a stab step is exactly what "~3x more yaw thrusters" on a
+-- SUPERWIDE hull (long moment arm) should give. The two calibrations corroborate each other.
+--
+-- SO: ROT_GAIN_PITCH AND ROT_GAIN_ROLL ARE LEFT ALONE. Change one thing. The fix is the outer
+-- gain, and only the outer gain.
+--
+-- PITCH 0.33: clean at the measured G, and it is also the analytic target -- zeta 0.9 wants
+-- ATT_KP = G/(4*zeta^2) = 1.05/3.24 = 0.32.
+-- ROLL 0.25, one notch more conservative, DELIBERATELY NOT THE SAME as pitch. Roll's G was
+-- never measured (the pilot's trace was the nose), and it is the axis most likely to be higher:
+-- inertia cancels out of G, so what is left is torque per step, and on a superwide hull the
+-- left/right stab thrusters sit much further outboard than the front/back pair. 0.25 is clean
+-- across G 0.8-2.2 where 0.33 starts ringing at 2.2. If roll now feels sluggish, raise it to
+-- meet pitch at 0.33.
+-- THE TRADE, stated plainly. A lower outer gain buys damping with STIFFNESS. Simulated step
+-- disturbance -- the off-CoM moment the lift thrusters inject once a real climb is commanded --
+-- peak excursion / still ringing / where it settles:
+--
+--     ATT_KP 1.50 (before)   1.38 deg / ringing at 4.2 s / 0.72 deg
+--     ATT_KP 0.33 (pitch)    3.31 deg / no ring          / 3.31 deg
+--     ATT_KP 0.25 (roll)     4.37 deg / no ring          / 4.37 deg
+--
+-- That is the whole "ascending/descending sways it" case: the ring is gone, at the cost of a
+-- few degrees of standing tilt while the disturbance lasts. On PITCH that cost is temporary --
+-- attIntegX is active and trims the standing part away. On ROLL it is NOT: attIntegZ is
+-- commented out in uac.lua, so the roll axis has no integral trim and will simply SIT at its
+-- offset for the length of the climb. A few degrees is tolerable (the strafe loop answers the
+-- lateral drift it causes), but know which symptom is which: SWAYING is this gain's business,
+-- SITTING at an angle is the missing integral's, and chasing the second with this knob only
+-- brings the first one back.
+--
+-- If either axis instead starts SLAMMING STAB 0<->15, stop and re-read: that is a different
+-- fault (an unbrakeable rate demand, #19 Citation's pitch nod) whose fix is MAX_RATE_* and
+-- MAX_DECEL_* below, not these. Those are still 4.0/8.0 here, i.e. the profile is effectively
+-- disabled -- but with ATT_KP at 0.33 the loop cannot demand more than 0.33*pi ~ 1.0 rad/s even
+-- from a full inversion, so it stays clear of the profile and the profile stays a safety net.
+CFG.ATT_KP_PITCH = 0.33  -- outer gain, PITCH axis only (1/s)
+CFG.ATT_KP_ROLL  = 0.25  -- outer gain, ROLL  axis only (1/s)
+-- YAW-ONLY outer gain (nil => fall back to CFG.ATT_KP; uac.lua reads
+-- `CFG.ATT_KP_YAW or CFG.ATT_KP`, so this is a no-op on any airframe that does not set it).
+-- Added 2026-08-20, the same hook #19 Citation added as CFG.ATT_KP_PITCH when it found that
+-- "ON THIS AIRFRAME PITCH IS A YAW-CLASS AXIS AND WAS WEARING PITCH-CLASS SETTINGS". Yaw here
+-- is the yaw-class axis and has always worn the shared, pitch/roll-tuned number.
+-- ATT_KP sets the cascade's DAMPING RATIO, not its speed:
+--     omega_n = sqrt(G*ATT_KP)      zeta = 0.5*sqrt(G/ATT_KP)
+-- with G = ROT_GAIN_YAW * Iy * RATE_KP_YAW * (rad/s^2 per step) -- the rate loop's true gain.
+-- 1.5 -> 0.33 (2026-08-20), from the pilot's measurement: yaw oscillating with a ~2 s period
+-- while the yaw command stayed inside +-1 step of 15.
+--
+-- THE TWO NUMBERS TOGETHER RULE OUT THE OBVIOUS ANSWER. A command that never leaves +-1 of 15
+-- is not saturating, so this is a LINEAR ring and not the unbrakeable-rate-demand mechanism
+-- that #19's pitch nod turned out to be -- the motion profile cannot be the cause, because the
+-- profile only bites when the loop is asking for more than it can deliver. And the period rules
+-- out this outer loop as the source: with zeta = 0.5*sqrt(G/ATT_KP), any G high enough to ring
+-- fast is also high enough to be overdamped, so the FASTEST ring this cascade can produce at
+-- ATT_KP 1.5 is 4.19 s (at G = 3.0, zeta = 0.71). Observed 2 s is twice that. It is the INNER
+-- rate loop ringing, and the outer loop is merely riding it.
+--
+-- WHAT 2 s PINS. The rate loop is an integrator (steps -> torque -> angular accel -> rate)
+-- behind the transport delay of the whole chain: UAC tick -> rednet -> relay #9 -> redstone ->
+-- thruster spool. A SUSTAINED oscillation means it sits on the stability boundary, and that is
+-- two equations for the two unknowns:
+--     angle  -90 - w*T = -180  ->  T = (pi/2)/w
+--     gain   G/w = 1           ->  G = w
+-- with w = 2*pi/2.0 = 3.14 rad/s, so T ~ 0.50 s and G ~ 3.14 /s. (A slight over-estimate of G:
+-- the pilot's oscillation is bounded at +-1 step rather than growing, so the truth is just
+-- under the boundary, not over it.) Half a second of dead time is entirely plausible for that
+-- chain, and it is the real ceiling on every loop in this system -- see the note on G = NORM/tau
+-- in the TRANSLATION section, which found the SAME 0.5 s and the same factor of ~3 on strafe.
+--
+-- THE FIX IS BOTH KNOBS, and that is why this hook had to exist. Phase margin at T = 0.5 s
+-- depends only on G, so ROT_GAIN_YAW must come down 3x for PM 60 deg (G 3.14 -> 1.05); but at
+-- G 1.05 with ATT_KP still 1.5 the simulated capture STILL crosses the target 42 times, ringing
+-- at 4.1 s -- it just moves the oscillation from the inner loop to the outer one. Simulated
+-- 10 deg capture, T = 0.50 s, crossings / ring period / settle:
+--
+--     G 3.14  ATT_KP 1.50  (today)      78 / 2.3 s / never     <- reproduces the report
+--     G 1.05  ATT_KP 1.50               42 / 4.1 s / 8.7 s
+--     G 1.05  ATT_KP 0.60               32 / 5.6 s / 4.0 s
+--     G 1.05  ATT_KP 0.33                0 /  --  / 5.2 s      <- chosen
+--     G 1.05  ATT_KP 0.20                0 /  --  / 9.6 s
+--
+-- 0.33 is also what the analytic target gives: zeta 0.9 needs ATT_KP = G/(4*zeta^2) = 0.32.
+-- RATIO SETS DAMPING, PRODUCT SETS SPEED -- if the nose is now too lazy, raise this and
+-- ROT_GAIN_YAW TOGETHER; if it swings again, lower this one alone.
+CFG.ATT_KP_YAW  = 0.33   -- outer gain, YAW axis only (1/s)
 CFG.RATE_KP     = 5.0    -- inner: desired angular accel per rad/s of rate error (pitch/roll)
 CFG.RATE_KP_YAW = 5.0    -- inner gain for YAW alone -- raise for a crisper yaw WITHOUT
                            -- over-gaining pitch/roll (they keep CFG.RATE_KP)
@@ -150,10 +324,22 @@ CFG.RATE_KD     = 0.0    -- inner: derivative on the rate error (noisy; start 0)
 -- thrusters) have different authority, so tune the three separately.
 CFG.ROT_GAIN_PITCH = 5e-6
 CFG.ROT_GAIN_ROLL  = 5e-6
-CFG.ROT_GAIN_YAW   = 1.7e-6   -- was 5e-6; /3 after ~3x more yaw thrusters (each step now ~3x
+CFG.ROT_GAIN_YAW   = 5.7e-7   -- was 5e-6; /3 after ~3x more yaw thrusters (each step now ~3x
                               -- the torque, so the loop was 3x over-gained -> left/right oscillation).
-                              -- If it STILL hunts you added more than 3x -> keep dividing; if it went
-                              -- sluggish, raise back toward 5e-6. This is the yaw plant-gain calibration.
+                              -- "If it STILL hunts you added more than 3x -> keep dividing" -- and it
+                              -- still hunted, so 1.7e-6 /3 again = 5.7e-7 (2026-08-20). This time the
+                              -- factor is MEASURED, not guessed: the pilot's ~2 s ring puts the rate
+                              -- loop's true gain at G ~ 3.14 /s behind ~0.5 s of transport delay, and
+                              -- 60 deg of phase margin at that delay wants G ~ 1.05 -- exactly /3.
+                              -- See CFG.ATT_KP_YAW for the derivation; the two must move together.
+                              -- NOTE this REPLACES the earlier reading that the rate loop was already
+                              -- near critical damping (from the MANNAV_YAW_BRAKE experiment ringing at
+                              -- an effective gain of 14 but not at 5). That reasoning assumed NO
+                              -- transport delay -- gain*dt with dt = 0.05 -- which is the wrong model
+                              -- for a chain that takes half a second to answer. With the delay in it,
+                              -- gain 5 is already past the boundary, which is why the brake experiment
+                              -- rang at all and why the yaw has been hunting since.
+                              -- So reach for the profile first, this second.
 
 -- INERTIA cross-axis coupling. false (default): use ONLY the body-diagonal moments,
 -- so each axis is independent -- a pitch demand makes pitch torque and nothing else
@@ -173,8 +359,46 @@ CFG.INERTIA_COUPLING = false
 -- spin up to a steady rate (= MAX_RATE), then full-reverse and time to zero
 -- (MAX_DECEL = MAX_RATE / that time). Caps set high effectively disable the profile
 -- (pitch/roll here are high, so leveling is unchanged; only the slow yaw axis binds).
-CFG.MAX_RATE_PITCH,  CFG.MAX_RATE_YAW,  CFG.MAX_RATE_ROLL  = 4.0, 0.5,  4.0   -- rad/s
-CFG.MAX_DECEL_PITCH, CFG.MAX_DECEL_YAW, CFG.MAX_DECEL_ROLL = 8.0, 0.05, 8.0   -- rad/s^2
+--
+-- *** YAW 0.5/0.05 -> 0.30/0.02 (2026-08-20). NOT THE FIX FOR THE YAW OSCILLATION -- that is
+-- CFG.ROT_GAIN_YAW and CFG.ATT_KP_YAW, see their notes. The pilot's report (command never
+-- leaving +-1 step of 15) says the loop never saturates, and an unbrakeable rate demand is
+-- exactly the saturating failure, so the profile was never what was ringing. These are lowered
+-- anyway, as the SAFETY NET they are meant to be: with ATT_KP_YAW at 0.33 the linear branch now
+-- governs everything inside 22 deg of heading error, so these two sit clear of the retuned loop
+-- rather than defining it -- which is precisely where #19 left MAX_RATE_PITCH/MAX_DECEL_PITCH
+-- after its own retune. Do not tune the swing with these. *** The tell that they were never
+-- anyone's considered values is the same one that gave away CLIMB_AT_FULL = 5.0 and the whole
+-- horizontal-gain block: 0.5/0.05 is what #38 Mantine and #27 SS Argo carry too. A superwide
+-- VTOL with the largest yaw inertia in the fleet, a small winged VTOL and a sailless watership
+-- cannot all decelerate in yaw at the same 0.05 rad/s^2 -- these were never measured on any of
+-- them. Only #19 Citation ever measured its own, and doing so is what cured its nod.
+--
+-- WHY THIS DIRECTION, given the number is unknown. MAX_DECEL is a PROMISE the profile makes on
+-- the thrusters' behalf: it commands the fastest closing rate it believes it can still stop
+-- from. Promise more than the craft can deliver and it arrives at the heading too fast, sails
+-- past, brakes, sails past the other way -- left/right oscillation. Promise less and the yaw
+-- is merely lazy. The error is therefore ONE-SIDED, so with the true figure unknown the safe
+-- move is to be pessimistic; #19 says the same ("the profile must be more pessimistic than the
+-- thrusters, or it plans a stop it cannot make"). This craft is the fleet's heaviest in yaw,
+-- so 0.05 is far likelier to be the optimistic end than the pessimistic one.
+--
+-- COST OF BEING WRONG-BUT-PESSIMISTIC: a slower nose, and nothing else. This is a VTOL -- the
+-- track is flown by the strafe/translation loops, which are holonomic and heading-agnostic, so
+-- yaw only points the nose. Manual yaw is untouched (the MIC names its rate directly and
+-- bypasses profileRate), and CFG.HDG_SIM_MAX_RATE tracks MAX_RATE_YAW but only bites in
+-- HYBRID/keyboard-joystick, neither of which exists here.
+--
+-- MEASURE IT, exactly as navcom and #19 describe: spin up to a steady yaw rate, full-reverse,
+-- and time to zero -- MAX_DECEL = rate/time, then keep ~0.7x of it as margin. The steady rate
+-- that full yaw reaches IS MAX_RATE_YAW. If the nose is now too lazy after measuring, raise
+-- these; if it STILL swings past the heading, lower MAX_DECEL_YAW further before touching any
+-- gain -- an unbrakeable rate demand looks exactly like an over-gained loop and is not one.
+-- (0.30/0.02: the sqrt branch governs above 2*MAX_DECEL/ATT_KP_YAW^2 ~ 0.018 rad, i.e. the
+-- profile shapes essentially the whole working range, and the rate cap only binds beyond
+-- 129 deg of heading error.)
+CFG.MAX_RATE_PITCH,  CFG.MAX_RATE_YAW,  CFG.MAX_RATE_ROLL  = 4.0, 0.30, 4.0   -- rad/s
+CFG.MAX_DECEL_PITCH, CFG.MAX_DECEL_YAW, CFG.MAX_DECEL_ROLL = 8.0, 0.02, 8.0   -- rad/s^2
 
 -- Gyroscopic feedforward, omega x (I omega). With this craft's enormous yaw inertia
 -- and 20 Hz-noisy angular velocity, this term injects large spurious pitch/roll during
@@ -225,6 +449,23 @@ CFG.TILT_ALT_ALLOC  = true
 -- the spill is added AFTER THRUST_SIGN so it carries its own sign. Calibrated in-game: nose
 -- DOWN 90 deg + climb wanted must fire the BACKWARD thruster (not forward). Flip back to +1
 -- only if that test inverts.
+--
+-- SECOND SUSPECT FOR "CLIMBING AND DESCENDING SWAY IT IN ROLL AND PITCH" (2026-08-20), and the
+-- reason these two knobs are the A/B test for it. The spill is proportional to vertEffort, so
+-- it is nearly absent in level cruise (the loop is holding a small hover trim) and at its
+-- largest in a commanded climb or descent -- which is exactly when the pilot sees the swaying.
+-- The path is a genuine feedback loop: vertEffort spills into fore/aft and strafe by the craft's
+-- TILT, those thrusters are off-CoM so they inject a pitch/roll moment, and that moment changes
+-- the tilt that set the spill. Its loop gain rises with vertEffort, so a climb can push an
+-- attitude loop that is merely marginal in the cruise over the edge.
+-- TO TEST, no code change needed: set BOTH of these to 0 (or CFG.TILT_ALT_ALLOC = false) and fly
+-- the same climb. The cost is only that altitude sags a little while tilted -- the alt thruster
+-- keeps the body-up share either way.
+--   * sway GONE with them at 0      -> it is this coupling; the attitude loop is fine.
+--   * sway UNCHANGED with them at 0 -> it is the pitch/roll loop itself, and the climb was only
+--                                      ever the disturbance that excited it. See CFG.ATT_KP_PITCH.
+-- That second outcome is the more likely one, because the nose also nods in LEVEL flight, where
+-- vertEffort -- and therefore this whole term -- is close to zero.
 CFG.VERT_XFER_FWD   = -1.0  -- fore/aft steps per unit vertical-effort * (world-up . body-fwd)
 CFG.VERT_XFER_STR   = 1.0   -- strafe   steps per unit vertical-effort * (world-up . body-lat)
 
@@ -378,6 +619,31 @@ CFG.BANK_HDG_KD     = 1.2     -- rad of counter-bank per rad/s of actual yaw rat
                               -- the bank eases off as the turn is already closing rather than only
                               -- once hErr itself shrinks. If it rings, raise; if sluggish/won't
                               -- bank in enough to initiate the turn, lower toward 0.
+                              -- NOTE (2026-08-19): this gain is now applied to the WASHED rate,
+                              -- not the raw one -- see CFG.BANK_HDG_KD_WASHOUT. Retune it there
+                              -- first; the value here no longer sets any standing droop.
+-- Washout (high-pass) time constant, in seconds, for the rate the damper above sees. The
+-- damper subtracts (yaw rate - a slow low-pass of the yaw rate), i.e. the CHANGE in turn
+-- rate, instead of the raw rate.
+--
+-- WHY THIS EXISTS. Damping on the raw rate is correct for a heading CAPTURE, whose steady
+-- state is wings level at zero rate, and wrong for a curved PATH, whose steady state is a
+-- SUSTAINED rate. On an arc the old law settled at
+--     bank = BANK_PER_YAWERR*hErr - BANK_HDG_KD*GRAVITY*tan(bank)/v
+-- so the damper never let go: a standing droop of BANK_HDG_KD*GRAVITY*tan(bank)/v rad, which
+-- (dividing by v) GROWS as the FMS slows for a corner -- worst exactly where the corner needs
+-- the most bank. 14% of BANK_MAX at 120 m/s cruise, but 33/47/74% at the 51/35/23 m/s Mantine's
+-- FMS schedules for the QATON/QETAM/BAZRA corners of WAU-BZR. That was the "HYBRID will not
+-- turn on DSWAE-QATON-BAZRA" report: it banked ~30 deg where the plan wanted 45, flew each of
+-- those three corners 2-3x wider than planned, and walked out past DC.PASS_CORRIDOR.
+--
+-- CHOOSING IT. Long next to the roll-in (BANK_MAX/BANK_RATE ~ 2.2 s) so the damper is fully
+-- alive through the roll and through any ring, short next to a corner (5-15 s) so it has
+-- washed out before the arc settles. 2.0 s sits between them. Raise it toward infinity to
+-- reproduce the OLD drooping behaviour exactly (useful as an A/B in flight); lower it if the
+-- roll-in itself still overshoots -- but below ~1 s it starts washing out DURING the roll-in
+-- and stops damping the thing it is for.
+CFG.BANK_HDG_KD_WASHOUT = 2.0
 CFG.BANK_HDG_FADE_NEAR = 60    -- m; below this distance to the current target, the heading-error
                                -- bank term is fully faded to 0 -- the cross-track term (which
                                -- stays aligned with the translation law) becomes the sole lateral
@@ -731,6 +997,13 @@ CFG.KJOY_TURN_REF_SPEED = 60
 -- ============================================================================
 -- TRANSLATION CONFIG -- ported from navcom.lua (yaw removed; it is attitude now)
 -- ============================================================================
+-- A CEILING on the speed the FMS may schedule, and the value navCruiseCap boots at.
+-- 999.0 -> SPEED_AT_FULL (2026-08-20). 999 was a "no ceiling" placeholder, and a ceiling
+-- above what the thrusters can actually buy is not a ceiling: it only lets the loop carry a
+-- permanent, unclosable error, and it boots the craft asking for a speed it can never reach.
+-- No practical change -- the FMS's own CFG.SPEED_FULL is 320 -- but it keeps the one number
+-- that says "how fast is this aeroplane" in ONE place, which is the whole point of the block
+-- below. Raise BOTH this and SPEED_AT_FULL if thrusters are added.
 CFG.CRUISE_SPEED       = 320.0
 CFG.APPROACH_KP        = 0.20
 CFG.APPROACH_SPEED     = 30.0
@@ -739,31 +1012,224 @@ CFG.TERMINAL_MAX_SPEED = 10.0
 -- (#8 dynamicSpeedTarget) so that ONE place owns the commanded speed and its HSI CMD readout is
 -- truthful. Do not re-add them here -- two sources would double-cut the throttle.
 CFG.TRANSLATE_MIN_CMD  = 5.0
+-- FORE/AFT half of the breakaway floor, in steps. SPLIT OFF from TRANSLATE_MIN_CMD above on
+-- 2026-08-21: that one number is in OUTPUT STEPS, but a step is not worth the same demand on
+-- the two axes it was applied to. Fore/aft, one step is SPEED_AT_FULL/THRUST_MAX; lateral,
+-- STRAFE_AT_FULL/STRAFE_MAX. On Aer Togekiss that is 21.3 m/s against 2.67 -- eightfold -- so a
+-- flat 5.0 asked for a reasonable 13 m/s sideways and an absurd 107 m/s fore/aft, i.e. 15 of the
+-- 45 A-units #69 resolves, slammed on and off as the closing rate crossed TRANSLATE_MIN_RATE.
+-- That was the fore-aft rocking. The floor is blended along the demand's direction (see uac.lua),
+-- so this value is what a PURELY fore/aft demand is floored to and TRANSLATE_MIN_CMD what a
+-- purely lateral one is; set them equal to get exactly the old flat behaviour back.
+--
+-- CALIBRATE by what the floor should be WORTH, not by the step count: multiply by
+-- SPEED_AT_FULL/THRUST_MAX to read it in m/s. Too low and the craft creeps at a fix instead of
+-- breaking away; too high and it lunges and rocks again -- that is the failure this split fixes,
+-- so come DOWN to it rather than up.
+-- Aer Togekiss: 0.5 steps = 1.5 of #69's 45 A-units ~ 10.7 m/s of demand, which is
+-- TERMINAL_MAX_SPEED (10.0) -- enough to always get moving, nowhere near a lunge.
+CFG.TRANSLATE_MIN_CMD_FWD = 0.5
 CFG.TRANSLATE_DEADZONE = 1.0
 CFG.TRANSLATE_MIN_RATE = 0.35
-CFG.SPD_KP = 1.5    -- ENROUTE speedPID gain only (see TRANS_KP below for the undamped laws).
-                    -- speedPID has its own KD (below), which damps the 2x-stronger fore/aft
-                    -- thrust fine on its own -- restored to the pre-thruster-upgrade value
-                    -- after cutting it project-wide caused ENROUTE cruise to undershoot its
-                    -- setpoint (over-damped: SPD_KI alone was too slow to trim the rest of
-                    -- the way). If ENROUTE cruise starts hunting again, this is the one to
-                    -- lower, not TRANS_KP.
-CFG.SPD_KI = 0.40
-CFG.SPD_KD = 1.0001
-CFG.SPD_FF = 0.0
+
+-- ---------------------------------------------------------------------------
+-- HORIZONTAL AUTHORITY -- the two measured numbers the whole translation loop scales from.
+--
+-- These are PHYSICAL PROPERTIES OF THIS AEROPLANE, exactly like CFG.CLIMB_AT_FULL in the
+-- altitude section below: the steady speed that CFG.THRUST_MAX steps of fore/aft, and
+-- CFG.STRAFE_MAX steps of strafe, actually buy. They are not preferences, and they change
+-- every time thrusters are added.
+--
+-- WHY THIS BLOCK EXISTS (2026-08-20). The vertical channel was rescaled on 2026-08-20 because
+-- its gains were written in absolute redstone steps with no reference to what a step buys, so
+-- a thruster upgrade silently doubled the loop gain and it hunted. The HORIZONTAL channel had
+-- the identical fault and worse: it had never been scaled to anything at all. The proof is
+-- that #1 (superwide VTOL, 320 m/s), #38 Mantine (160), #27 SS Argo (100) and #19 Citation
+-- (280) all carried the SAME BLOCK, byte for byte:
+--
+--     SPD_KP 1.5   SPD_KI 0.40   SPD_KD 1.0001   SPD_FF 0.0
+--     STRAFE_KP 1.2   STRAFE_KD 2.0   TRANS_KP 0.75
+--
+-- Four airframes with nothing in common cannot share a steps-per-m/s gain, for the same
+-- reason they could not share CLIMB_AT_FULL = 5.0. What that gain is worth here:
+--
+--     STEPS_PER_MPS_FWD = 15 / 320 = 0.047 steps per m/s
+--     SPD_KP 1.5 = 32x that.  TRANS_KP 0.75 = 16x.  STRAFE_KP 1.2 = 3.2x.
+--
+-- A P gain 32x the plant's own scale is not a proportional controller, it is a RELAY: at
+-- SPD_KP 1.5 the whole 15-step range is crossed in 10 m/s of speed error, so anything outside
+-- +-10 m/s commands full thrust or full reverse.
+--
+-- BE PRECISE ABOUT WHICH OF THESE IS THE SURGE, because the first guess was wrong. Benched
+-- (below), the 32x P gain on its own is NOT what oscillates -- with SPD_KD at navcom's 0.0 it
+-- settles in one overshoot. SPD_KD = 1.0001 is what oscillates, and it does so violently. The
+-- over-scaled gains are the reason the channel had no MARGIN left to absorb it, and the reason
+-- nobody could tell which knob was at fault; they are worth fixing, but the airspeed surge
+-- itself is the derivative. See CFG.SPD_KD.
+--
+-- MEASURE THEM. Both are one flight test each, and everything below rescales off them:
+--
+--   1. Calm air, plenty of altitude, wings level, AP-NAV OFF so the MIC stick (#14) owns the
+--      horizontal (a released stick is a velocity-hold at zero, so centre it to stop).
+--   2. Full FORWARD on the stick; hold until the ground speed (GS on the UAC display, or the
+--      HSI) STOPS INCREASING. That steady speed is SPEED_AT_FULL. Repeat full aft; use the
+--      smaller of the two.
+--   3. Same again full LEFT and full RIGHT for STRAFE_AT_FULL.
+--
+-- SPEED_AT_FULL 320 is taken from the FMS's own CFG.SPEED_FULL (8/apconf.lua), which is the
+-- fastest cruise this aeroplane is flown at -- a good figure, but chosen for chunk loading,
+-- not measured at the thrusters, so confirm it. STRAFE_AT_FULL 40 IS A GUESS: nothing in the
+-- tree records what this craft's strafe thrusters are worth, and the strafe channel could not
+-- be flight-tested when this block was written. Measure it before trusting any strafe number
+-- here -- every strafe gain below is proportional to it, so one measurement retunes them all.
+CFG.SPEED_AT_FULL     = 320.0
+CFG.STRAFE_AT_FULL    = 40.0
+-- Inverse plant gain: the steps that buy one m/s in the steady state. This is the fore/aft and
+-- lateral twin of CFG.STEPS_PER_MPS, and it is used for BOTH jobs the vertical channel uses
+-- that number for -- as the FEEDFORWARD (below and in uac.lua's velocity-vector laws) and as
+-- the SCALE every feedback gain in this section is expressed in.
+CFG.STEPS_PER_MPS_FWD = CFG.THRUST_MAX / CFG.SPEED_AT_FULL   -- 0.047 steps per m/s
+CFG.STEPS_PER_MPS_LAT = CFG.STRAFE_MAX / CFG.STRAFE_AT_FULL  -- 0.375 steps per m/s
+
+-- ---- ENROUTE along-track loop (speedPID) ----
+-- FEEDFORWARD, ON AT LAST. The code has multiplied CFG.SPD_FF by the commanded closing speed
+-- since navcom, and every airframe in the fleet has carried it at 0.0 -- i.e. the feedback
+-- alone had to manufacture the entire cruise thrust out of the tracking error. That is what
+-- forced SPD_KP to 32x the plant scale in the first place, and it is the same "the feedforward
+-- and the feedback must scale off the SAME authority" fault the vertical channel was fixed for.
+-- At exactly STEPS_PER_MPS_FWD this is an inverse-plant feedforward: on its own it commands
+-- precisely the steps that hold the commanded speed, so P and I are left with nothing to do
+-- but trim mass changes, bank, and climb attitude -- which is why they can now be gentle.
+CFG.SPD_FF = CFG.STEPS_PER_MPS_FWD
+-- P and I in MULTIPLES OF THE PLANT SCALE, so they follow SPEED_AT_FULL automatically -- the
+-- half of the vertical fix that mattered most (correcting the authority while leaving the
+-- feedback a bare constant is half a fix, and the half that hunts).
+-- BENCHED, not guessed (first-order thrust plant + 1-tick actuator lag, 20 Hz, 0 -> 150 m/s,
+-- drag time constant swept 6/15/30 s). Worst tracking error after the first 5 s, number of
+-- error sign reversals, and command chatter (output reversing direction tick to tick):
+--
+--     kp 1.5    ki 0.40  kd 1.0001  ff 0        16.04 m/s   2734 revs   1464 chatter
+--     kp 1.5    ki 0.40  kd 0       ff 0         3.02 m/s      1 rev      47 chatter
+--     KP_NORM 2   ki 0.023  kd 0    ff on       13.60 m/s     10 revs     15 chatter
+--     KP_NORM 8   ki 0.023  kd 0    ff on        0.60 m/s      1 rev       0 chatter
+--     KP_NORM 16  ki 0.023  kd 0    ff on        0.08 m/s      1 rev       0 chatter
+--     KP_NORM 32  ki 0.023  kd 0    ff on        0.00 m/s      1 rev       0 chatter
+--
+-- Read it carefully: cutting the gain HARD (KP_NORM 2, the first cut tried here) is WORSE than
+-- leaving it alone -- the feedforward then over-commands through the transient and the feedback
+-- is too slow to catch it. The gain is not the fault; see the SPD_KD note below.
+-- KP_NORM 16 = kp 0.75 = HALF the historic 1.5: bench-clean, and the halving is margin for what
+-- the bench cannot model (relay hop, redstone granularity, thruster spool, quadratic drag).
+-- KP_NORM 32 would restore 1.5 exactly if it turns out sluggish in the air.
+-- KI_NORM 0.5 = ki 0.023 beat 1.0 / 2.0 / 4.0 (which reintroduced 100+ chatter), and still
+-- closes the steady state exactly when the feedforward is 25% wrong (2.06 m/s worst, 1 chatter)
+-- -- which matters, because SPEED_AT_FULL is not yet measured.
+CFG.SPD_KP_NORM = 16.0
+CFG.SPD_KI_NORM = 0.5
+CFG.SPD_KP = CFG.SPD_KP_NORM * CFG.STEPS_PER_MPS_FWD
+CFG.SPD_KI = CFG.SPD_KI_NORM * CFG.STEPS_PER_MPS_FWD
+-- 1.0001 -> 0. THIS IS THE AIRSPEED OSCILLATION, and it was never meant to be here: the
+-- ancestor 4/navcom.lua sets `SPD_KD = 0.0  -- leave 0; the derivative here is acceleration,
+-- and noisy`, uac.lua carried 0.0 through v1.0, and v1.4 (2026-07-27) raised it to 1.0001 with
+-- NO comment, in the same edit that put SPD_KP back to 1.5 -- i.e. the gain was restored and a
+-- derivative bolted on to damp it, which is the wrong half of the fix twice over.
+--
+-- WHY IT OSCILLATES, not merely "is noisy". pid.lua differences the ERROR and does not filter
+-- it (see CFG.VEL_KD, zeroed for the same reason), and on a SPEED loop the error's derivative
+-- IS the craft's acceleration -- which is produced by this loop's own last output. So with A =
+-- m/s^2 per step, the law reduces to u(n) = Kp*e + Ki*I - KD*A*u(n-1): a recurrence whose pole
+-- is -KD*A. At KD ~ 1 it alternates sign every tick and DIVERGES as soon as one step is worth
+-- more than 1 m/s^2, until the +-15 clamp turns it into a sustained limit cycle. It bites
+-- hardest at low speed, where there is no drag opposing the thrust and A is at its largest --
+-- which is exactly "especially noticeable on starting from full stop".
+--
+-- The bench above is unambiguous: the SAME gains with kd 1.0001 vs kd 0 give 2734 error sign
+-- reversals against 1, and 1464 command reversals against 47. Everything else in this block is
+-- scaling and margin; THIS line is the airspeed oscillation.
+-- Leave it at 0. If the loop still hunts, lower SPD_KP_NORM; the damping is supposed to come
+-- from the gain being right, not from differencing a noisy speed 20 times a second.
+CFG.SPD_KD = 0.0
 CFG.CRUISE_TRIM_INIT = 0
-CFG.STRAFE_KP = 1.2
+
+-- ---- Cross-track (strafe) loop ----
+-- Read the PD as the cascade it actually is. With sp = 0 the law in uac.lua is
+--     steps = -STRAFE_KP*xtk - STRAFE_KD*xtkRate  =  -STRAFE_KD * ( (KP/KD)*xtk + xtkRate )
+-- i.e. an OUTER position gain KP/KD (1/s -- the lateral closing speed wanted per metre off
+-- track) driving an INNER lateral-velocity gain KD (steps per m/s). Written that way it is the
+-- same shape as the vertical cascade, and the two halves can be given their proper units:
+--   * XTK_KP is the outer gain and is a pure 1/s -- it does NOT depend on thruster authority,
+--     so it is an absolute number and is LEFT AT ITS HISTORIC VALUE (1.2/2.0 = 0.6). Path
+--     tracking behaves as it always has.
+--   * STRAFE_VEL_KP is the inner gain and is steps per m/s, so it MUST scale with
+--     STEPS_PER_MPS_LAT, and it is the one number the strafe channel now derives from.
+-- THE PILOT'S GUESS WAS RIGHT -- strafe does share the fault, and it shares the CAUSE with yaw.
+-- Reported: strafe holding inside +-3 steps of 15 and oscillating on the same ~2 s period as the
+-- yaw. Same period, same non-saturating command, same mechanism: an inner velocity loop sitting
+-- on its stability boundary behind the ~0.5 s transport delay derived in CFG.ATT_KP_YAW.
+--
+-- THE ONE IDENTITY WORTH REMEMBERING, and the reason normalising the gains was worth doing at
+-- all. The inner loop's true gain is
+--     G = (steps per m/s) * (m/s^2 per step) = *_KP_NORM / tau
+-- where tau is that axis's drag time constant. STRAFE_AT_FULL CANCELS OUT -- so the normalised
+-- gain is exactly "loop gain times tau", the authority guess does not enter the stability
+-- question at all, and every channel in this file can be read off the same scale. With T = 0.5 s
+-- of delay the boundary is G = pi/(2T) = 3.14 and 60 deg of phase margin wants G ~ 1.05, i.e.
+--     KP_NORM ~= tau       for every one of these loops.
+-- Fore/aft has tau ~15 s and SPD_KP_NORM 16 -- which is why that channel is fine. Strafe's tau
+-- is short (~1.7 s if it is exactly on the boundary today), and it was carrying NORM 5.33.
+--
+-- Simulated 30 m capture WITH the 0.5 s delay, lateral tau swept 1.0/1.7/4.0 s (crossings):
+--
+--     VEL_NORM 5.33  XTK_KP 0.60   (the historic 1.2/2.0)    150   138     0
+--     VEL_NORM 2.00  XTK_KP 0.30                               0     0     0
+--
+-- 138-150 crossings is not a cross-track hold, it is a weave. NORM 2.0 is clean with zero
+-- overshoot across the whole 4x range of lateral drag -- i.e. it stays clean however wrong the
+-- STRAFE_AT_FULL guess turns out to be -- and recaptures 30 m in ~14 s.
+--
+-- CORRECTION, worth recording so it is not repeated: the first cut of this block bench-tuned
+-- these two WITHOUT the transport delay in the model and concluded the opposite -- that the
+-- outer/inner RATIO was at fault and the inner gain should be RAISED to VEL_NORM 10. With the
+-- delay in, VEL_NORM 10 is three times past the stability boundary. A cascade bench with no
+-- dead time cannot see the thing that limits every loop here; do not tune this channel with one.
+CFG.XTK_KP             = 0.30   -- 1/s: lateral closing speed wanted per metre of cross-track
+CFG.STRAFE_VEL_KP_NORM = 2.0
+CFG.STRAFE_VEL_KP = CFG.STRAFE_VEL_KP_NORM * CFG.STEPS_PER_MPS_LAT   -- steps per m/s
+CFG.STRAFE_KP = CFG.XTK_KP * CFG.STRAFE_VEL_KP                       -- steps per metre of xtk
 CFG.STRAFE_KI = 0.0
-CFG.STRAFE_KD = 2.0
--- TRANS_KP: gain for the UNDAMPED direct-velocity-error laws only -- align-to-point
--- (TERMINAL/ARRIVED/LANDING/APPROACH, and en-route direct-to with no leg) and the
--- manual MIC stick law. Both compute thrust as a bare Kp*error with no I or D term,
--- so unlike speedPID above they have nothing to damp a too-high gain -- this is the
--- number that was cut for the 2x fore/aft thruster upgrade (was 1.5, same story as
--- ROT_GAIN_YAW). Tune independently of SPD_KP: if align-to-point/manual-stick still
--- hunts, lower this; if ENROUTE cruise undershoots its setpoint, that is SPD_KP, not
--- this one.
-CFG.TRANS_KP = 0.75
+-- The inner gain again, under the name uac.lua's cross-track law reads it by. It is the SAME
+-- NUMBER as STRAFE_VEL_KP on purpose: both are "steps per m/s of body-right velocity", and
+-- carrying two different values for one physical quantity (2.0 here, 1.2 in the velocity laws)
+-- was the other half of the strafe channel's confusion. Unlike SPD_KD this derivative is taken
+-- from the MEASURED cross-track rate, not from a differenced error, so it is real damping and
+-- stays.
+CFG.STRAFE_KD = CFG.STRAFE_VEL_KP
+-- TRANS_KP: gain for the UNDAMPED direct-velocity-error laws -- align-to-point
+-- (TERMINAL/ARRIVED/LANDING/APPROACH, the en-route CARROT, and direct-to with no leg) and the
+-- manual MIC stick law. They compute thrust as a bare Kp*error with no I and no D, so unlike
+-- speedPID they have nothing to damp a too-high gain. This is the number that was already cut
+-- once for the 2x fore/aft thruster upgrade (1.5 -> 0.75, same story as ROT_GAIN_YAW).
+--
+-- LEFT AT 0.75 (TRANS_KP_NORM 16 reproduces it exactly), and what changed instead is that
+-- uac.lua now gives this law the same inverse-plant feedforward the ENROUTE law gets --
+-- STEPS_PER_MPS_FWD times the commanded body-frame velocity. Note WHICH law this is: with a
+-- baked path the FMS flies a CARROT, so this -- not speedPID -- is the law that holds cruise,
+-- and it is a bare P with no integral at all. Benched (0 -> 150 m/s, tau 15 s), that shows up
+-- as a standing DROOP, because a pure P must hold an error to hold thrust:
+--
+--     TRANS_KP 0.75, no feedforward        steady error 8.82 m/s
+--     TRANS_KP 0.75, feedforward on        steady error 0.04 m/s
+--     TRANS_KP 0.75, feedforward 25% wrong steady error 2.21 m/s
+--
+-- 8.8 m/s slow, with the HSI reading the commanded number -- the FMS's speed schedule was being
+-- quietly undershot at every carrot. Halving the gain on top of this was tried and reverted:
+-- with the droop gone there is nothing left for a smaller gain to buy, and the close-in
+-- align-to-point phases want the authority. Lower TRANS_KP_NORM if align-to-point or the manual
+-- stick hunts; the middle column above is why measuring SPEED_AT_FULL is worth the flight.
+-- Close-in station keeping is unaffected either way: below CFG.TRANSLATE_MIN_RATE,
+-- CFG.TRANSLATE_MIN_CMD floors the command at 5 steps regardless of what this gain computes.
+CFG.TRANS_KP_NORM = 16.0
+CFG.TRANS_KP = CFG.TRANS_KP_NORM * CFG.STEPS_PER_MPS_FWD
 CFG.THRUST_SIGN = 1
 CFG.STRAFE_SIGN = 1
 CFG.XTK_SIGN    = 1
@@ -788,13 +1254,69 @@ CFG.ALT_MIN, CFG.ALT_MAX = 0, 15
 -- math.max (not min): with neutral 7 in a 0..15 range the up side has 8 steps of
 -- headroom, so full effort reaches level 15 and the down line reaches 0.
 CFG.ALT_SWING   = math.max(CFG.ALT_NEUTRAL - CFG.ALT_MIN, CFG.ALT_MAX - CFG.ALT_NEUTRAL)
-CFG.CLIMB_AT_FULL = 5.0
+-- ---------------------------------------------------------------------------
+-- VERTICAL AUTHORITY -- the one measured number the whole vertical loop scales from.
+--
+-- CLIMB_AT_FULL is a PHYSICAL PROPERTY OF THIS AEROPLANE: the climb rate ALT_SWING steps
+-- of lift actually buys. It is not a preference, and it changes every time lift thrusters
+-- are added.
+--
+-- WHY IT WAS WRONG, AND WHAT IT COST. It sat at 5.0 -- the number ported from control.tua
+-- -- and 5.0 is still what #38 Mantine, #27 SS Argo and #19 Citation all carry. A massive
+-- superwide VTOL, a small winged one, a sailless watership and a Cessna cannot all buy the
+-- same climb rate per step. Meanwhile this airframe's OTHER channels were rescaled as it
+-- was upgraded, and the comments beside them say so:
+--
+--     TRANS_KP    1.5  -> 0.75    "cut for the 2x fore/aft thruster upgrade"
+--     ROT_GAIN_YAW 5e-6 -> 1.7e-6 "/3 after ~3x more yaw thrusters"
+--
+-- The vertical channel never got that treatment. More lift thrusters means more
+-- acceleration per step, which raises the vertical loop gain by the same factor, and a loop
+-- whose gain quietly went up by 2x is a loop that hunts. It hunted: VS swinging -5/+5 m/s
+-- on a ~2 s period, in level cruise.
+--
+-- Note what the symptom says about the number. The loop was TRYING TO HOLD ZERO, using
+-- about five of its eight steps to do it, and the aeroplane still reached 5 m/s. If
+-- ALT_SWING really bought 5 m/s, five steps could not have. Full authority is therefore
+-- well above 5, and 10 is the conservative reading of that -- which is also exactly the
+-- "2x the thrusters, half the gain" precedent above.
+--
+-- 10.0 IS AN ESTIMATE FROM THE SYMPTOM, NOT A MEASUREMENT. Measure it and put the real
+-- number here:
+--
+--   1. Calm air, plenty of altitude, AP-ALT OFF so the manual VSC (#6) owns the vertical.
+--   2. Full up on the VS stick, hold it until the climb rate STOPS INCREASING.
+--   3. That steady rate is CLIMB_AT_FULL. Repeat with full down; use the smaller of the two.
+--
+-- Everything below scales off it, so that one measurement retunes the whole channel.
+CFG.CLIMB_AT_FULL = 10.0
 CFG.STEPS_PER_MPS = CFG.ALT_SWING / CFG.CLIMB_AT_FULL
 CFG.ALT_KP      = 0.3
-CFG.CLIMB_MAX   = 0.75 * CFG.CLIMB_AT_FULL
-CFG.DESCEND_MAX = 0.75 * CFG.CLIMB_AT_FULL
-CFG.VEL_KP = 1.0
+
+-- The commanded-rate envelope is deliberately ABSOLUTE now, not 0.75 * CLIMB_AT_FULL.
+-- Correcting the authority above must not silently change how fast the aeroplane is
+-- ALLOWED to climb -- that is a handling decision, and it was 3.75 m/s before this edit and
+-- is 3.75 m/s after it. Raise these on their own if a brisker vertical is wanted.
+CFG.CLIMB_MAX   = 3.75
+CFG.DESCEND_MAX = 3.75
+
+-- The inner climb-rate loop, in STEPS PER m/s OF ERROR.
+--
+-- Expressed as a multiple of STEPS_PER_MPS rather than as a bare number, so that it scales
+-- with the airframe's authority automatically. That is the whole point of this edit: with
+-- VEL_KP written as a constant, correcting CLIMB_AT_FULL fixed the FEEDFORWARD and left the
+-- FEEDBACK at its old, now-doubled loop gain -- half a fix, and the half that hunts.
+--
+-- 0.625 * STEPS_PER_MPS reproduces the historical VEL_KP = 1.0 exactly at CLIMB_AT_FULL =
+-- 5.0, so this expression changed nothing on its own; the authority correction above is
+-- what halves it, to 0.5.
+CFG.VEL_KP_NORM = 0.625
+CFG.VEL_KP = CFG.VEL_KP_NORM * CFG.STEPS_PER_MPS
 CFG.VEL_KI = 0.5
+-- Still 0. pid.lua takes its derivative from the ERROR and does not filter it, so on a rate
+-- loop at 20 Hz this is differenced acceleration with no smoothing -- noise, not damping.
+-- If the loop still hunts after the authority above is measured properly, LOWER VEL_KP_NORM
+-- rather than reaching for this.
 CFG.VEL_KD = 0.0
 CFG.ALT_TRIM_INIT = 0
 CFG.MASS_STEP_THRESHOLD = 50.0
@@ -811,6 +1333,20 @@ CFG.AL_STALE_AFTER = 3.0
 -- The velocity loop's integral is frozen while it applies, so this can never wind up.
 -- 0 disables the down-bias without re-enabling the altitude hold; raise it to press harder.
 CFG.AL_GROUND_VS   = 0.5
+-- CUT THE LIFT ENGINE DEAD once the FMS calls the landing (alState "landed" -- a pad touchdown
+-- or the end of a runway rollout). Both thruster lines go to 0, not to the balanced hover
+-- ALT_NEUTRAL means, so the aeroplane sits on its gear under its own weight instead of being
+-- held there by thrust it is also fighting. This is the reach-over-and-flip-the-ALTITUDE-switch
+-- the pilot has always had to do by hand at touchdown, done automatically and at the right
+-- instant. AL_GROUND_VS above still applies until the cut takes over, and the velocity loop's
+-- integral is frozen through it, so the learnt hover trim is waiting intact for the next
+-- takeoff -- the cut lifts the moment the landing is cancelled/released.
+-- SAFETY: this trusts the FMS's touchdown call completely, so it is only as good as that call.
+-- It is safe today because the pad sequence no longer declares a touchdown from ALTITUDE ALONE
+-- (see LG.PAD_PROBE_M in apconf.lua: a helipad that is only a point in the air is HELD, not
+-- landed on) -- a landing is called by the squat contact or by the craft measurably stopping.
+-- Set false to go back to the standing down-bias and leave the engine to the pilot.
+CFG.AL_GROUND_CUT  = true
 
 -- Link freshness
 CFG.AP_STALE_AFTER = 5.0

@@ -65,9 +65,76 @@ do
             -- airframe whose uacconf predates them dies of nil-arithmetic in controlLoop
             -- rather than at boot -- exactly how #19 was left unbootable by STRAFE_EAGER_*.
             "HAS_ALT_THRUSTER", "FW_PITCH_ENABLE", "FW_PITCH_SIGN", "FW_PITCH_MIN_SPEED",
-            "FW_PITCH_HEADROOM" }) do
+            "FW_PITCH_HEADROOM", "AL_GROUND_CUT",
+            -- Same rule, same reason -- both are read UNCONDITIONALLY every tick (the heading
+            -- bank washout in controlLoop, the float-thrust protocol in sendNav), so a uacconf
+            -- predating them must fail HERE and not mid-turn.
+            "BANK_HDG_KD_WASHOUT", "THRUSTF_PROTOCOL",
+            -- Same rule again (2026-08-20): the horizontal channel now scales off a measured
+            -- authority the way the vertical one does, and these are read on every navigating
+            -- tick. A uacconf predating them must fail HERE, not as a nil-arithmetic crash the
+            -- first time the craft is asked to translate. CFG.ATT_KP_YAW is deliberately NOT
+            -- listed -- uac.lua reads it as `or CFG.ATT_KP`, so absent is a valid answer.
+            "STEPS_PER_MPS_FWD", "STEPS_PER_MPS_LAT", "STRAFE_VEL_KP",
+            -- Same rule again (2026-08-21): the breakaway floor is per-axis now and this half
+            -- is read on every translating tick, so a uacconf predating it must fail HERE.
+            "TRANSLATE_MIN_CMD_FWD",
+            -- Same rule again (2026-08-21), with one difference worth stating: this one is a
+            -- BOOLEAN, so a uacconf predating it would NOT crash -- it would read nil, evaluate
+            -- false, and leave the VS stick's top detent quietly doing nothing at all. That is
+            -- precisely the failure this knob exists to end (the detent used to be sent as
+            -- `vs = 100`, a command this file then silently clamped away to CLIMB_MAX), so a
+            -- missing one has to fail LOUDLY at boot rather than fail invisibly in the air.
+            "MANCON_SCRAMBLE" }) do
         if res[k] == nil then
             error("pid/uacconf.lua is missing CFG." .. k .. " -- the file looks incomplete.", 0)
+        end
+    end
+    -- CONDITIONAL requirement, not a canary (2026-08-21, at the four-way merge). The Smith
+    -- predictor's keys are deliberately NOT in the list above -- absent is a valid answer and
+    -- means "no dead-time compensation", which is what every airframe but #19 wants. But once
+    -- PITCH_SMITH_ENABLE is TRUE the other two are read on every attitude tick, and
+    -- PITCH_SMITH_ACCEL_PER_STEP in particular is read inside attitude() where a nil would be a
+    -- first-tick arithmetic crash. Now that all airframes share one uac.lua this flag is one
+    -- edit away on any of them, so switching it on with a half-filled config must fail HERE.
+    if res.PITCH_SMITH_ENABLE then
+        for _, k in ipairs({ "PITCH_SMITH_TD", "PITCH_SMITH_ACCEL_PER_STEP" }) do
+            if res[k] == nil then
+                error("pid/uacconf.lua sets CFG.PITCH_SMITH_ENABLE but is missing CFG." .. k
+                    .. " -- the pitch Smith predictor needs both.", 0)
+            end
+        end
+    end
+    -- CONDITIONAL requirement, same rule (2026-08-21, Scout #72). The triangular thrust
+    -- allocator's knobs are deliberately NOT in the canary list above: absent is a valid
+    -- answer and means "this airframe has axis thruster banks, not three vectoring nozzles",
+    -- which is every aircraft on the fleet but Scout. But once TRI_ENABLE is true every one
+    -- of these is read on EVERY tick inside sendVector, where a nil is a first-tick
+    -- arithmetic crash, and TRI_ENGINES is read at boot to build the allocation itself. All
+    -- airframes share one uac.lua, so this flag is one edit away on any of them -- switching
+    -- it on with a half-filled config has to fail HERE and name the knob.
+    -- Same conditional rule again (2026-08-22): absent means "no flight data recorder", which
+    -- is every airframe but whichever one is being debugged. Present means all five are read
+    -- on every tick inside LOG.tick.
+    if res.LOG_ENABLE then
+        for _, k in ipairs({ "LOG_FILE", "LOG_DELAY", "LOG_SECONDS", "LOG_EVERY" }) do
+            if res[k] == nil then
+                error("pid/uacconf.lua sets CFG.LOG_ENABLE but is missing CFG." .. k
+                    .. " -- the flight data recorder needs the whole block.", 0)
+            end
+        end
+    end
+    if res.TRI_ENABLE then
+        for _, k in ipairs({ "TRI_PROTOCOL", "TRI_ENGINES", "TRI_HOVER", "TRI_LIFT_PER_ALTSTEP",
+                "TRI_PITCH_PER_STEP", "TRI_ROLL_PER_STEP", "TRI_YAW_PER_STEP",
+                "TRI_LAT_PER_STEP", "TRI_FWD_PER_STEP", "TRI_PITCH_SIGN", "TRI_ROLL_SIGN",
+                "TRI_YAW_SIGN", "TRI_LAT_SIGN", "TRI_FWD_SIGN", "TRI_T_MIN", "TRI_T_MAX",
+                "TRI_W_FLOOR", "TRI_VEC_MAX", "TRI_VEC_MAX_ANGLE", "TRI_VEC_X_SIGN",
+                "TRI_VEC_Y_SIGN" }) do
+            if res[k] == nil then
+                error("pid/uacconf.lua sets CFG.TRI_ENABLE but is missing CFG." .. k
+                    .. " -- the triangular thrust allocator needs the whole block.", 0)
+            end
         end
     end
     CFG = res
@@ -133,6 +200,26 @@ local function makeDither()
         return q
     end
 end
+-- PITCH SMITH PREDICTOR (2026-08-14) -- dead-time compensation for the pitch rate loop.
+-- WHY IT IS NEEDED, measured not assumed: the actuator dead time is ~1 s (pilot timed a 60 deg
+-- step), and the old +/-4 deg limit cycle ran at 4 s = 1.5 rad/s, where 1 s of delay is 86 deg of
+-- phase -- that cycle WAS the dead-time instability, which is why ROT_GAIN 1.6e-4/ATT_KP 0.28 had
+-- to be abandoned. Usable bandwidth without compensation is ~0.3-0.5/tau_d, and the loop sits at
+-- omega_n = 0.25 rad/s, i.e. already at the wall. No gain buys pitch response past this point.
+-- HOW: the plant is an INTEGRATOR (torque -> angular accel -> rate), so the rate the aeroplane
+-- will have once the pipeline drains is the measured rate PLUS every acceleration already
+-- commanded within the last tau_d but not yet felt. Keep those in a ring buffer and add them.
+-- That is a Smith predictor specialised to an integrator plant, and it needs only tau_d and the
+-- accel-per-step -- the latter cancels out here, because the buffer stores the DELIVERED accel
+-- computed from the same ROT_GAIN_PITCH the output used.
+-- **THIS IS THE MOST MODEL-SENSITIVE THING IN THIS FILE. It fails INVISIBLY -- a wrong tau_d
+-- makes the loop trust a wrong prediction rather than doing anything visible on screen. If pitch
+-- gets worse after enabling it, set CFG.PITCH_SMITH_ENABLE = false FIRST, before touching any
+-- gain, and re-measure tau_d.** Display tag "SMI" on the TRIM line shows when it is active.
+local smithBuf, smithIdx, smithSum = {}, 1, 0
+local smithN = (CFG.PITCH_SMITH_ENABLE and CFG.PITCH_SMITH_TD and CFG.PITCH_SMITH_TD > 0)
+    and math.max(1, math.floor(CFG.PITCH_SMITH_TD / 0.05 + 0.5)) or 0
+for i = 1, smithN do smithBuf[i] = 0 end
 local ditherPitch  = makeDither()
 local ditherRoll   = makeDither()
 local ditherYaw    = makeDither()
@@ -263,6 +350,10 @@ local AP_NAV = CFG.AP_NAV_DEFAULT
 local AP_ALT = CFG.AP_ALT_DEFAULT
 local apswLastMsg = nil
 local manVS = 0            -- pilot's wanted climb rate (m/s) from the VSC #6
+-- The VS stick's TOP DETENT (level 15 on the VSC), which is not a rate at all but a discrete
+-- "lift engine to full throttle" -- see CFG.MANCON_SCRAMBLE. Latched from the same packet as
+-- manVS, so manLastMsg ages both and neither can outlive the link.
+local manScramble = false
 local manLastMsg = nil
 local manFwd, manStrafe, manYaw = 0, 0, 0  -- pilot's wanted body velocities (m/s, m/s, rad/s), MIC #14
 local manNavActive  = false                -- MIC reports a key currently held (vs. sticks centred)
@@ -278,6 +369,11 @@ local kj = { pitch = 0, roll = 0, thr = 0, active = false, last = nil }
 -- kj above, and kept at top level (not inside controlLoop) so it survives nothing -- it is
 -- simply the one piece of state the PI needs between ticks.
 local fw = { pitchI = 0 }
+
+-- HYBRID/FIXEDWING heading-bank damper (CFG.BANK_HDG_KD): the WASHOUT reference -- a slow
+-- low-pass of the measured yaw rate. Same table-not-a-local reason as kj/fw above. See the
+-- CFG.BANK_HDG_KD_WASHOUT block for why the damper needs one at all.
+local bnk = { yawWash = 0 }
 
 local AP_ALTI    = nil
 local altLastMsg = nil
@@ -325,7 +421,7 @@ end
 
 -- OUTPUT ----------------------------------------------------------------------
 local outStab   = { front = 0, back = 0, left = 0, right = 0 }
-local outNav    = { thrust = 0, yaw = 0, strafe = 0 }
+local outNav    = { thrust = 0, yaw = 0, strafe = 0, thrustF = 0 }
 local outAlt    = { up = CFG.ALT_NEUTRAL, down = CFG.ALT_NEUTRAL }
 
 -- pitch/roll are signed steps [-15,15]. front/back carry pitch, left/right roll
@@ -349,6 +445,10 @@ end
 
 -- thrust +fwd/-back, yaw +right/-left, strafe +right/-left; all [-15,15].
 local function sendNav(thrust, yaw, strafe)
+    -- ANALOGUE fore/aft demand, captured BEFORE the dither/round below quantises it away.
+    -- Normalised on CFG.THRUST_MAX so the wire units are a plain [-1, 1] regardless of what
+    -- the redstone encoding happens to be worth on this airframe (+1 = full forward).
+    local thrustF = (CFG.THRUST_MAX > 0) and clamp(thrust / CFG.THRUST_MAX, -1, 1) or 0
     if CFG.DITHER then
         thrust = ditherThrust(thrust, -CFG.THRUST_MAX, CFG.THRUST_MAX)
         yaw    = ditherYaw(yaw,       -CFG.YAW_MAX,    CFG.YAW_MAX)
@@ -361,22 +461,43 @@ local function sendNav(thrust, yaw, strafe)
     local fwd, back = 0, 0;      if thrust >= 0 then fwd = thrust else back = -thrust end
     local yawL, yawR = 0, 0;     if yaw >= 0 then yawR = yaw else yawL = -yaw end
     local strL, strR = 0, 0;     if strafe >= 0 then strR = strafe else strL = -strafe end
+    -- VECTOR-NOZZLE AIRFRAME (CFG.TRI_ENABLE): yaw and strafe are not thruster banks here --
+    -- the three nozzles make both, and sendVector has already spent them. The NAVCTRL message
+    -- still goes out because the fore/aft bank IS real and IS on it (#79), but those four
+    -- lines are pinned to zero so a relay wired to them later cannot double-command an axis
+    -- the nozzles are already flying. outNav below keeps the TRUE commands: they are what the
+    -- display reads, and zeroing them there would hide the yaw the craft is actually making.
+    if CFG.TRI_ENABLE then yawL, yawR, strL, strR = 0, 0, 0, 0 end
     rednet.broadcast({
         thrust_forward = fwd, thrust_backward = back,
         yaw_left = yawL, yaw_right = yawR,
         strafe_left = strL, strafe_right = strR,
     }, CFG.NAVCTRL_PROTOCOL)
-    outNav = { thrust = thrust, yaw = yaw, strafe = strafe }
+    -- ...and the same fore/aft command again as ONE signed float, on its own protocol. Purely
+    -- ADDITIVE: the integer NAVCTRL message above is untouched, so every existing relay keeps
+    -- working exactly as before and nothing is required to subscribe to this. What it buys is
+    -- the sub-step resolution the 0-15 redstone lines throw away -- the demand as the control
+    -- law actually computed it, before dither/round -- for anything that can act on an
+    -- analogue value (a proportional drive, a recorder, a gauge).
+    rednet.broadcast({ thrust = thrustF }, CFG.THRUSTF_PROTOCOL)
+    outNav = { thrust = thrust, yaw = yaw, strafe = strafe, thrustF = thrustF }
 end
 
 -- Split the signed vertical command into independent up- and down-thruster levels
 -- (replacing the external splitter box). steps 0 -> both at ALT_NEUTRAL (balanced
 -- hover); +steps drives the up line and backs off the down line, -steps the reverse.
 -- Each line is dithered on its own accumulator and clamped to the full 0..15 range.
-local function sendAlt(steps)
+-- `cut` is the one thing steps cannot say: BOTH LINES TO A FLAT ZERO, i.e. the lift engine
+-- switched OFF. steps 0 is not that -- it is a balanced hover, still burning on both lines --
+-- and on the ground that is exactly what has to stop (see CFG.AL_GROUND_CUT). The dither
+-- accumulators are bypassed rather than fed: they hold at most half a step, so nothing is owed
+-- when the engine comes back.
+local function sendAlt(steps, cut)
     local wantUp, wantDown = CFG.ALT_NEUTRAL + steps, CFG.ALT_NEUTRAL - steps
     local up, down
-    if CFG.DITHER then
+    if cut then
+        up, down = 0, 0
+    elseif CFG.DITHER then
         up   = ditherAltUp(wantUp,     CFG.ALT_MIN, CFG.ALT_MAX)
         down = ditherAltDown(wantDown, CFG.ALT_MIN, CFG.ALT_MAX)
     else
@@ -386,6 +507,352 @@ local function sendAlt(steps)
     rednet.broadcast({ up = up, down = down }, CFG.ALT_PROTOCOL)
     outAlt = { up = up, down = down }
     return up, down
+end
+
+-- TRIANGULAR (VECTOR-NOZZLE) THRUST ALLOCATION -- CFG.TRI_ENABLE ---------------
+-- Scout (#72), and any airframe built the same way. Instead of a separate thruster bank per
+-- axis, the whole craft hangs on THREE down-firing engines on vectoring mounts, placed as a
+-- triangle: front-centre, back-left, back-right. Each engine's control computer takes three
+-- numbers -- gimbal X (-15..15), gimbal Y (-15..15), thrust (0..15) -- so what the UAC has
+-- to send is not five axis commands but three FORCE VECTORS. Pitch, roll, yaw, strafe and
+-- lift all come out of those three nozzles; only fore/aft still has a bank of its own
+-- (CFG.NAVCTRL_PROTOCOL, #79), which is why sendNav is still called on this airframe.
+--
+-- WHY THIS LIVES IN THE UAC AND NOT IN A RELAY. Every other output on this fleet is one axis
+-- translated into redstone by a relay that needs to know nothing else. This is not that: every
+-- axis lands on every engine, and how a demand splits depends on what the OTHER axes are
+-- already spending (an engine held at 15 for lift cannot also make yaw). A relay sees one
+-- channel. Only the controller sees the whole wrench, so only the controller can divide it.
+--
+-- THE MODEL. The body frame is the one the attitude loop already works in: x = starboard
+-- (pitch axis), y = up (yaw axis), z = nose (roll axis). Engine i sits at r_i = (x, y, z)
+-- measured FROM THE CENTRE OF MASS and makes force f_i = (fx, fy, fz):
+--
+--     F = sum f_i                        M = sum r_i x f_i
+--     M_x (pitch) = sum( y_i*fz_i - z_i*fy_i )
+--     M_y (yaw)   = sum( z_i*fx_i - x_i*fz_i )
+--     M_z (roll)  = sum( x_i*fy_i - y_i*fx_i )
+--
+-- Note what the yaw line does NOT contain: y_i. YAW IS MADE ENTIRELY BY THE HORIZONTAL
+-- components and lift/pitch/roll entirely by the vertical ones -- except for the two y_i
+-- terms, which are the pitch/roll moment a sideways push makes about a centre of mass that
+-- is not level with the mounts. That splits the problem into two solves run in a fixed order:
+--
+--   1. HORIZONTAL -- 6 unknowns (fx, fz), 3 equations (strafe, the fore/aft share, yaw).
+--      Three spare degrees of freedom, resolved as the least-effort answer WEIGHTED by how
+--      much thrust each engine is already carrying: an engine burning at 12 lends more
+--      sideways push at the same nozzle angle than one at 3, so it should be asked for more.
+--      The weights choose BETWEEN exact answers and never change the wrench delivered, which
+--      is exactly why last tick's thrusts are a good enough weight and no inner iteration is
+--      needed here.
+--   2. VERTICAL -- 3 unknowns (fy), 3 equations (lift, pitch, roll): exactly determined, once
+--      the pitch/roll moment step 1 has already committed us to (the y_i terms) is subtracted
+--      from the demand.
+--
+-- Step 2 is LINEAR in its three demands, so its three basis solutions are computed ONCE at
+-- boot -- TRI.n (pure lift), TRI.p (pure pitch), TRI.r (pure roll) -- and each tick is three
+-- multiply-adds. TRI.p and TRI.r each sum to ZERO by construction: they move lift between
+-- engines without changing the total. That is what makes the saturation rule below possible.
+--
+-- SATURATION: ATTITUDE OUTRANKS LIFT. When the demands will not fit in 0..15 the differential
+-- (pitch/roll) is kept and the COMMON lift is slid to make room -- a multirotor that loses
+-- lift for a moment sags, and one that loses pitch/roll authority turns over. Only when no
+-- common lift can fit the differential at all is the differential itself scaled, and then by
+-- the exact largest factor that admits a feasible lift, not by bisection.
+--
+-- The nozzles have a finite deflection cone (CFG.TRI_VEC_MAX_ANGLE), so each engine's
+-- horizontal share is finally limited against its own vertical share (tan(cone) * fy) and
+-- what will not fit is DROPPED rather than commanded and quietly not delivered. The attitude
+-- loop then sees the shortfall as a disturbance and answers it on the next tick, which is the
+-- correct behaviour and the reason this code does not try to be cleverer about it.
+--
+-- WHAT GOES ON THE WIRE IS A FLOAT, AND IS NOT ROUNDED HERE. Every other output in this file
+-- dithers to whole redstone steps before broadcasting, because it knows exactly what its
+-- relay will do with the number: one line, 0..15. This one does not know that. The three
+-- engine computers drive their thrusters through an output allocation that is theirs to
+-- choose -- more than one line per axis, peripheral-side relays, whatever the airframe turned
+-- out to need -- so the grid the demand must be quantised ONTO is only known at the far end.
+-- Rounding here would throw away resolution the receiver may well have, and it could never be
+-- got back. So the sigma-delta lives in the engine computers (77/78/80 vecengine.lua) and
+-- this file sends the demand as the allocation computed it. CFG.DITHER does not apply to this
+-- path; it still governs sendStab/sendNav/sendAlt, which do know their relays.
+--
+-- CALIBRATION IS EMPIRICAL, like everything else in this file. Do the TRI_*_SIGN knobs first,
+-- one axis at a time on the ground, watching WHICH ENGINE SPOOLS UP; then the *_PER_STEP
+-- authorities. See the CFG.TRI_ block in uacconf.lua for the order and what each knob means.
+local TRI = { eng = {}, n = {}, p = {}, r = {}, a = {}, w = {}, fx = {}, fy = {}, fz = {},
+              out = {}, sat = 1, cone = 0, hot = 0, tot = 0, cut = false, tanMax = 1 }
+if CFG.TRI_ENABLE then
+    -- Geometry -> the vertical channel's three basis solutions, ONCE. The working locals are
+    -- inside this block so they cost the main chunk no registers (Cobalt counts the main
+    -- chunk's live locals against every nested function -- see the CFG loader's note).
+    local E = CFG.TRI_ENGINES
+    if type(E) ~= "table" or #E ~= 3 then
+        error("CFG.TRI_ENGINES must list exactly three engines (got "
+            .. (type(E) == "table" and #E or type(E)) .. ").", 0)
+    end
+    for i = 1, 3 do
+        local e = E[i]
+        if type(e) ~= "table" or type(e.key) ~= "string"
+            or type(e.x) ~= "number" or type(e.z) ~= "number" then
+            error("CFG.TRI_ENGINES[" .. i .. "] needs key (string) plus x/z (numbers, metres "
+                .. "from the centre of mass).", 0)
+        end
+        TRI.eng[i] = { key = e.key, name = e.name or e.key, x = e.x, y = e.y or 0, z = e.z }
+        TRI.w[i], TRI.a[i] = CFG.TRI_HOVER, 0
+        TRI.fx[i], TRI.fy[i], TRI.fz[i] = 0, 0, 0
+        TRI.out[i] = { x = 0, y = 0, thrust = 0 }
+    end
+    TRI.tanMax = math.tan(CFG.TRI_VEC_MAX_ANGLE)
+    -- A * fy = (lift, pitch, roll), i.e. row 1 = sum fy, row 2 = -sum z*fy, row 3 = sum x*fy.
+    -- Gaussian elimination with partial pivoting rather than a hand-derived adjugate: it runs
+    -- once at boot, so the cost is nothing and the derivation cannot be got wrong.
+    local A = { {  1, 1, 1 },
+                { -TRI.eng[1].z, -TRI.eng[2].z, -TRI.eng[3].z },
+                {  TRI.eng[1].x,  TRI.eng[2].x,  TRI.eng[3].x } }
+    local function solve3(b1, b2, b3)
+        local m = { { A[1][1], A[1][2], A[1][3], b1 },
+                    { A[2][1], A[2][2], A[2][3], b2 },
+                    { A[3][1], A[3][2], A[3][3], b3 } }
+        for c = 1, 3 do
+            local piv, best = c, math.abs(m[c][c])
+            for k = c + 1, 3 do
+                if math.abs(m[k][c]) > best then piv, best = k, math.abs(m[k][c]) end
+            end
+            if best < 1e-9 then return nil end
+            m[c], m[piv] = m[piv], m[c]
+            for k = 1, 3 do
+                if k ~= c then
+                    local f = m[k][c] / m[c][c]
+                    for cc = c, 4 do m[k][cc] = m[k][cc] - f * m[c][cc] end
+                end
+            end
+        end
+        return m[1][4] / m[1][1], m[2][4] / m[2][2], m[3][4] / m[3][3]
+    end
+    TRI.n = { solve3(1, 0, 0) }
+    if TRI.n[1] == nil then
+        error("CFG.TRI_ENGINES is degenerate -- the three mounts lie on one straight line "
+            .. "through the centre of mass, so lift, pitch and roll cannot be told apart. "
+            .. "Check the x/z figures: they are metres FROM THE CoM, not from the hull.", 0)
+    end
+    TRI.p, TRI.r = { solve3(0, 1, 0) }, { solve3(0, 0, 1) }
+    -- Every engine must PUSH to hold a level hover. A non-positive share here means the CoM
+    -- lies outside (or on an edge of) the triangle the mounts make, and no set of down-firing
+    -- thrusts can balance the craft -- worth refusing at boot, because in the air it presents
+    -- as an unkillable pitch or roll bias that no gain will tune out.
+    for i = 1, 3 do
+        if TRI.n[i] <= 0 then
+            error("CFG.TRI_ENGINES: engine '" .. TRI.eng[i].name .. "' would have to pull DOWN "
+                .. "(share " .. string.format("%.3f", TRI.n[i]) .. ") to hold a level hover -- "
+                .. "the centre of mass is not inside the triangle of mounts. Re-measure x/z "
+                .. "from the CoM and check their signs (x = starboard, z = nose).", 0)
+        end
+    end
+end
+
+-- One tick of the allocation. Takes the SAME step commands every other output takes -- so a
+-- sign or gain tuned on the axis-thruster path means the same thing here -- and turns them
+-- into three (gimbal X, gimbal Y, thrust) triplets on CFG.TRI_PROTOCOL. `cut` is the lift
+-- engine switched off (CFG.AL_GROUND_CUT / touchdown): all three engines to a flat zero,
+-- nozzles centred, dither accumulators BYPASSED rather than fed, so nothing is owed when the
+-- engines come back (sendAlt's note applies verbatim).
+local function sendVector(pitch, roll, yaw, strafe, fwd, altSteps, cut)
+    local E = TRI.eng
+    -- ---- the demanded wrench, in engine-units (1 unit = one redstone step on one engine) ----
+    local Fx = CFG.TRI_LAT_SIGN   * strafe * CFG.TRI_LAT_PER_STEP
+    local Fz = CFG.TRI_FWD_SIGN   * fwd    * CFG.TRI_FWD_PER_STEP
+    local My = CFG.TRI_YAW_SIGN   * yaw    * CFG.TRI_YAW_PER_STEP
+    local Mx = CFG.TRI_PITCH_SIGN * pitch  * CFG.TRI_PITCH_PER_STEP
+    local Mz = CFG.TRI_ROLL_SIGN  * roll   * CFG.TRI_ROLL_PER_STEP
+    local L  = 3 * CFG.TRI_HOVER  + altSteps * CFG.TRI_LIFT_PER_ALTSTEP
+    if cut then Fx, Fz, My, Mx, Mz, L = 0, 0, 0, 0, 0, 0 end
+
+    -- ---- 1. HORIZONTAL: least-effort (fx, fz) hitting strafe, fore/aft share and yaw ----
+    -- Lagrange solution of min sum |f_h,i|^2 / w_i subject to the three constraints:
+    --   fx_i = w_i*(L1 + L3*z_i)      fz_i = w_i*(L2 - L3*x_i)
+    -- with the multipliers eliminated by hand down to one division. Sw* are the weighted
+    -- moments of the mount positions; D is the weighted second moment about the weighted
+    -- centroid, so it is positive for any triangle that is not a line (already refused above).
+    local Sw, Swx, Swz, Sq = 0, 0, 0, 0
+    for i = 1, 3 do
+        local w = math.max(TRI.w[i], CFG.TRI_W_FLOOR)
+        TRI.w[i] = w
+        Sw, Swx, Swz = Sw + w, Swx + w * E[i].x, Swz + w * E[i].z
+        Sq = Sq + w * (E[i].x * E[i].x + E[i].z * E[i].z)
+    end
+    local D  = Sq - (Swz * Swz + Swx * Swx) / Sw
+    local L3 = (D > 1e-6) and ((My - (Swz * Fx - Swx * Fz) / Sw) / D) or 0
+    local L1, L2 = (Fx - L3 * Swz) / Sw, (Fz + L3 * Swx) / Sw
+    -- ...and the pitch/roll moment that sideways push has ALREADY committed us to, through
+    -- the height of the mounts above/below the CoM. Zero when e.y is 0 (mounts level with the
+    -- CoM), which is why leaving e.y unset is a safe default rather than an approximation.
+    local dMx, dMz = 0, 0
+    for i = 1, 3 do
+        TRI.fx[i] = TRI.w[i] * (L1 + L3 * E[i].z)
+        TRI.fz[i] = TRI.w[i] * (L2 - L3 * E[i].x)
+        dMx = dMx + E[i].y * TRI.fz[i]
+        dMz = dMz - E[i].y * TRI.fx[i]
+    end
+
+    -- ---- 2. VERTICAL: the pure differential first, then the common lift under it ----
+    -- TRI.a is the attitude part and sums to zero (see TRI.p/TRI.r above): it moves lift
+    -- between engines and adds none. TRI.n * L is the lift part and makes no moment. So the
+    -- band each engine has left for lift is (lo - a_i)/n_i .. (hi - a_i)/n_i, and a common
+    -- lift exists at all only while, for every ordered pair (i, j),
+    --     s*(n_i*a_j - n_j*a_i) <= n_i*hi - n_j*lo.
+    -- Take the tightest of those six as the attitude scale rather than bisecting for it --
+    -- this is on the 20 Hz path, and a scale that is exact never chatters.
+    local lo, hi, s = CFG.TRI_T_MIN, CFG.TRI_T_MAX, 1
+    for i = 1, 3 do TRI.a[i] = (Mx - dMx) * TRI.p[i] + (Mz - dMz) * TRI.r[i] end
+    for i = 1, 3 do
+        for j = 1, 3 do
+            local c = TRI.n[i] * TRI.a[j] - TRI.n[j] * TRI.a[i]
+            if c > 1e-9 then s = math.min(s, (TRI.n[i] * hi - TRI.n[j] * lo) / c) end
+        end
+    end
+    s = clamp(s, 0, 1)
+    local Lmin, Lmax = -math.huge, math.huge
+    for i = 1, 3 do
+        TRI.a[i] = TRI.a[i] * s
+        Lmin = math.max(Lmin, (lo - TRI.a[i]) / TRI.n[i])
+        Lmax = math.min(Lmax, (hi - TRI.a[i]) / TRI.n[i])
+    end
+    local Lu = clamp(L, Lmin, math.max(Lmin, Lmax))
+    for i = 1, 3 do TRI.fy[i] = clamp(Lu * TRI.n[i] + TRI.a[i], lo, hi) end
+
+    -- ---- 3. cone limit, magnitude, nozzle angles, dither, wire ----
+    local msg = { cut = cut or false }
+    TRI.cone, TRI.hot, TRI.tot, TRI.cut, TRI.sat = 0, 0, 0, cut or false, s
+    for i = 1, 3 do
+        local fy, fx, fz = TRI.fy[i], TRI.fx[i], TRI.fz[i]
+        -- Deflection cone: the nozzle cannot make more sideways force than tan(cone) times
+        -- what it is making downwards. Scale fx and fz TOGETHER so the direction of the push
+        -- survives and only its size is cut.
+        local h, hmax = math.sqrt(fx * fx + fz * fz), fy * TRI.tanMax
+        if h > hmax then
+            local k = (h > 1e-9) and (hmax / h) or 0
+            fx, fz = fx * k, fz * k
+            TRI.cone = TRI.cone + 1
+        end
+        local T = math.sqrt(fx * fx + fy * fy + fz * fz)
+        if T > hi then                       -- a tilted engine's MAGNITUDE can exceed the
+            local k = hi / T                 -- ceiling even with fy inside it
+            fx, fy, fz, T = fx * k, fy * k, fz * k, hi
+            TRI.hot = TRI.hot + 1
+        end
+        TRI.fx[i], TRI.fy[i], TRI.fz[i] = fx, fy, fz
+        -- Nozzle angles: the tilt of the thrust line away from straight down, resolved onto
+        -- the two gimbal axes and measured AGAINST THE VERTICAL COMPONENT -- so an engine
+        -- asked for a big sideways push while barely burning reads the large angle it really
+        -- needs, instead of a small one scaled off full thrust. "tan" law: the command is
+        -- proportional to the force RATIO instead of to the angle; which of the two the
+        -- hardware wants is a calibration, see CFG.TRI_VEC_LAW.
+        local gx, gz
+        if CFG.TRI_VEC_LAW == "tan" then
+            gx = ((fy > 1e-6) and (fx / fy) or 0) / TRI.tanMax * CFG.TRI_VEC_MAX
+            gz = ((fy > 1e-6) and (fz / fy) or 0) / TRI.tanMax * CFG.TRI_VEC_MAX
+        else
+            gx = atan2(fx, fy) / CFG.TRI_VEC_MAX_ANGLE * CFG.TRI_VEC_MAX
+            gz = atan2(fz, fy) / CFG.TRI_VEC_MAX_ANGLE * CFG.TRI_VEC_MAX
+        end
+        local cx, cy = CFG.TRI_VEC_X_SIGN * gx, CFG.TRI_VEC_Y_SIGN * gz
+        if CFG.TRI_VEC_SWAP then cx, cy = cy, cx end
+        -- CLAMPED but NOT ROUNDED (see the header). The band still has to be enforced here --
+        -- a gimbal command outside +/-TRI_VEC_MAX is not a degraded flight, it is a number the
+        -- engine computer has no legal output for -- but the fraction inside the band is the
+        -- receiver's to spend, so it travels intact.
+        local ox, oy, ot
+        if cut then
+            ox, oy, ot = 0, 0, 0
+        else
+            ox = clamp(cx, -CFG.TRI_VEC_MAX, CFG.TRI_VEC_MAX)
+            oy = clamp(cy, -CFG.TRI_VEC_MAX, CFG.TRI_VEC_MAX)
+            ot = clamp(T, 0, hi)
+        end
+        TRI.out[i].x, TRI.out[i].y, TRI.out[i].thrust = ox, oy, ot
+        msg[E[i].key] = { x = ox, y = oy, thrust = ot }
+        TRI.tot = TRI.tot + ot
+        TRI.w[i] = fy                        -- weight for next tick's horizontal split
+    end
+    rednet.broadcast(msg, CFG.TRI_PROTOCOL)
+end
+
+-- FLIGHT DATA RECORDER (CFG.LOG_ENABLE) ---------------------------------------
+-- Writes one CSV row per control tick to CFG.LOG_FILE, so a fault can be read off a
+-- time-aligned record instead of off a 20 Hz screen. The screen shows the same numbers, but
+-- not simultaneously and not at a rate anyone can transcribe -- and the question this exists
+-- to answer ("does the kick appear first in the COMMAND, in the LIFT, or only in the ENGINE
+-- OUTPUTS?") can only be answered by columns that share a timestamp.
+--
+-- It waits CFG.LOG_DELAY seconds after boot before opening the file, so the first moments --
+-- peripherals attaching, the first nav/altitude packets arriving, the trim integral starting
+-- from zero -- do not fill the record with a transient nobody asked about. It then records for
+-- CFG.LOG_SECONDS and STOPS, closing the file, because an unbounded log on a computer with a
+-- fixed disk quota eventually fails a write mid-flight and takes the controller with it.
+--
+-- Everything here is off unless CFG.LOG_ENABLE is set, and no other airframe's uacconf has it.
+local LOG = { state = "off", t0 = nil, tRec = nil, n = 0, fh = nil, skip = 0, why = nil }
+LOG.HEAD = "t,pitch,roll,wx,wz,errP,errR,rotRaw,pStep,rStep,yStep,integP,integR,"
+    .. "posY,velY,desVelY,vertEff,altSteps,tiltUp,thrCmd,strCmd,"
+    .. "L,sat,cone,hot,fcx,fcy,fct,blx,bly,blt,brx,bry,brt,idle,apN,apA,phase"
+
+-- Called at the END of every control tick, once ui is published and the commands are final.
+-- Takes the four values that are controlLoop locals (and so are not on ui) as arguments
+-- rather than having controlLoop publish them: this file is already close to Cobalt's
+-- 200-locals ceiling and ui lookups in the hot path are not free either.
+function LOG.tick(now, pStep, rStep, yStep, altSteps)
+    if not CFG.LOG_ENABLE or LOG.state == "done" or LOG.state == "fail" then return end
+    LOG.t0 = LOG.t0 or now
+    if now - LOG.t0 < CFG.LOG_DELAY then
+        LOG.state, LOG.wait = "wait", CFG.LOG_DELAY - (now - LOG.t0)
+        return
+    end
+    if LOG.state ~= "rec" then                      -- first tick past the delay: open the file
+        local ok, h = pcall(fs.open, CFG.LOG_FILE, "w")
+        if not ok or not h then
+            LOG.state, LOG.why = "fail", "cannot open " .. tostring(CFG.LOG_FILE)
+            return
+        end
+        LOG.fh, LOG.state, LOG.tRec = h, "rec", now
+        h.writeLine(LOG.HEAD)
+    end
+    -- Decimate BEFORE the row is built, not after: string.format on 38 values every tick is
+    -- the expensive part, and CFG.LOG_EVERY exists to make it cheaper on a busy computer.
+    LOG.skip = LOG.skip + 1
+    if LOG.skip < CFG.LOG_EVERY then return end
+    LOG.skip = 0
+    local o1, o2, o3 = TRI.out[1], TRI.out[2], TRI.out[3]
+    local okw = pcall(LOG.fh.writeLine, string.format(
+        "%.2f,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%.0f,%.3f,%.3f,%.3f,%.4f,%.4f,"
+        .. "%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+        .. "%.2f,%.3f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%s",
+        now - LOG.tRec,
+        math.deg(ui.pitch or 0), math.deg(ui.roll or 0), ui.wx or 0, ui.wz or 0,
+        ui.errPitch or 0, ui.errRoll or 0, ui.rotRaw or 0,
+        pStep or 0, rStep or 0, yStep or 0, ui.integP or 0, ui.integR or 0,
+        ui.posY or 0, ui.velY or 0, ui.desVelY or 0, ui.vertEff or 0, altSteps or 0,
+        ui.tiltUp or 1, ui.thr or 0, ui.str or 0,
+        TRI.tot or 0, TRI.sat or 1, TRI.cone or 0, TRI.hot or 0,
+        o1 and o1.x or 0, o1 and o1.y or 0, o1 and o1.thrust or 0,
+        o2 and o2.x or 0, o2 and o2.y or 0, o2 and o2.thrust or 0,
+        o3 and o3.x or 0, o3 and o3.y or 0, o3 and o3.thrust or 0,
+        ui.idle and 1 or 0, ui.apNav and 1 or 0, ui.apAlt and 1 or 0,
+        (tostring(ui.phase or "-"):gsub(",", ";"))))
+    if not okw then
+        -- A failed write is almost always the disk quota. Close what we have rather than
+        -- retrying every tick: a partial log is still readable, and a controller that spends
+        -- its tick budget on failing writes is a worse problem than a short record.
+        LOG.state, LOG.why = "fail", "write failed at row " .. LOG.n .. " (disk full?)"
+        pcall(LOG.fh.close)
+        return
+    end
+    LOG.n = LOG.n + 1
+    LOG.pct = (now - LOG.tRec) / CFG.LOG_SECONDS
+    if now - LOG.tRec >= CFG.LOG_SECONDS then
+        pcall(LOG.fh.close)
+        LOG.state = "done"
+    end
 end
 
 -- ATTITUDE --------------------------------------------------------------------
@@ -474,14 +941,35 @@ local function attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitch
     wx, wy, wz = wx * CFG.PITCH_RATE_SIGN, wy * CFG.YAW_RATE_SIGN, wz * CFG.ROLL_RATE_SIGN
 
     -- Integral trim (body frame), rate-gated so it can't pump a manoeuvre (integStep).
+    -- PITCH always. YAW and ROLL are OPT-IN and default OFF, which is what the two commented
+    -- -out lines they replace amounted to -- absent knob = nil = false = the behaviour every
+    -- airframe on this fleet has had. The reason they were off is not recorded anywhere, so
+    -- they are made reachable rather than simply switched on.
+    --
+    -- WHY ROLL WANTS IT ON A MULTIROTOR (Scout, 2026-08-22): with no integral the axis can
+    -- only answer a standing moment with a standing ERROR, and on a craft whose lift vector
+    -- IS its attitude, a standing roll error is a standing sideways acceleration that nothing
+    -- ever cancels. Measured off 201 samples of hover: errR held +0.0125 rad (+0.72 deg) with
+    -- integR flat at exactly 0.0000, which is 11*sin(0.72deg) = 0.14 m/s^2 of permanent
+    -- sideways push -- the aircraft crept, and no gain could have stopped it. Pitch, which
+    -- does have the integral, sat at errP +0.0001 with integP holding a steady 0.0177 on the
+    -- same flight: the mechanism works, roll just was not allowed to use it.
     if CFG.ATT_INTEGRAL then
         attIntegX = integStep(attIntegX, ex, wx, dt, idle)
-        --attIntegY = integStep(attIntegY, ey, wy, dt, idle)
-        --attIntegZ = integStep(attIntegZ, ez, wz, dt, idle)
+        if CFG.ATT_INTEGRAL_YAW  then attIntegY = integStep(attIntegY, ey, wy, dt, idle) end
+        if CFG.ATT_INTEGRAL_ROLL then attIntegZ = integStep(attIntegZ, ez, wz, dt, idle) end
     end
     local biasX = CFG.ATT_INTEGRAL and attIntegX or 0
     local biasY = CFG.ATT_INTEGRAL and attIntegY or 0
     local biasZ = CFG.ATT_INTEGRAL and attIntegZ or 0
+
+    -- SMITH PREDICTION on the pitch rate only: add the acceleration already commanded within the
+    -- last tau_d but not yet felt, so the rate loop sees where the aeroplane WILL be rather than
+    -- where it was a dead time ago. smithSum is a running sum of buffered accels (rad/s^2), so
+    -- smithSum*dt is the rate change still in the pipeline. Zero-length buffer = exact no-op.
+    local wxUse = wx
+    if smithN > 0 then wxUse = wx + smithSum * dt end
+    ui.smith = (smithN > 0) and (wxUse - wx) or nil
 
     local px, py, pz   -- body-frame command (pitch, yaw, roll), pre-sign/clamp
     if CFG.ATT_MODE == "INERTIA" then
@@ -499,12 +987,23 @@ local function attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitch
         -- profile turns error into a desired RATE that a high-inertia axis can still
         -- brake from (so yaw doesn't overshoot/spin); inner P(D) tracks that rate,
         -- plus the integral trim as an accel bias.
-        local wdx = profileRate(ex, CFG.ATT_KP, CFG.MAX_RATE_PITCH, CFG.MAX_DECEL_PITCH)
+        -- PITCH and ROLL get their OWN outer gains where the config supplies them (nil =>
+        -- CFG.ATT_KP, so this is a no-op on any airframe that does not set them). Same hook and
+        -- same reason as CFG.ATT_KP_YAW below and #19's CFG.ATT_KP_PITCH: ATT_KP sets the
+        -- cascade's DAMPING RATIO, zeta = 0.5*sqrt(G/ATT_KP), and the three axes hang off three
+        -- different thruster sets with three different G. One shared number cannot damp them all.
+        local wdx = profileRate(ex, CFG.ATT_KP_PITCH or CFG.ATT_KP, CFG.MAX_RATE_PITCH, CFG.MAX_DECEL_PITCH)
         -- Manual yaw held -> the pilot NAMES the yaw rate; feed it straight to the rate loop and
         -- skip the heading profile (no ramp to chase = no counter-steer overshoot). Else profile.
-        local wdy = manYawRate or bankYawRate or profileRate(ey, CFG.ATT_KP, CFG.MAX_RATE_YAW, CFG.MAX_DECEL_YAW)
-        local wdz = profileRate(ez, CFG.ATT_KP, CFG.MAX_RATE_ROLL,  CFG.MAX_DECEL_ROLL)
-        local rex, rey, rez = wdx - wx, wdy - wy, wdz - wz
+        -- YAW gets its OWN outer gain where the config supplies one (nil => CFG.ATT_KP, so
+        -- this is a no-op on any airframe that does not set it). Same hook, same reason, as
+        -- #19's CFG.ATT_KP_PITCH: ATT_KP sets the cascade's DAMPING RATIO
+        -- (zeta = 0.5*sqrt(G/ATT_KP)), and a yaw axis with this much inertia has a completely
+        -- different G from pitch and roll, which one shared number cannot express.
+        local wdy = manYawRate or bankYawRate
+            or profileRate(ey, CFG.ATT_KP_YAW or CFG.ATT_KP, CFG.MAX_RATE_YAW, CFG.MAX_DECEL_YAW)
+        local wdz = profileRate(ez, CFG.ATT_KP_ROLL or CFG.ATT_KP, CFG.MAX_RATE_ROLL,  CFG.MAX_DECEL_ROLL)
+        local rex, rey, rez = wdx - wxUse, wdy - wy, wdz - wz   -- pitch uses the predicted rate
         local ax = CFG.RATE_KP*rex     + CFG.ATT_KI*biasX
         local ay = CFG.RATE_KP_YAW*rey + CFG.ATT_KI*biasY - (yawBrake or 0)*wy
         local az = CFG.RATE_KP*rez     + CFG.ATT_KI*biasZ
@@ -583,6 +1082,32 @@ local function attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitch
     local yawSteps   = clamp(CFG.YAW_SIGN * py, -CFG.YAW_MAX, CFG.YAW_MAX) * yawScale
     local pitchSteps = clamp(CFG.PITCH_SIGN * px + CFG.YAW_TO_PITCH_FF * yawSteps, -CFG.STAB_MAX, CFG.STAB_MAX)
     local rollSteps  = clamp(CFG.ROLL_SIGN  * pz + CFG.YAW_TO_ROLL_FF  * yawSteps, -CFG.STAB_MAX, CFG.STAB_MAX)
+    -- Feed the predictor the accel this tick's output will ACTUALLY deliver, not the demanded
+    -- one: pitchSteps is clamped to STAB_MAX, and buffering an unachievable demand would have
+    -- the predictor expect a rate the aeroplane never reaches -- the loop would then back off
+    -- while still saturated, which is precisely the windup pattern this file keeps rediscovering.
+    -- The saturation ratio is taken against the pre-clamp command, so the accel-per-step
+    -- calibration cancels and only ROT_GAIN_PITCH's own consistency matters.
+    -- CRITICAL: the buffered accel must come from the OUTPUT STEPS times a MEASURED accel-per-
+    -- step, NOT from axCmd. axCmd is the accel the loop DEMANDS, and ROT_GAIN_PITCH is a tuned
+    -- LOOP GAIN, not an absolute calibration -- ROT_GAIN_PITCH*Ix = 12.88 steps per rad/s^2
+    -- implies 0.078 rad/s^2 per step, while the limit-cycle measurement says the real figure is
+    -- ~0.008. Feeding axCmd would therefore have the predictor expect **~10x** the rate the
+    -- aeroplane actually develops, which is the one error mode that makes a Smith predictor
+    -- worse than no predictor at all. Using steps x CFG.PITCH_SMITH_ACCEL_PER_STEP keeps the
+    -- prediction on a physically measurable constant and drops ROT_GAIN_PITCH out entirely.
+    -- Sign: pitchSteps is in the OUTPUT convention, so multiply back by CFG.PITCH_SIGN to get
+    -- the accel in the loop's internal frame, the same frame wx lives in.
+    -- Reading the OUTPUT also makes this correct in PD mode and through saturation for free:
+    -- pitchSteps is already clamped to STAB_MAX, so an unachievable DEMAND is never buffered --
+    -- which would otherwise have the predictor expect a rate the aeroplane cannot reach and back
+    -- the loop off while still saturated, the windup pattern this file keeps rediscovering.
+    if smithN > 0 then
+        local deliv = CFG.PITCH_SIGN * pitchSteps * CFG.PITCH_SMITH_ACCEL_PER_STEP
+        smithSum = smithSum - smithBuf[smithIdx] + deliv
+        smithBuf[smithIdx] = deliv
+        smithIdx = smithIdx % smithN + 1
+    end
     return pitchSteps, rollSteps, yawSteps
 end
 
@@ -824,6 +1349,12 @@ local function controlLoop()
         --     instead of strafing. See CFG.BANK_XTK_SIGN (a calibration GUESS).
         -- pitch tracks the desired climb rate. All are slewed for a smooth roll/pitch in/out.
         local bankTarget, pitchTarget = 0, 0
+        -- WASHOUT REFERENCE for the heading-error bank's rate damping, stepped EVERY tick --
+        -- not inside the bankSteer block -- so it never goes stale across a pad phase, an
+        -- autoland, or a MODE button press and then dumps a fake "transient" into the first
+        -- banking tick after it. See CFG.BANK_HDG_KD_WASHOUT.
+        bnk.yawWash = bnk.yawWash + (CFG.YAW_RATE_SIGN * w.y - bnk.yawWash)
+            * clamp(dt / math.max(CFG.BANK_HDG_KD_WASHOUT, dt), 0, 1)
         if bankSteer then
             -- Heading-error bank: zero on a tracked course. For a turn-RATE bank instead
             -- (banks during ANY yaw, incl. pilot yaw), use CFG.BANK_PER_YAWERR * w.y here.
@@ -852,7 +1383,37 @@ local function controlLoop()
                 and clamp((dist - CFG.BANK_HDG_FADE_NEAR) / (CFG.BANK_HDG_FADE_FAR - CFG.BANK_HDG_FADE_NEAR), 0, 1)
                 or 1
             local hErr  = wrapPi(desiredHeading - heading)
-            bankTarget  = clamp((CFG.BANK_PER_YAWERR * hErr - CFG.BANK_HDG_KD * (CFG.YAW_RATE_SIGN * w.y)) * hdgBankFade,
+            -- DAMP THE RATE TRANSIENT, NOT THE STEADY TURN RATE (2026-08-19). The term below
+            -- used to subtract the RAW yaw rate, which is right for a heading CAPTURE (whose
+            -- steady state is wings level, rate 0) and wrong for a curved PATH (whose steady
+            -- state is a sustained rate). On an arc the loop settles where
+            --   bank = BANK_PER_YAWERR*hErr - BANK_HDG_KD * GRAVITY*tan(bank)/v
+            -- so the damper never stops pulling: it stands a permanent droop of
+            -- BANK_HDG_KD*GRAVITY*tan(bank)/v rad off the commanded bank, and because it
+            -- divides by SPEED that droop GROWS as the FMS slows for a corner -- i.e. it bites
+            -- hardest exactly where the most bank is needed. At 120 m/s cruise it costs 0.11 of
+            -- 0.785 rad (14%, which is what it was tuned against and why it looked healthy);
+            -- at the 51/35/23 m/s Mantine's FMS schedules for the QATON/QETAM/BAZRA corners of
+            -- WAU-BZR it costs 0.26/0.37/0.58 rad -- 33%/47%/74% of the ENTIRE bank authority.
+            -- Holding the planned 45 deg at 23 m/s would have needed hErr = 134 deg, which pure
+            -- pursuit to a 400 m carrot can never present, so the craft simply banked ~30 deg,
+            -- flew every corner 2-3x wide, and read to the pilot as "it will not turn".
+            -- Fix: high-pass (wash out) the rate before damping with it. bnk.yawWash is a slow
+            -- low-pass of the same rate, so (rate - yawWash) is the CHANGE in turn rate:
+            --   * settled on an arc -> yawWash has caught up -> term ~0 -> no droop, full
+            --     bank authority, the corner radius the FMS planned is reachable.
+            --   * rolling in, overshooting the heading, or ringing -> the rate is moving faster
+            --     than the filter -> the term is live and damps exactly as before.
+            --   * heading capture -> the rate decays to 0 and so does yawWash, so the end state
+            --     is identical to the old law. This is the standard yaw-damper washout, and it
+            --     is why the FIX IS THE FILTER, not a smaller BANK_HDG_KD: lowering the gain
+            --     would trade the droop straight back for the ringing it was raised to cure.
+            -- Bench: 97% of the damping survives a 0.4 Hz ring; a sustained turn's droop is
+            -- gone within ~5 s. VTOL never sets bankSteer, so this whole block is inert there
+            -- -- carried anyway so the four UACs stay one file apart from their conf.
+            -- CFG.BANK_HDG_KD_WASHOUT -> huge reproduces the old (drooping) behaviour exactly.
+            bankTarget  = clamp((CFG.BANK_PER_YAWERR * hErr
+                    - CFG.BANK_HDG_KD * (CFG.YAW_RATE_SIGN * w.y - bnk.yawWash)) * hdgBankFade,
                 -CFG.BANK_MAX, CFG.BANK_MAX)
             local latBank = CFG.BANK_XTK_SIGN * CFG.BANK_PER_LAT * lastLatDemand
             if hasLeg then   -- rate damping to settle the banking sway; survives P saturation
@@ -931,9 +1492,25 @@ local function controlLoop()
             local vsCmd = clamp(lastDesiredVelY, -vsMax, vsMax)
             ui.fwVsCap = (vsCmd ~= lastDesiredVelY)   -- display: speed protection is limiting us
             local vsErr = vsCmd - vel.y
+            -- THE TRIM TERM HAS A DIFFERENT SPEED LAW FROM THE OTHER TWO (pilot, 2026-08-14):
+            -- "at faster airspeed the airframe only needs a small nose-up to stay level, at
+            -- slower speed it requires greater nose-up". Correct, and the law had it wrong.
+            -- FF*vsCmd and KP*vsErr are FLIGHT PATH ANGLES -- vs/V -- so dividing by vRef once
+            -- is exactly right for them. KI*fw.pitchI is an ANGLE-OF-ATTACK TRIM, and for
+            -- constant lift C_L ~ 1/V^2, so trim AoA falls as 1/V^2, NOT 1/V. All three were
+            -- sharing one divisor because the law was written when pitch was believed to buy
+            -- nothing but flight path angle -- the same disproven assumption behind the
+            -- geometric feedforward and the thrust-borne-plant detour.
+            -- Scaled by TRIM_VNOM so the law is IDENTICAL at that speed and the already-learnt
+            -- integral carries over unchanged; only the off-cruise behaviour differs (at 20 m/s
+            -- the trim is now 6.25x its cruise value instead of 2.5x). The `or vRef` fallback
+            -- reproduces the OLD law exactly when the key is absent, so this is a no-op on any
+            -- airframe whose config does not define it.
+            local trimAng = CFG.FW_PITCH_KI * fw.pitchI
+                * (CFG.FW_PITCH_TRIM_VNOM or vRef) / (vRef * vRef)
             local gamma = (CFG.FW_PITCH_FF * vsCmd
-                + CFG.FW_PITCH_KP * vsErr
-                + CFG.FW_PITCH_KI * fw.pitchI) / vRef
+                + CFG.FW_PITCH_KP * vsErr) / vRef + trimAng
+            ui.fwTrimDeg = math.deg(trimAng)   -- published here: trimAng only exists in this branch
             pitchTarget = clamp(gamma, -CFG.FW_PITCH_MAX, CFG.FW_PITCH_MAX)
             -- Integrate only when the command is inside its clamp, or when the error is pushing
             -- it back toward the clamp -- the same conditional-integration anti-windup the speed
@@ -947,7 +1524,39 @@ local function controlLoop()
             if idle then
                 fw.pitchI = fw.pitchI * CFG.ATT_I_IDLE_BLEED
             elseif vsCmd ~= lastDesiredVelY then
-                fw.pitchI = fw.pitchI * CFG.ATT_I_IDLE_BLEED
+                -- SPEED PROTECTION ACTIVE: FREEZE, DO NOT BLEED (fixed 2026-08-14).
+                -- This branch used to decay the trim at ATT_I_IDLE_BLEED (0.95/tick, a ~1 s time
+                -- constant). It fires whenever the cap bites, i.e. for ANY altitude error over
+                -- ~122 m at cruise (vsMax = 0.27*0.45*50 = 6.1 m/s against desiredVelY =
+                -- ALT_KP*error), so EVERY large altitude change DESTROYED the vertical trim and
+                -- held it at zero for the whole approach -- leaving only FF+KP with nothing
+                -- compensating the airframe's trim angle of attack. Reported as "climb/descend
+                -- rate is inadequate": it was climbing on geometry alone with the learnt trim
+                -- deleted underneath it.
+                -- The reason NOT to integrate here is that the error is measured against a rate
+                -- we deliberately chose not to ask for -- that is an argument for FREEZING, not
+                -- for discarding a trim that is still true. Same distinction the vertical
+                -- cascade already makes for velPID ("Freeze, don't bleed: the hover lift is a
+                -- real value wanted at the next takeoff"). Windup is still prevented, because
+                -- freezing stops accumulation just as effectively.
+                --
+                -- ...BUT A PLAIN FREEZE LOCKS IN AN ALREADY-WOUND-UP TRIM, which is worse than
+                -- the bleed it replaced (found 2026-08-14, same day). Failure it caused: with a
+                -- target ABOVE the aeroplane's lift ceiling, vsErr stays positive indefinitely,
+                -- fw.pitchI winds to FW_PITCH_I_LIMIT (0.05*300/50 = 0.30 rad = 17 deg of
+                -- standing nose-up), and the clamp-based anti-windup below never fires because
+                -- 17 deg sits well inside FW_PITCH_MAX (26 deg) -- it can only see the COMMAND
+                -- saturating, never the AEROPLANE saturating. Then a descent demand of a few
+                -- degrees cannot out-vote 17 deg of trim, so it keeps climbing whatever you
+                -- select: the "pins at 300..320 regardless of the set altitude" symptom.
+                -- ONE-DIRECTIONAL INTEGRATION is the correct anti-windup: never let it GROW
+                -- while the demand is capped, but ALWAYS let it unwind toward zero, so a trim
+                -- learnt against an unachievable demand can always be given back.
+                local d = vsErr * dt
+                if d * fw.pitchI < 0 then     -- moving toward zero: allow it
+                    fw.pitchI = clamp(fw.pitchI + d, -CFG.FW_PITCH_I_LIMIT, CFG.FW_PITCH_I_LIMIT)
+                end
+
             elseif pitchTarget == gamma or (gamma - pitchTarget) * vsErr < 0 then
                 fw.pitchI = clamp(fw.pitchI + vsErr * dt, -CFG.FW_PITCH_I_LIMIT, CFG.FW_PITCH_I_LIMIT)
             end
@@ -964,6 +1573,7 @@ local function controlLoop()
             fw.pitchI = fw.pitchI * CFG.ATT_I_IDLE_BLEED
         end
         ui.fwPitch, ui.fwPitchI = (fwPitch and not alGrounded), fw.pitchI
+        ui.fwTrimPct = 100 * fw.pitchI / CFG.FW_PITCH_I_LIMIT   -- ui.fwTrimDeg set where trimAng lives
         -- ---- KEYBOARD JOYSTICK (#21): the stick OWNS the attitude setpoint ----
         -- REPLACES the coordinated/cross-track bank and climb pitch above, never adds to
         -- them. Blending would recreate exactly the two-terms-fighting-over-one-bankTarget
@@ -1077,12 +1687,51 @@ local function controlLoop()
                 local sinH, cosH = math.sin(heading), math.cos(heading)
                 local fwdErr   = velErrX * sinH + velErrZ * cosH
                 local rightErr = velErrZ * sinH - velErrX * cosH   -- matches xtk handedness
-                local fwdCmd   = CFG.TRANS_KP * fwdErr
-                local rightCmd = CFG.STRAFE_KP * rightErr
+                -- INVERSE-PLANT FEEDFORWARD + trim, the shape the vertical cascade uses
+                -- (CFG.STEPS_PER_MPS * desiredVelY + velPID:step(...)). The first term is the
+                -- commanded velocity vector projected into the body frame and multiplied by the
+                -- steps that buy one m/s, so on its own it already commands very nearly the
+                -- right thrust; TRANS_KP/STRAFE_VEL_KP are left only trimming what it misses.
+                -- Without it this law -- which is what flies the FMS's en-route CARROT, i.e.
+                -- the normal cruise law -- was a bare P with no integral, and had to stand a
+                -- 20 m/s speed error just to hold full thrust. See CFG.SPEED_AT_FULL.
+                local fwdCmd   = CFG.STEPS_PER_MPS_FWD * (desiredSpeed * (ux * sinH + uz * cosH))
+                    + CFG.TRANS_KP * fwdErr
+                local rightCmd = CFG.STEPS_PER_MPS_LAT * (desiredSpeed * (uz * sinH - ux * cosH))
+                    + CFG.STRAFE_VEL_KP * rightErr
                 local mag = math.sqrt(fwdCmd*fwdCmd + rightCmd*rightCmd)
-                if dist > CFG.TRANSLATE_DEADZONE and closing < CFG.TRANSLATE_MIN_RATE
-                        and mag > 1e-6 and mag < CFG.TRANSLATE_MIN_CMD then
-                    local k = CFG.TRANSLATE_MIN_CMD / mag
+                -- BREAKAWAY FLOOR (CFG.TRANSLATE_MIN_CMD / _FWD). Two changes, 2026-08-21,
+                -- both from "Aer Togekiss rocks fore-aft when it should be making minuscule
+                -- adjustments", traced to this block commanding +/-15 of #69's 45 A-units.
+                --
+                -- (1) PER-AXIS. One floor in STEP units cannot mean the same thing on both
+                -- axes: a step is SPEED_AT_FULL/THRUST_MAX of fore/aft demand but only
+                -- STRAFE_AT_FULL/STRAFE_MAX of lateral, and on Aer Togekiss those differ
+                -- EIGHTFOLD (21.3 vs 2.67 m/s per step). The old flat 5.0 was therefore a
+                -- sane 13 m/s nudge sideways and a 107 m/s LUNGE fore/aft. The floor is now
+                -- blended along the demand's OWN direction, so it still scales the magnitude
+                -- and preserves the direction (which is the point of a vector boost -- a
+                -- per-axis clamp would steer the craft off the bearing it wants) while
+                -- meaning the same physical nudge whichever way it points.
+                --
+                -- (2) FADE, NOT A SWITCH. `closing < MIN_RATE` was a relay: at 0.349 m/s the
+                -- command was the full floor and at 0.351 whatever the PID said, with nothing
+                -- in between. An equilibrium sitting on that switching surface cannot do
+                -- anything BUT limit-cycle -- kick, accelerate through MIN_RATE, boost drops,
+                -- coast, overshoot, closing goes negative, kick the other way. That is the
+                -- rocking. Fading the boost out as the closing rate comes up to MIN_RATE keeps
+                -- the breakaway at a standstill (need = 1 at closing <= 0, so drifting AWAY
+                -- still gets the full floor) and reaches MIN_RATE continuously.
+                local floorCmd = CFG.TRANSLATE_MIN_CMD
+                if mag > 1e-6 then
+                    local uf, ul = fwdCmd / mag, rightCmd / mag
+                    floorCmd = math.sqrt((uf * CFG.TRANSLATE_MIN_CMD_FWD) ^ 2
+                                       + (ul * CFG.TRANSLATE_MIN_CMD) ^ 2)
+                end
+                if dist > CFG.TRANSLATE_DEADZONE and mag > 1e-6 and mag < floorCmd then
+                    local need = clamp((CFG.TRANSLATE_MIN_RATE - closing)
+                        / math.max(CFG.TRANSLATE_MIN_RATE, 1e-6), 0, 1)
+                    local k = 1 + (floorCmd / mag - 1) * need
                     fwdCmd, rightCmd = fwdCmd * k, rightCmd * k
                 end
                 thrustCmd = CFG.THRUST_SIGN * clamp(fwdCmd, -CFG.THRUST_MAX, CFG.THRUST_MAX)
@@ -1144,7 +1793,12 @@ local function controlLoop()
                     local vErrX  = dSpeed * ux2 - vel.x
                     local vErrZ  = dSpeed * uz2 - vel.z
                     local rErr   = vErrZ * math.sin(heading) - vErrX * math.cos(heading)
-                    strafeCmd = CFG.STRAFE_SIGN * clamp(CFG.STRAFE_KP * rErr, -CFG.STRAFE_MAX, CFG.STRAFE_MAX)
+                    -- Feedforward + trim, as in the velocity-vector law above; STRAFE_VEL_KP
+                    -- (steps per m/s) not STRAFE_KP (steps per metre of cross-track) -- the two
+                    -- were one overloaded constant until 2026-08-20.
+                    strafeCmd = CFG.STRAFE_SIGN * clamp(
+                        CFG.STEPS_PER_MPS_LAT * (dSpeed * (uz2 * math.sin(heading) - ux2 * math.cos(heading)))
+                        + CFG.STRAFE_VEL_KP * rErr, -CFG.STRAFE_MAX, CFG.STRAFE_MAX)
                     strafePID.integral = 0
                 end
             end
@@ -1157,8 +1811,12 @@ local function controlLoop()
             local sinH, cosH = math.sin(heading), math.cos(heading)
             local fwdVel   = vel.x * sinH + vel.z * cosH        -- body forward speed
             local rightVel = vel.z * sinH - vel.x * cosH        -- body right speed (xtk handedness)
-            local fwdCmd   = CFG.TRANS_KP  * (manFwd    - fwdVel)
-            local rightCmd = CFG.STRAFE_KP * (manStrafe - rightVel)
+            -- Same feedforward + trim split as the autopilot's velocity-vector law: the stick
+            -- names a body-frame speed, so the steps that buy that speed can be commanded
+            -- outright and the feedback left to trim. A centred stick asks for 0, so the
+            -- feedforward vanishes and this is the old pure velocity-hold-at-zero exactly.
+            local fwdCmd   = CFG.STEPS_PER_MPS_FWD * manFwd    + CFG.TRANS_KP      * (manFwd    - fwdVel)
+            local rightCmd = CFG.STEPS_PER_MPS_LAT * manStrafe + CFG.STRAFE_VEL_KP * (manStrafe - rightVel)
             thrustCmd = CFG.THRUST_SIGN * clamp(fwdCmd,   -CFG.THRUST_MAX, CFG.THRUST_MAX)
             strafeCmd = CFG.STRAFE_SIGN * clamp(rightCmd, -CFG.STRAFE_MAX, CFG.STRAFE_MAX)
             speedPID.integral  = 0
@@ -1196,6 +1854,30 @@ local function controlLoop()
         end
 
         -- ---- VERTICAL (ported control.lua cascade + autoland, OR manual VSC) ----
+        -- LIFT ENGINE CUT ON TOUCHDOWN (CFG.AL_GROUND_CUT). Once the FMS has called the landing
+        -- -- "landed" is sent from the pad sequence's touchdown and from the end of a runway
+        -- rollout alike -- there is nothing left for the lift thrusters to buy. Holding them at
+        -- a balanced hover, or on the standing down-bias below, leaves the engine burning
+        -- against the ground: it keeps the craft skittish, unloads the gear the brakes need,
+        -- and is the thing the pilot has always had to reach over and switch off by hand.
+        -- So the whole channel goes to a flat zero on both lines. The altitude reference is NOT
+        -- what does this -- alGrounded still decides whether there is one -- and the velocity
+        -- loop's integral is frozen alongside, so the learnt hover trim is intact for the next
+        -- takeoff (the cut lifts the moment the FMS cancels/releases the landing).
+        -- On ui rather than a new local: controlLoop is one of the two functions this file
+        -- has already had to keep off Cobalt's 200-locals cap, and the display wants it anyway.
+        -- ---- SCRAMBLE: the VS stick's top detent, and the one vertical command that is NOT
+        -- a rate. "Lift engine at full throttle, get us up NOW." See the CFG.MANCON_SCRAMBLE
+        -- block in uacconf, and the VSC's own header on #6 for why it travels as a flag.
+        --
+        -- Decided HERE, above ui.altCut, because it outranks the ground cut: a scramble off the
+        -- pad is half the reason to have one, and a cut engine cannot answer it. On `ui` rather
+        -- than a local for the same 200-locals reason as ui.altCut itself (below).
+        -- A stale or absent VSC reads false, so a dropped link can never latch full lift on.
+        ui.scramble = (CFG.MANCON_SCRAMBLE and CFG.ENABLE_ALTITUDE and CFG.HAS_ALT_THRUSTER
+            and manScramble and manLastMsg and (now - manLastMsg) <= CFG.MANCON_STALE_AFTER
+            and (CFG.MANCON_SCRAMBLE_OVERRIDE or not useAltCascade)) or false
+        ui.altCut = CFG.AL_GROUND_CUT and alState == "landed" and not ui.scramble
         local altUp, altDown = CFG.ALT_NEUTRAL, CFG.ALT_NEUTRAL
         local desiredVelY, velY = 0, vel.y
         local vertEffort = 0   -- signed alt-thruster steps wanted (+ = climb)
@@ -1205,7 +1887,17 @@ local function controlLoop()
             -- outer P, an autoland-commanded descent, or -- when altitude-hold is off -- the
             -- pilot's wanted rate straight off the VSC (#6) over mancon. The VSC no longer
             -- controls anything itself; it just names a rate, and this loop buys it.
-            if useAltCascade then
+            if ui.scramble then
+                -- SCRAMBLE outranks all three sources below -- including an ALT-AP hold and an
+                -- in-progress autoland, which is the point of CFG.MANCON_SCRAMBLE_OVERRIDE: a
+                -- hand-flown go-around IS this detent. The rate named here is not what buys the
+                -- climb (the outright full-lift command further down is), but it still has to be
+                -- HONEST, because it is what the ALT line displays and what the FIXEDWING pitch
+                -- overlay flies off next tick via lastDesiredVelY. CLIMB_AT_FULL is by definition
+                -- the rate ALT_SWING steps of lift actually buys, so it is the truthful answer to
+                -- "what is being asked for here" -- which the old 100 m/s placeholder was not.
+                desiredVelY = CFG.CLIMB_AT_FULL
+            elseif useAltCascade then
                 if alState == "descend" then
                     desiredVelY = alDescendVS
                     if alLastMsg and (now - alLastMsg) > CFG.AL_STALE_AFTER then desiredVelY = 0 end
@@ -1245,7 +1937,7 @@ local function controlLoop()
                 local ib = velPID.integral
                 local steps = CFG.STEPS_PER_MPS * desiredVelY + velPID:step(velY, dt)
                 local stepsSat = clamp(steps, -CFG.ALT_SWING, CFG.ALT_SWING)
-                if idle or alGrounded then
+                if idle or alGrounded or ui.altCut or ui.scramble then
                     -- Parked/landed: HOLD the learnt hover trim (as shutdown() preserves it) rather
                     -- than pumping it against a grounded craft that can't respond -- undo this tick's
                     -- integration. Freeze, don't bleed: the hover lift is a real value wanted at the
@@ -1254,6 +1946,11 @@ local function controlLoop()
                     -- not idle, but the wheels are down and the standing down-command above is one
                     -- the loop can never satisfy -- left to integrate it would wind up hard against
                     -- the ground and poison the hover trim for the next takeoff.
+                    -- ui.scramble is in this list for a THIRD reason: during a scramble this loop's
+                    -- output is thrown away (see the override below), so it must not go on learning
+                    -- from an error it is not being allowed to answer. Left running it would spend
+                    -- the whole detent winding against a saturated output and hand back a poisoned
+                    -- hover trim the moment the pilot let go -- a scramble would end in a sag.
                     velPID.integral = ib
                 elseif stepsSat ~= steps and (steps - stepsSat) * velPID.integral > 0 then
                     velPID.integral = ib
@@ -1264,6 +1961,21 @@ local function controlLoop()
                 vertEffort = stepsSat
                 -- Belt and braces on the same rule: on the gear, nothing may command lift UP.
                 if alGrounded then vertEffort = math.min(vertEffort, 0) end
+                -- ...and with the engine cut, nothing may command it at all -- including the
+                -- share the tilt allocation below would otherwise spill into fore/aft + strafe.
+                if ui.altCut then vertEffort = 0 end
+                -- SCRAMBLE HAS THE LAST WORD, over the rate loop and over both ground rules
+                -- above. Stated outright rather than left for the rate loop to arrive at: the
+                -- feedforward alone (STEPS_PER_MPS * CLIMB_AT_FULL) is exactly ALT_SWING, so in
+                -- the ordinary case this line changes nothing -- but that is the ordinary case
+                -- only while the craft is still SLOWER than CLIMB_AT_FULL. Once it is not (a
+                -- dive recovery, a gust, or simply a CLIMB_AT_FULL set conservatively), the rate
+                -- loop starts SUBTRACTING lift to hold the figure, which is the exact opposite
+                -- of what the pilot asked for. A scramble is an open throttle, not a rate.
+                -- The tilt allocation below still applies, and should: it routes this by the
+                -- true attitude, so full lift means full lift ALONG WORLD-UP (and flips sign
+                -- inverted) rather than full lift out of whichever way the roof happens to face.
+                if ui.scramble then vertEffort = CFG.ALT_SWING end
             end
         end
         lastDesiredVelY = desiredVelY   -- feed next tick's pitch-for-altitude overlay
@@ -1293,7 +2005,18 @@ local function controlLoop()
                 + vertEffort * ux * CFG.VERT_XFER_STR * (bankSteer and strEager or 1)
             ui.tiltUp = uy
         end
-        altUp, altDown = sendAlt((CFG.ENABLE_ALTITUDE and CFG.HAS_ALT_THRUSTER) and altSteps or 0)
+        if CFG.TRI_ENABLE then
+            -- VECTOR-NOZZLE AIRFRAME: the three nozzles ARE the lift engine, so there is no
+            -- up/down thruster pair for this channel to drive -- altSteps is spent below by
+            -- sendVector, together with every other axis. Broadcasting CFG.ALT_PROTOCOL as
+            -- well would put a confident-looking number on a protocol nothing on this craft
+            -- listens to, which is exactly the sort of thing that gets believed a year later.
+            -- The display's u/d pair is pinned at neutral and hidden (see displayLoop).
+            altUp, altDown = CFG.ALT_NEUTRAL, CFG.ALT_NEUTRAL
+        else
+            altUp, altDown = sendAlt((CFG.ENABLE_ALTITUDE and CFG.HAS_ALT_THRUSTER) and altSteps or 0,
+                ui.altCut)
+        end
 
         -- ---- OUTPUT ----
         -- FIXEDWING: strafe thrusters fully disabled -- drop course-correction AND the
@@ -1302,7 +2025,19 @@ local function controlLoop()
         -- corrected only by turning (bank + yaw), and the alt thruster carries whatever
         -- vertical effort the banked craft can't route laterally (may sag in hard banks).
         if not CFG.STRAFE_ENABLED then strafeCmd = 0; strafePID.integral = 0 end
-        if CFG.ENABLE_ATTITUDE then sendStab(pitchSteps, rollSteps) else sendStab(0, 0) end
+        -- ONE call carrying EVERY axis on a vector-nozzle airframe. It has to be one call:
+        -- pitch, roll, yaw, strafe and lift all land on the same three engines, so they can
+        -- only be divided between them together (see sendVector's header). It sits HERE, at
+        -- the bottom of the output block rather than beside the vertical channel, because
+        -- strafeCmd is not final until the FIXEDWING zeroing on the line above.
+        if CFG.TRI_ENABLE then
+            sendVector(CFG.ENABLE_ATTITUDE and pitchSteps or 0,
+                CFG.ENABLE_ATTITUDE and rollSteps or 0,
+                yawSteps, strafeCmd, thrustCmd,
+                (CFG.ENABLE_ALTITUDE and CFG.HAS_ALT_THRUSTER) and altSteps or 0,
+                ui.altCut)
+        elseif CFG.ENABLE_ATTITUDE then sendStab(pitchSteps, rollSteps)
+        else sendStab(0, 0) end
         sendNav(thrustCmd, yawSteps, strafeCmd)
 
         -- ---- publish for display ----
@@ -1330,12 +2065,23 @@ local function controlLoop()
         ui.targetAlt, ui.velY, ui.desVelY = TARGET_ALT, velY, desiredVelY
         ui.altUp, ui.altDown = altUp, altDown
         ui.pStep, ui.rStep, ui.yStep = outStab, outNav.yaw, nil
+        ui.wx, ui.wz, ui.vertEff = w.x, w.z, vertEffort   -- for the flight data recorder
+        -- MEASURED loop period. sleep(0.05) asks for 20 Hz; what the computer actually
+        -- achieves is another matter, and every gain in uacconf assumes it got what it asked
+        -- for. A slow tick is dead time, and dead time is what destabilises these loops -- so
+        -- this belongs on the screen permanently, not in a debug build. Rolling mean, on ui
+        -- rather than a local (Cobalt's 200-locals ceiling; see the CFG loader's note).
+        ui.dtAvg = (ui.dtAvg or dt) * 0.9 + dt * 0.1
         ui.thr, ui.yaw, ui.str = outNav.thrust, outNav.yaw, outNav.str or outNav.strafe
         ui.alState = alState
         ui.tgtName = navTarget[4]
         ui.bankCmd, ui.pitchCmd = bankCmd, pitchCmd
         ui.bankSteer = bankSteer
         lastLatDemand = latDemand   -- feed next tick's cross-track bank
+
+        -- LAST thing in the tick: every command is final and ui is published, so the row is a
+        -- coherent snapshot rather than a mix of this tick and the last.
+        LOG.tick(now, pitchSteps, rollSteps, yawSteps, altSteps)
 
         sleep(0.05)
     end
@@ -1411,8 +2157,9 @@ function switchApalt()
     end
 end
 
--- Manual vertical from the VSC (#6): the pilot's wanted climb rate (m/s). Held between
--- packets; staleness (and the rate clamp) handled by the control loop.
+-- Manual vertical from the VSC (#6): the pilot's wanted climb rate (m/s), plus the scramble
+-- flag that rides beside it. Held between packets; staleness (and the rate clamp) handled by
+-- the control loop.
 local function manConReceiveLoop()
     while true do
         local sender, msg = rednet.receive(CFG.MANCON_PROTOCOL, 1)
@@ -1420,6 +2167,11 @@ local function manConReceiveLoop()
             local v = tonumber(msg.vs)
             if v then
                 manVS = v
+                -- Latched INSIDE the same freshness gate as the rate, deliberately: a VSC that
+                -- goes quiet mid-scramble -- crashed program, pulled modem, chunk unloaded --
+                -- then ages out on MANCON_STALE_AFTER exactly as manVS does, instead of leaving
+                -- the lift engine pinned wide open with nobody at the stick.
+                manScramble = (msg.scramble == true)
                 manLastMsg = os.clock()
             end
         end
@@ -1482,7 +2234,15 @@ local function autolandReceiveLoop()
                 -- missed approach) used to leave TARGET_ALT at the stale ALT-AP selection, so
                 -- the aircraft would stop descending and then climb all the way back to cruise.
                 -- Guarded on ~= "hold" so repeated holds don't re-seize and ratchet on noise.
-                if alState ~= "hold" and latestPosY then setTarget(latestPosY) end
+                -- msg.alt overrides all of that with an altitude to hold OUTRIGHT. The FMS sends
+                -- it when it is station-keeping on a "helipad" that turned out to be a published
+                -- point in open air (its HOVER phase): the number to sit on is landing.db's, not
+                -- the metre of slop the descent happened to stop at, so it says so rather than
+                -- letting us seize. Re-applied on every packet -- it is a constant the FMS
+                -- repeats, so there is nothing here to ratchet either.
+                local alt = tonumber(msg.alt)
+                if alt then setTarget(alt)
+                elseif alState ~= "hold" and latestPosY then setTarget(latestPosY) end
                 alGrounded = false
                 alState = "hold"
             elseif cmd == "descend" then
@@ -1540,8 +2300,21 @@ local function drawAH(pitch, roll)
     term.setBackgroundColour(colours.black)
 end
 
-local function line(row, text)
-    term.setCursorPos(1, row); term.clearLine(); term.write(text)
+local function line(row, text, colour)
+    term.setCursorPos(1, row); term.clearLine()
+    if colour then term.setTextColour(colour) end
+    term.write(text)
+    if colour then term.setTextColour(colours.white) end
+end
+
+local function displayLoop2()
+    while true do
+        line(1, string.format("TICK %.0fms %.1fHz",
+            (ui.dtAvg or 0.05) * 1000, 1 / (ui.dtAvg or 0.05)),
+            ((ui.dtAvg or 0.05) > 0.125 and colours.red)
+            or ((ui.dtAvg or 0.05) > 0.067 and colours.orange) or colours.white)
+        sleep(0.05)
+    end
 end
 
 local function displayLoop()
@@ -1549,17 +2322,76 @@ local function displayLoop()
         drawAH(ui.pitch or 0, ui.roll or 0)
         term.setTextColour(colours.white)
         local r = CFG.AH_TOP + CFG.AH_HEIGHT
+        -- FLIGHT DATA RECORDER status, drawn over the TOP row of the artificial horizon (the
+        -- least informative row of it) and AFTER drawAH, so it survives the redraw. Every other
+        -- row on this screen is spoken for; this costs the horizon one line of sky and only
+        -- while CFG.LOG_ENABLE is set.
+        if CFG.LOG_ENABLE then
+            if LOG.state == "done" then
+                -- The whole point of the exercise: an unmissable, PERSISTENT "stop flying and
+                -- go and read it". Inverse video because a coloured line among coloured lines
+                -- is exactly what gets missed.
+                term.setCursorPos(1, CFG.AH_TOP); term.clearLine()
+                term.setBackgroundColour(colours.green); term.setTextColour(colours.black)
+                term.write(string.format(" LOG DONE  %d rows  -> %s ", LOG.n, CFG.LOG_FILE))
+                term.setBackgroundColour(colours.black); term.setTextColour(colours.white)
+            elseif LOG.state == "fail" then
+                term.setCursorPos(1, CFG.AH_TOP); term.clearLine()
+                term.setBackgroundColour(colours.red); term.setTextColour(colours.white)
+                term.write(" LOG FAILED: " .. tostring(LOG.why) .. " ")
+                term.setBackgroundColour(colours.black); term.setTextColour(colours.white)
+            elseif LOG.state == "wait" then
+                line(CFG.AH_TOP, string.format("REC starts in %.1fs", LOG.wait or 0), colours.orange)
+            elseif LOG.state == "rec" then
+                line(CFG.AH_TOP, string.format("REC %3.0f%%  %d rows",
+                    (LOG.pct or 0) * 100, LOG.n), colours.orange)
+            end
+        end
         line(r + 0, string.format("P%+5.1f R%+5.1f [%s/%s %s]",
             math.deg(ui.pitch or 0), math.deg(ui.roll or 0), CFG.ATT_MODE, CFG.SENSOR_FRAME, quatCtorName))
         line(r + 1, string.format("HDG %+6.1f -> %+6.1f  YR %+5.2f BY%+5.2f",
             ui.headingDeg or 0, ui.desHeadingDeg or 0, ui.yawRate or 0, ui.bankYawRate or 0))
-        line(r + 2, string.format("STAB F%d B%d L%d R%d Y%+3d raw%.0f",
-            (ui.pStep or outStab).front, (ui.pStep or outStab).back,
-            (ui.pStep or outStab).left, (ui.pStep or outStab).right, ui.yaw or 0, ui.rotRaw or 0))
+        if CFG.TRI_ENABLE then
+            -- <key><gimbal X><gimbal Y>/<thrust> per engine, in the order CFG.TRI_ENGINES
+            -- lists them, then the allocator's own health -- the four things that can go
+            -- wrong with it, in the order they matter:
+            --   CUT  = lift engine off (touchdown cut), all three at a flat zero
+            --   S<n> = the pitch/roll differential did NOT fit in 0..15 and was scaled to n%.
+            --          This is the readout to watch: it means attitude authority is being
+            --          rationed, and sitting below ~80% in ordinary flight says the
+            --          TRI_*_PER_STEP authorities are asking for more than three engines can
+            --          pay -- lower them rather than reaching for a gain.
+            --   MAX  = an engine is hard against the 15 ceiling
+            --   CONE = a nozzle wanted more deflection than TRI_VEC_MAX_ANGLE allows, so part
+            --          of the commanded strafe/yaw was dropped rather than delivered
+            local vt = (TRI.cut and "CUT")
+                or (TRI.sat < 0.999 and string.format("S%d%%", math.floor(TRI.sat * 100)))
+                or (TRI.hot > 0 and "MAX") or (TRI.cone > 0 and "CONE") or ""
+            -- Y is the COMMANDED yaw step, kept from the STAB line this replaces: the
+            -- nozzle X columns show yaw indirectly (front one way, back pair the other) but
+            -- not how much was asked for, which is the half needed to tune it.
+            line(r + 2, string.format("%s%+3.0f%+3.0f/%2.0f %s%+3.0f%+3.0f/%2.0f %s%+3.0f%+3.0f/%2.0f Y%+3d %s",
+                TRI.eng[1].key, TRI.out[1].x, TRI.out[1].y, TRI.out[1].thrust,
+                TRI.eng[2].key, TRI.out[2].x, TRI.out[2].y, TRI.out[2].thrust,
+                TRI.eng[3].key, TRI.out[3].x, TRI.out[3].y, TRI.out[3].thrust,
+                ui.yaw or 0, vt))
+        else
+            line(r + 2, string.format("STAB F%d B%d L%d R%d Y%+3d raw%.0f",
+                (ui.pStep or outStab).front, (ui.pStep or outStab).back,
+                (ui.pStep or outStab).left, (ui.pStep or outStab).right, ui.yaw or 0, ui.rotRaw or 0))
+        end
         line(r + 7, string.format("TRIM iP%+.2f iR%+.2f yS%.2f gy%.2f %s",
             ui.integP or 0, ui.integR or 0, ui.yawScale or 1, ui.gyroFade or 0,
-            (ui.idle and "PARK " or "") .. (ui.yawBrake and "YBRK" or "")))
-        line(r + 8, string.format("I(k) x%.0f y%.0f z%.0f", (ui.Ix or 0)/1000, (ui.Iy or 0)/1000, (ui.Iz or 0)/1000))
+            (ui.idle and "PARK " or "") .. (ui.yawBrake and "YBRK" or "")
+            .. (ui.smith and string.format(" SMI%+.2f", ui.smith) or "")))
+        -- TICK is the loop's MEASURED period and rate. It should read 50ms / 20.0Hz. Anything
+        -- slower is dead time the tuning does not know about, and the number to fix before
+        -- touching a gain. Amber below 15 Hz, red below 8 Hz.
+        line(r + 8, string.format("I(k) x%.0f y%.0f z%.0f  TICK %.0fms %.1fHz",
+            (ui.Ix or 0)/1000, (ui.Iy or 0)/1000, (ui.Iz or 0)/1000,
+            (ui.dtAvg or 0.05) * 1000, 1 / (ui.dtAvg or 0.05)),
+            ((ui.dtAvg or 0.05) > 0.125 and colours.red)
+            or ((ui.dtAvg or 0.05) > 0.067 and colours.orange) or colours.white)
         -- FIXEDWING off; HYBRID banking=spar, pad=on. "eagr" = the eager-strafe handoff has
         -- taken the lateral correction off the bank (see CFG.STRAFE_EAGER_NEAR) -- it shows on
         -- FIXEDWING's "off" too, since there the handoff still silences the BANK half.
@@ -1609,11 +2441,24 @@ local function displayLoop()
         --   VS   = the FMS owns the rate channel (alState "descend"): TARGET_ALT is bypassed
         --          entirely and the aeroplane flies alDescendVS, whatever the panel says.
         --   GND  = on the gear, no altitude reference at all.
-        local altTgt = ui.altManual and "MAN"
+        --   CUT  = ...and the lift engine is off with it (CFG.AL_GROUND_CUT): both thruster
+        --          lines at a flat 0, the aeroplane sitting on its own weight. Reads CUT for the
+        --          whole of a landing, so seeing GND there means the cut is switched off.
+        -- SCRM sits ahead of all of them: during a scramble none of the four below is what is
+        -- flying the vertical, including the MAN the switches would otherwise show.
+        local altTgt = ui.scramble and "SCRM"
+            or ui.altManual and "MAN"
             or (ui.alState == "descend" and string.format("VS%+.1f", ui.desVelY or 0))
-            or (ui.alState == "landed" and "GND")
+            or (ui.alState == "landed" and (ui.altCut and "CUT" or "GND"))
             or (ui.targetAlt and string.format("%.0f", ui.targetAlt) or "--")
-        if CFG.HAS_ALT_THRUSTER then
+        if CFG.TRI_ENABLE then
+            -- No up/down pair to show here: the vertical IS the sum of the three nozzle
+            -- thrusts, so L is that total (out of 45 on three 0..15 engines). t is still the
+            -- body-up share of world-up, i.e. how much of the climb the tilt allocation is
+            -- routing to lift rather than spilling into fore/aft and strafe.
+            line(r + 5, string.format("ALT %6.1f -> %s  Vy%+5.2f L%2.0f t%+.2f",
+                ui.posY or 0, altTgt, ui.velY or 0, TRI.tot, ui.tiltUp or 1))
+        elseif CFG.HAS_ALT_THRUSTER then
             line(r + 5, string.format("ALT %6.1f -> %s  Vy%+5.2f u%2d d%2d t%+.2f",
                 ui.posY or 0, altTgt,
                 ui.velY or 0, ui.altUp or CFG.ALT_NEUTRAL, ui.altDown or CFG.ALT_NEUTRAL, ui.tiltUp or 1))
@@ -1628,8 +2473,19 @@ local function displayLoop()
             -- is too slow to fly what the altitude loop asked for, so it is deliberately asking
             -- for less rather than raising the nose. Expected transiently in a hard climb; if it
             -- stays lit in level cruise the aeroplane is short of thrust, not short of gain.
-            line(r + 5, string.format("ALT %6.1f -> %s  Vy%+5.2f/%+5.2f iV%+5.1f%s",
-                ui.posY or 0, altTgt, ui.velY or 0, ui.desVelY or 0, ui.fwPitchI or 0,
+            -- TRM is the trim in SCALE-INVARIANT units: <percent of FW_PITCH_I_LIMIT>/<degrees
+            -- of commanded pitch it is contributing>. The old raw iV was unreadable because its
+            -- units are whatever FW_PITCH_KI happens to be, and the same physical trim has read
+            -- 0.7, 300 and 1000 across rescalings. Read it as:
+            --   pct at +/-100        -> the integral is PEGGED; it is asking for something the
+            --                           aeroplane is not delivering (windup, or a real ceiling)
+            --   deg near FW_PITCH_MAX -> the TRIM is eating the whole command budget, so there is
+            --                           no manoeuvring authority left -- raise FW_PITCH_MAX
+            --   deg changing with SPEED is now CORRECT and expected: the trim is an angle of
+            --                           attack and scales as 1/V^2 (see the gamma law).
+            line(r + 5, string.format("ALT %6.1f -> %s  Vy%+5.2f/%+5.2f TRM%+4.0f%%%+5.1fd%s",
+                ui.posY or 0, altTgt, ui.velY or 0, ui.desVelY or 0,
+                ui.fwTrimPct or 0, ui.fwTrimDeg or 0,
                 ui.fwVsCap and " SPD" or ""))
         end
         local apTag = string.format("AP nav:%s alt:%s  %s",
@@ -1638,7 +2494,13 @@ local function displayLoop()
         term.setTextColour(ui.link == "ok" and colours.green or colours.orange)
         line(r + 6, al)
         term.setTextColour(colours.white)
-        sleep(0.05)
+        -- The instruments do NOT need 20 Hz, and on this fleet they cannot have it: every
+        -- terminal write is main-thread work charged against the server-wide CC budget
+        -- (max_main_global_time, 10 ms per tick shared by every computer), and a full redraw
+        -- here is the artificial horizon plus ten lines -- around 20 operations, 400 a second.
+        -- At 5 Hz that is 100 a second for a readout no eye can follow faster anyway.
+        -- Optional knob: absent = the old 0.05, so this is a no-op on every other airframe.
+        sleep(CFG.DISPLAY_PERIOD or 0.05)
     end
 end
 
@@ -1667,19 +2529,37 @@ local function shutdown()
         rednet.broadcast({ left = 0, right = 0, front = 0, back = 0 }, CFG.STAB_PROTOCOL)
         rednet.broadcast({ thrust_forward = 0, thrust_backward = 0, yaw_left = 0,
             yaw_right = 0, strafe_left = 0, strafe_right = 0 }, CFG.NAVCTRL_PROTOCOL)
-        local trimSteps = clamp(CFG.VEL_KI * velPID.integral, -CFG.ALT_SWING, CFG.ALT_SWING)
-        rednet.broadcast({
-            up   = clamp(round(CFG.ALT_NEUTRAL + trimSteps), CFG.ALT_MIN, CFG.ALT_MAX),
-            down = clamp(round(CFG.ALT_NEUTRAL - trimSteps), CFG.ALT_MIN, CFG.ALT_MAX),
-        }, CFG.ALT_PROTOCOL)
+        rednet.broadcast({ thrust = 0.0 }, CFG.THRUSTF_PROTOCOL)
+        -- Vector-nozzle airframe: kill the three engines outright and centre the nozzles.
+        -- There is no hover trim to preserve on this side -- unlike the up/down pair below,
+        -- whose neutral is a balanced burn, a nozzle held at anything above zero is lift, and
+        -- lift is the one thing a stopped controller must not leave running.
+        if CFG.TRI_ENABLE then
+            local m = { cut = true }
+            for i = 1, #TRI.eng do m[TRI.eng[i].key] = { x = 0, y = 0, thrust = 0 } end
+            rednet.broadcast(m, CFG.TRI_PROTOCOL)
+        end
+        -- ...and the up/down pair, held at the LEARNT hover trim rather than a blind neutral.
+        -- Skipped entirely on a vector-nozzle airframe: the message above has already stopped
+        -- the engines, and this one is a standing burn on a protocol nothing there listens to.
+        if not CFG.TRI_ENABLE then
+            local trimSteps = clamp(CFG.VEL_KI * velPID.integral, -CFG.ALT_SWING, CFG.ALT_SWING)
+            rednet.broadcast({
+                up   = clamp(round(CFG.ALT_NEUTRAL + trimSteps), CFG.ALT_MIN, CFG.ALT_MAX),
+                down = clamp(round(CFG.ALT_NEUTRAL - trimSteps), CFG.ALT_MIN, CFG.ALT_MAX),
+            }, CFG.ALT_PROTOCOL)
+        end
     end)
 end
 
 term.setBackgroundColour(colours.black); term.clear()
 local ok, err = pcall(parallel.waitForAny,
-    controlLoop, navReceiveLoop, altReceiveLoop, autolandReceiveLoop,
+    controlLoop,
+    navReceiveLoop, altReceiveLoop, autolandReceiveLoop,
     switchApnav, switchApalt, manConReceiveLoop, manNavReceiveLoop, kbdJoyReceiveLoop,
-    displayLoop, inputLoop)
+    displayLoop,
+    inputLoop
+)
 shutdown()
 term.setBackgroundColour(colours.black); term.setTextColour(colours.white)
 term.setCursorPos(1, term.getSize() and select(2, term.getSize()) or 19)
