@@ -1,22 +1,60 @@
 ; autolanding info
-; aerodrome/poi = type (heli,rwy), direction (n, w, s, e; x for don't care), altitude, runway length in meters (ignored for heli)
+; aerodrome/poi = type (heli,rwy,goaround,appr), direction (n, w, s, e; x for don't care; integer/decimal number for heading), altitude, runway length in meters (ignored for heli)
+; IF TYPE IS goaround (goaround pattern), the format changes:
+; random id = "goaround", starting point X, starting point Y, ending point X, ending point Y, altitude
+; random id = "goaround-wp", minimum altitude, waypoints (always starts AND ends at the runway it belongs to)
+; an FMS should be able to circle into the goaround route, fly straight, circle back to runway line, realign, and try landing again.
+; IF TYPE IS appr (approach pattern), the format AND the interpretation changes:
+; interpretation, on preparation to the landing, the FMS MUST choose the most suitable approach pattern according to its current position and heading
+; random id = "appr", minimum altitude, waypoints
+; BOTH GOAROUND AND APPROACH PATTERN CAN REFERENCE EACH OTHERS PATTERN
+;   appr naming another appr  = continue as that pattern; its fixes are spliced in where the id stands
+;   appr naming a goaround    = that circuit is this approach's MISSED APPROACH, and names the runway it ends at
+; ALL AEROPLANES MUST ABIDE BY THE GOAROUND AND APPROACH PATTERNS
 ; Minecraft coord convention:
 ; North: Z-
 ; East: X+
 ; South: Z+
 ; West: X-
 ; Altitude: Y axis
-TMU=heli,n,69,0
-AGS=heli,n,73,0
-BZR=heli,w,69,0
-ZTP=heli,s,70,0
-KST=heli,w,71,0
-FRO=heli,s,73,0
-WAU=heli,s,120,0
-ARN=heli,s,70,0
-; A RUNWAY is the same strip listed twice, once per landing direction: the point is the
-; THRESHOLD you touch down past, and the strip runs from it for <length> m the way you land.
-; TMV (609,598) landing south + 295 m ends at 609,893, which is exactly where TMA sits --
-; land on TMA instead and you fly the identical strip northbound.
-TMV=rwy,s,69,295
-TMA=rwy,n,69,295
+TMU=heli,n,64,0
+AGS=heli,n,68,0
+BZR=heli,w,64,0
+ZTP=heli,s,65,0
+KST=heli,w,66,0
+FRO=heli,s,68,0
+WAU=heli,s,114,0
+ARN=heli,s,65,0
+RNF=heli,n,65,0
+WCL=heli,e,226,0
+FRT=heli,w,88,0
+TWN=heli,e,68,0
+OLV=heli,w,68,0
+TMV=rwy,s,64,295
+TMA=rwy,n,64,295
+TMN=rwy,w,89,200
+WAX=rwy,56.30993,116,166
+AGC=rwy,w,81,150
+NUK=heli,w,174,0
+NUS=rwy,s,174,70
+NUN=rwy,n,174,70
+BLY=heli,n,64,0
+FGY=rwy,e,86,80
+ASY=heli,e,77,0
+; goaround patterns
+TMA_GAWP=goaround-wp,150,TMA,TAIMU,CECIN,NATIO,VAROI,GOGET,NAROD,VOTRE,SLAVA,TAIMW,TMA
+TMV_GAWP=goaround-wp,150,TMV,TAIMW,SLAVA,NOTRE,NAROD,GOGET,VAROI,NATIO,CECIN,TAIMU,TMV
+; approach patterns
+TMA_APPR1=appr,150,KUTAC,UKRAN,TMA_GAWP
+TMA_APPR2=appr,150,UHAKF,UKRAN,TMA_GAWP
+TMA_APPR3=appr,150,NAROD,NOTRE,SLAVA,TAIMW,TMA_GAWP
+TMV_APPR1=appr,150,PDRNT,TAIMU,NATIO,TAPRV,TAIMU,TMV
+TMV_APPR2=appr,150,NATIO,TAIMU,PDRNT,TAPRV,TAIMU,TMV
+TMV_APPR3=appr,150,NTARI,TMV_APPR2
+TMV_APPR4=appr,150,WAHAU,PDRNT,TAPRV,TAIMU,TMV
+WAX_APPR1=appr,180,WAYCL,WAUZU,KOBUL,WAUZA,WAX
+TMN_APPR1=appr,140,SXTRI,EITRI,TMN
+AGC_APPR1=appr,135,ONTRF,BMTRF,AGSOC,AGC
+NUS_APPR1=appr,185,BOLAK,BROMA,NUS
+NUN_APPR1=appr,185,BLTAG,BORTA,NUN
+FGY_APPR1=appr,120,STAKY,ENOKY,FUNGY,FGY

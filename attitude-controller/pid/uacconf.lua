@@ -35,14 +35,30 @@ CFG.APNAV_PROTOCOL    = 'aertogekiss_navap'      -- in : FMS target + phase
 CFG.ALTAP_PROTOCOL    = 'aertogekiss_altap'      -- in : ALT-AP panel setpoint
 CFG.AUTOLAND_PROTOCOL = 'aertogekiss_autoland'   -- in : FMS vertical channel
 CFG.APSWITCH_PROTOCOL = 'aertogekiss_apswitch'   -- in : pilot autopilot toggles (nav / altitude), #12
-CFG.MANCON_PROTOCOL   = 'aertogekiss_mancon'     -- in : manual wanted climb rate (m/s) from the VSC, #6
-CFG.MANNAV_PROTOCOL   = 'aertogekiss_mancon_nav' -- in : manual horizontal+yaw stick (m/s, rad/s) from the MIC, #14
+CFG.MANCON_PROTOCOL   = 'aertogekiss_mancon'     -- in : manual wanted climb rate (m/s), #6
+CFG.MANNAV_PROTOCOL   = 'aertogekiss_mancon_nav' -- in : manual horizontal+yaw stick (m/s, rad/s), #6
+                                                 --      (was the MIC #14 until 2026-08-28;
+                                                 --      #6's mancon.lua owns both now)
 CFG.KBDJOY_PROTOCOL   = 'aertogekiss_kbdjoy'     -- in : keyboard joystick -- pitch/roll TARGET (rad) + throttle, #21
+-- OUTPUT PROTOCOLS CARRY FLOATS, NOT REDSTONE STEPS (2026-08-26). STAB, NAVCTRL and ALT
+-- all changed shape when the sigma-delta moved into the relays: signed [-1, 1] per AXIS
+-- (a fraction of one full redstone line), not split unsigned 0..15 per BANK.
+--     STAB    { pitch, roll }                  -- was { front, back, left, right }
+--     NAVCTRL { thrust, yaw, strafe }          -- was { thrust_forward, ... , strafe_right }
+--     ALT     { up, down, cut }                -- up/down now [0,1]; cut is new and explicit
+-- Which bank a signed demand lands on, and what whole step it rounds to, is the receiving
+-- relay's answer to give. See uac.lua's OUTPUT header for why.
 CFG.STAB_PROTOCOL     = 'aertogekiss_stab'       -- out: pitch/roll thrusters
 CFG.NAVCTRL_PROTOCOL  = 'aertogekiss_navcontrol' -- out: yaw/thrust/strafe
-CFG.THRUSTF_PROTOCOL  = 'aertogekiss_thrustf'      -- out: fore/aft demand as ONE float, -1..1
                                              --      (additive; NAVCTRL above is unchanged)
 CFG.ALT_PROTOCOL      = 'aertogekiss_alt'        -- out: up/down thruster
+
+-- 'aertogekiss_controlf' was a half-built attempt at the same idea -- ONE message carrying
+-- every axis as a float -- that never had a listener, and uac.lua's sendControlf() that fed
+-- it was never called. The 2026-08-26 refactor did the job on the three protocols the relays
+-- already subscribe to instead, so the knob is gone rather than left looking live. Nothing
+-- broadcasts on that name.
+CFG.THRUSTF_PROTOCOL = 'aertogekiss_thrustf'
 
 -- MASTER ENABLES -- bring the craft up one channel at a time (it is still ONE
 -- file; these just zero a channel's output so you can isolate a problem). These are
@@ -71,6 +87,14 @@ CFG.MANCON_STALE_AFTER = 0.5   -- s; manual vertical older than this -> treat as
 -- in the whole system that is NOT a rate: "lift engine to full throttle, climb as fast as
 -- this airframe can". It bypasses the inner rate loop entirely and drives the alt thruster
 -- to CFG.ALT_SWING outright, routed by attitude like every other vertical command.
+--
+-- IT IS ALSO THE ONE VERTICAL COMMAND THAT DOES NOT DRIVE BOTH BANKS. Every other command
+-- is a differential about the balanced hover (CFG.ALT_NEUTRAL +/- steps, so the down line is
+-- still burning at 3 while the up line is at 11); a scramble switches the opposing bank OFF
+-- and burns the helping one at CFG.ALT_NEUTRAL + |steps|. Without that the attitude routing
+-- above quietly cancels the detent -- the down line only reaches CFG.ALT_MIN while the tilt
+-- is inside acos(ALT_NEUTRAL / ALT_SWING) (~29 deg on this fleet), and past it the retro bank
+-- burns against the scramble. See sendAlt's header in uac.lua for the arithmetic.
 --
 -- WHY IT NEEDED A CHANNEL OF ITS OWN. It used to be sent as a rate -- vs = 100 m/s off the
 -- stick's top step -- and there were three independent layers between that and the thrusters,
@@ -263,8 +287,8 @@ CFG.ATT_KP      = 1.5    -- outer: desired angular velocity per rad of error (1/
 -- MAX_DECEL_* below, not these. Those are still 4.0/8.0 here, i.e. the profile is effectively
 -- disabled -- but with ATT_KP at 0.33 the loop cannot demand more than 0.33*pi ~ 1.0 rad/s even
 -- from a full inversion, so it stays clear of the profile and the profile stays a safety net.
-CFG.ATT_KP_PITCH = 0.33  -- outer gain, PITCH axis only (1/s)
-CFG.ATT_KP_ROLL  = 0.25  -- outer gain, ROLL  axis only (1/s)
+CFG.ATT_KP_PITCH = 0.70  -- outer gain, PITCH axis only (1/s)
+CFG.ATT_KP_ROLL  = 0.33  -- outer gain, ROLL  axis only (1/s)
 -- YAW-ONLY outer gain (nil => fall back to CFG.ATT_KP; uac.lua reads
 -- `CFG.ATT_KP_YAW or CFG.ATT_KP`, so this is a no-op on any airframe that does not set it).
 -- Added 2026-08-20, the same hook #19 Citation added as CFG.ATT_KP_PITCH when it found that
@@ -312,9 +336,9 @@ CFG.ATT_KP_ROLL  = 0.25  -- outer gain, ROLL  axis only (1/s)
 -- 0.33 is also what the analytic target gives: zeta 0.9 needs ATT_KP = G/(4*zeta^2) = 0.32.
 -- RATIO SETS DAMPING, PRODUCT SETS SPEED -- if the nose is now too lazy, raise this and
 -- ROT_GAIN_YAW TOGETHER; if it swings again, lower this one alone.
-CFG.ATT_KP_YAW  = 0.33   -- outer gain, YAW axis only (1/s)
+CFG.ATT_KP_YAW  = 0.50   -- outer gain, YAW axis only (1/s)
 CFG.RATE_KP     = 5.0    -- inner: desired angular accel per rad/s of rate error (pitch/roll)
-CFG.RATE_KP_YAW = 5.0    -- inner gain for YAW alone -- raise for a crisper yaw WITHOUT
+CFG.RATE_KP_YAW = 8.0    -- inner gain for YAW alone -- raise for a crisper yaw WITHOUT
                            -- over-gaining pitch/roll (they keep CFG.RATE_KP)
 CFG.RATE_KD     = 0.0    -- inner: derivative on the rate error (noisy; start 0)
 -- INERTIA outputs a physical torque (I*alpha + gyro) in N.m. This craft's inertia
@@ -322,9 +346,9 @@ CFG.RATE_KD     = 0.0    -- inner: derivative on the rate error (noisy; start 0)
 -- tiny. Rule: ROT_GAIN ~= (steps wanted at a firm correction) / raw seen at that
 -- correction, e.g. 7 / 1.3e6 ~= 5e-6. Pitch/roll (stab thrusters) and yaw (nav
 -- thrusters) have different authority, so tune the three separately.
-CFG.ROT_GAIN_PITCH = 5e-6
-CFG.ROT_GAIN_ROLL  = 5e-6
-CFG.ROT_GAIN_YAW   = 5.7e-7   -- was 5e-6; /3 after ~3x more yaw thrusters (each step now ~3x
+CFG.ROT_GAIN_PITCH = 0.000005
+CFG.ROT_GAIN_ROLL  = 0.000005
+CFG.ROT_GAIN_YAW   = 0.00000140   -- was 5e-6; /3 after ~3x more yaw thrusters (each step now ~3x
                               -- the torque, so the loop was 3x over-gained -> left/right oscillation).
                               -- "If it STILL hunts you added more than 3x -> keep dividing" -- and it
                               -- still hunted, so 1.7e-6 /3 again = 5.7e-7 (2026-08-20). This time the
@@ -523,7 +547,7 @@ CFG.IDLE_SETTLE  = 1.5    -- s of continuous stillness-and-unguided before idle 
 CFG.PITCH_SIGN = 1
 CFG.ROLL_SIGN  = -1
 CFG.YAW_SIGN   = -1
-CFG.SWAP_PITCH_ROLL_CHANNELS = true  -- true if pitch cmd should drive left/right
+CFG.SWAP_PITCH_ROLL_CHANNELS = false  -- true if pitch cmd should drive left/right
 
 -- Rate-feedback sign, per axis -- SEPARATE from the output *_SIGN above. *_SIGN makes
 -- a static tilt CORRECT (leveling, the P term); these make the rate DAMPING oppose
@@ -1238,6 +1262,35 @@ CFG.WP_EPSILON  = 0.5
 -- ============================================================================
 -- ALTITUDE CONFIG -- ported from control.lua (the vertical cascade + autoland)
 -- ============================================================================
+-- THE ALTITUDE DATUM. How far the pose `sublevel` reports sits ABOVE THE BOTTOM OF THE HULL,
+-- in metres. uac.lua subtracts it on the first line of every tick, so every altitude in this
+-- system -- what the cascade holds, what the ALT-AP panel picks, what the HSI and the PFD
+-- print, what the responder tells ATC, what the GPWS measures its clearance from -- is the
+-- world Y of the part of the aeroplane that touches the ground.
+--
+-- WHY IT HAS TO BE SUBTRACTED. `sublevel` reports the assembly's pose, which is somewhere
+-- inside the hull; the aeroplane's altitude is where its FEET are. Every number the aircraft
+-- compares itself against is a piece of GROUND -- landing.db's pad and runway elevations are
+-- surveyed surface Y, and so is the terrain server's profile -- so an uncorrected reading is
+-- an aeroplane that believes it is 9 m higher than it is. Aer Togekiss parked on the
+-- Y=63 airstrip read 73. What that cost, before this was measured:
+--   * the autoland flew its descent to a pad elevation 9 m UNDERGROUND, and only the
+--     squat switch stopped it there;
+--   * the GPWS's radio altitude over-read by the same 9 m on every SITE and TERR
+--     datum, so every terrain-closure envelope fired that much late -- and this is the one
+--     that matters, because the whole point of that computer is to be early;
+--   * ATC painted the fleet 9 m high, each hull by a different amount.
+--
+-- HOW TO MEASURE IT. Set it to 0, park the aeroplane on ground of a KNOWN Y (an aerodrome in
+-- landing.db is ideal -- TMV/TMA are Y=64), and read the altitude off the PFD or the UAC's
+-- own display. The offset is (what it read) - (the Y the hull is resting on). It is a
+-- property of the BUILD, so re-measure it whenever the hull grows a deck underneath.
+--
+-- POSITIVE means the reported pose is above the bottom, which is the only case seen so far;
+-- the arithmetic is a plain subtraction and would take a negative just as happily.
+CFG.ALT_OFFSET = 9
+-- Measured 2026-08-29: parked on the Y=63 airstrip, Aer Togekiss reported alt 73.
+
 -- DOES THIS AIRFRAME HAVE LIFT THRUSTERS AT ALL? A physical fact about the aeroplane, NOT a
 -- mode: FLIGHT_MODE says how the craft is flown, this says what it is built out of, and the
 -- two are set independently. TRUE here -- this craft has up/down thrusters and everything
@@ -1300,6 +1353,23 @@ CFG.ALT_KP      = 0.3
 CFG.CLIMB_MAX   = 3.75
 CFG.DESCEND_MAX = 3.75
 
+-- ...and the MANUAL vertical's own envelope, which is deliberately NOT the two above.
+-- ADDED 2026-09-08 with mancon.lua's boost key (#6's CFG.KEYS.BOOST, A). The stick has two
+-- ceilings now -- CFG.VS.MAX_CMD 3.75 unboosted, CFG.VS.BOOST_MAX_CMD 7.5 held -- and the
+-- boosted one has to get past the clamp uac.lua applies before its rate loop ever sees the
+-- number. Raising CLIMB_MAX to buy that would have loosened the envelope the AUTOLAND and
+-- ALT-AP fly inside as well (CFG.AL_DESC_MAX / CFG.AL_CLIMB_MAX are literally these two), so
+-- the manual branch clamps here instead and the autopilots keep the 3.75 they were tuned at.
+--
+-- 7.5 = twice the unboosted stick, and still comfortably under CFG.CLIMB_AT_FULL (10.0), so
+-- it is a rate the lift bank can actually buy rather than one it saturates against. THE TWO
+-- FILES MUST AGREE: this is the ceiling, and 6/manconconf.lua's BOOST_MAX_CMD is what asks
+-- for it -- set that higher than this and the extra travel is silently thrown away here.
+-- If CLIMB_AT_FULL is ever measured properly (CLAUDE.TODO.md #1) this is one of the numbers
+-- to revisit: it should stay below whatever that turns out to be.
+CFG.MANCON_CLIMB_MAX   = 7.5
+CFG.MANCON_DESCEND_MAX = 7.5
+
 -- The inner climb-rate loop, in STEPS PER m/s OF ERROR.
 --
 -- Expressed as a multiple of STEPS_PER_MPS rather than as a bare number, so that it scales
@@ -1351,13 +1421,100 @@ CFG.AL_GROUND_CUT  = true
 -- Link freshness
 CFG.AP_STALE_AFTER = 5.0
 
--- Output dithering (sigma-delta): recover fractional commands that whole-step
--- redstone would otherwise throw away, since the airframe is far slower than 20 Hz.
-CFG.DITHER = true
+-- OUTPUT DITHERING HAS MOVED (2026-08-26). The sigma-delta that recovers fractional
+-- commands whole-step redstone would otherwise throw away now lives in the RELAYS, one
+-- accumulator per redstone line, and each relay carries its own DITHER flag at the top of
+-- its program. uac.lua broadcasts floats in [-1, 1] and quantises nothing.
+--
+-- CFG.DITHER IS DELETED RATHER THAN LEFT SET, deliberately: a knob still sitting here that
+-- the program no longer reads is exactly the "an edit here silently does nothing" failure
+-- this file's header refuses to allow. To turn dithering off on this airframe, set
+-- DITHER = false at the top of the relay concerned (#3/#9/#10 and their equivalents).
+
+-- LOOP RATE ------------------------------------------------------------------
+-- Added 2026-08-28 with the loop-rate fork. Aer Togekiss and Scout run an optimised uac.lua;
+-- the other three airframes run the file in ../../_goldmaster/ and do not have these knobs.
+--
+-- WHAT THE FORK IS ANSWERING. The control loop asked for 20 Hz and measured 4.4 Hz. Scout's
+-- flight recorder says why, and the shape of the answer is the useful part: across 660 ticks
+-- every single measured period was an exact multiple of one game tick (0.10 s 0.2%, 0.15 s
+-- 6.7%, 0.20 s 41.7%, 0.25 s 41.4%, 0.30 s 10.2%) and nothing in between. Arithmetic running
+-- long gives a CONTINUOUS spread; a spread with no fractional part is a loop that is BLOCKING
+-- a whole tick at a time. What blocks is the calls the server has to serve on its main
+-- thread, and the loop was making ten a tick. That is the thing being cut -- not the control
+-- law, which is byte-for-byte the same law it was.
+
+-- The period the control loop TARGETS. It sleeps only if the tick finished inside this, and
+-- yields through the event queue if it did not -- so an overrunning tick no longer buys
+-- itself another whole 50 ms of sleep on top of the overrun. 0.05 = the 20 Hz every gain in
+-- this file is derived against; raising it deliberately slows the loop and nothing here
+-- wants that.
+CFG.LOOP_PERIOD = 0.05
+
+-- How often to re-read the inertia tensor and the mass. These are properties of the ASSEMBLY,
+-- not of its motion -- they change when a block is added or broken or cargo moves, not at
+-- 20 Hz -- so reading them every tick spent two of the loop's ten main-thread round trips on
+-- two numbers that were almost always last tick's.
+-- WHAT IT COSTS, so nobody has to re-derive it: a mass change is noticed up to this late,
+-- which delays the CFG.TRIM_BOOST_TIME re-learn by the same amount. TRIM_BOOST_TIME is in
+-- seconds and the boost works over the seconds after a mass step, so 1 s of notice is
+-- immaterial. Nothing else on this aircraft reads either value.
+-- Lower it if you fly with rapidly changing cargo and see the hover trim lag a load change.
+CFG.SLOW_POLL_PERIOD = 1.0
+
+-- ============================================================================
+-- FLIGHT DATA RECORDER
+-- ============================================================================
+-- THIS AIRFRAME HAD NO RECORDER BLOCK AT ALL until 2026-08-29, which is why every vertical
+-- fault on it so far has been argued from a 20 Hz screen and a memory of what the screen
+-- said. uac.lua's LOG is optional by design -- absent LOG_ENABLE means "no recorder" and the
+-- boot canary only demands the rest of the block once it is set -- so #1 simply never had
+-- one. It does now, off by default, and the whole block is here so switching it on is one
+-- edit and not a copy from Scout.
+--
+-- HOW TO USE IT. Set LOG_ENABLE = true, REBOOT #1 (a CC computer keeps running the code it
+-- booted with -- this is worth saying out loud, because "I changed the file" and "the
+-- aeroplane is running the change" are not the same statement), fly the fault, watch for the
+-- green LOG DONE banner on the top row of the artificial horizon, then read /uaclog.csv off
+-- the world save. Set it back to false afterwards: it costs a string.format of 40 values per
+-- tick and it overwrites the previous record on every boot.
+--
+-- FOR THE SCRAMBLE, the two columns that matter are the last two, and they are last because
+-- they were appended rather than inserted (every earlier record still parses):
+--   scram   the flag as THE CONTROLLER saw it. The MANCON's panel showing SCRM only proves
+--           the stick sent it. If this column is 0 while the panel says SCRM, the aeroplane
+--           is deaf and the fault is between #6 and here. If it is 1, the flag arrived and
+--           nothing about the input path is worth looking at again.
+--   velInt  the hover trim the loop has learnt, in alt steps. The detent commands
+--           CFG.ALT_SWING (8) outright, so what it is WORTH over the hover is 8 - velInt.
+--           At velInt 6-7 the up line is already at 13-14 of 15 just to stay level and the
+--           scramble is worth one or two steps -- which would read as "it does nothing" no
+--           matter what the code did, and would mean the answer is lift, not software.
+-- Read them against altSteps (what was commanded), velY (what the aeroplane did) and tiltUp
+-- (body-up . world-up, so a row can be told from one taken on its side).
+CFG.LOG_ENABLE  = false
+CFG.LOG_FILE    = "/uaclog.csv"
+-- Seconds after boot before the file is opened. The first moments are peripherals attaching,
+-- the first nav/altitude packets landing and the trim starting from zero -- a transient nobody
+-- asked about, and it would be the loudest thing in the record.
+CFG.LOG_DELAY   = 4.0
+-- How long to record, then STOP and close the file. Bounded on purpose: a computer has a fixed
+-- disk quota, and an unbounded log eventually fails a write mid-flight. 60 s at 20 Hz is 1200
+-- rows -- and this loop does not reach 20 Hz (see CFG.LOOP_PERIOD), so expect nearer 300.
+CFG.LOG_SECONDS = 60.0
+-- Record every Nth tick. 1 = every tick. Raise it for a longer window at coarser resolution.
+CFG.LOG_EVERY   = 1
 
 -- Visualiser
 CFG.AH_TOP    = 1     -- artificial-horizon top row
 CFG.AH_HEIGHT = 9     -- rows the horizon occupies
 CFG.PITCH_PIXELS_PER_RAD = 8   -- vertical sensitivity of the horizon to pitch
+-- How often the instrument panel redraws. THIS AIRCRAFT HAD NO SUCH KNOB, so it was
+-- redrawing at the fallback 0.05 -- the full artificial horizon plus ten text lines, 20 times
+-- a second, on the same computer that was failing to run its control loop at 20 Hz. Scout has
+-- been at 0.2 since it got the knob. The horizon itself is far cheaper than it was (drawAH
+-- draws runs now, and skips rows that did not change), but a readout no eye can follow faster
+-- than ~5 Hz has no business competing with the attitude loop for the tick budget either way.
+CFG.DISPLAY_PERIOD = 0.2
 
 return CFG

@@ -1,6 +1,10 @@
 local PROTOCOL_ENGINE_SWITCH = 'aertogekiss_engineswitch'
 
-rednet.open('top')
+if not sublevel then error("No sublevel API - is the Sable mod present?") end
+
+local modem = peripheral.find("modem")
+if not modem then error("No modem attached") end
+rednet.open(peripheral.getName(modem))
 term.clear()
 
 local function displayLine(row, text)
@@ -13,13 +17,15 @@ local function relayLoop()
         local mst = redstone.getInput('front')
         local alt = redstone.getInput('right')
         local att = redstone.getInput('left')
-    
-        rednet.broadcast({ ['master'] = mst, ['altitude'] = alt, ['attitude'] = att }, PROTOCOL_ENGINE_SWITCH)
+        local extralift = redstone.getInput('back')
+
+        rednet.broadcast({ ['master'] = mst, ['altitude'] = alt, ['attitude'] = att, ['extra_lift'] = extralift }, PROTOCOL_ENGINE_SWITCH)
 
         displayLine(1, "MASTER: "..tostring(mst))
         displayLine(2, "ALTITUDE: "..tostring(alt))
         displayLine(3, "ATTITUDE: "..tostring(att))
-            
+        displayLine(4, "EXTRA LIFT: "..tostring(extralift))
+
         sleep(0.1)
     end
 end

@@ -21,8 +21,8 @@
 -- The OUTPUT ALLOCATION block is shared, line for line, with 77/78/80 vecengine.lua. Fix a
 -- bug in one and fix it in all four.
 
-PROTOCOL               = 'scout_thrustf'        -- in: UAC -> signed float, -1..+1
-PROTOCOL_ENGINE_SWITCH = 'scout_engineswitch'   -- in: master/altitude/attitude switch (#71)
+PROTOCOL               = 'aertogekiss_thrustf'        -- in: UAC -> signed float, -1..+1
+PROTOCOL_ENGINE_SWITCH = 'aertogekiss_engineswitch' -- in: master/altitude/attitude switch panel
 
 THRUST_SIGN = 1        -- flip to -1 if +thrust drives the aircraft backwards
 
@@ -63,9 +63,29 @@ THRUST_SIGN = 1        -- flip to -1 if +thrust drives the aircraft backwards
 --       Put the weight-1 sink LAST, or some totals cannot be expressed and show up as ! on
 --       the display.
 --
--- SCALE is what |thrust| = 1.0 is worth in channel units -- what the quantiser aims at. 15
--- for one plain line; raise it to the real capacity when a channel is wired across several.
-SCALE = 15
+-- SCALE is what |thrust| = 1.0 is worth in channel units -- what the quantiser aims at.
+--
+-- IT IS PER CHANNEL, AND `nil` MEANS "THIS CHANNEL'S OWN WIRED CAPACITY" (2026-08-28). It was
+-- a single number 15 for both channels, and that was the bug that left the secondary forward
+-- engine dead: `fwd` is wired across 45 units (a weight-2 line plus a weight-1 line, the
+-- two-bundle resolution trick #69 uses), but the quantiser only ever aimed at 15 of them.
+-- emit() fills highest weight first, so a demand that never exceeded 15 was spent almost
+-- entirely on the weight-2 line -- which itself only ever reached 7 of its 15 -- and the
+-- weight-1 line got `level mod 2`, i.e. 0 or 1, for the whole of the demand range. Forward
+-- thrust was capped at a third of what is bolted to the aircraft.
+--
+-- The resolved capacity of every channel was ALREADY being computed at boot (OUT.ch[x].cap)
+-- and then never read. It is what these default to now, so a correctly-declared WIRING needs
+-- no SCALE at all and cannot fall out of step with itself when a line is added.
+--
+-- THE TWO CHANNELS ARE NOT THE SAME SIZE ON THIS AIRCRAFT: fwd 45, aft 15. That is a fact
+-- about what is wired, not a setting -- so |thrust| = 1.0 astern commands a third of the force
+-- it commands ahead, and the aeroplane accelerates three times harder than it brakes. The UAC
+-- has no way to express that (it normalises both directions on CFG.THRUST_MAX), so its speed
+-- loop sees a kink at zero and trims through it on the integral. TO FIX IT PROPERLY, wire the
+-- aft bank across two lines the way fwd is and the asymmetry goes away on its own.
+-- Setting these to a number overrides the wiring; keep them nil unless there is a reason.
+SCALE = { fwd = nil, aft = nil }
 
 WIRING = {
     fwd = { { side = 'front', max = 15, weight = 1 }, { per = 'left', side = 'back', max = 15, weight = 2 } },   -- e.g. { { side = "back",  max = 15, weight = 2 }, { side = "right", max = 15 } }
@@ -161,6 +181,13 @@ do
     end
 end
 
+-- Resolve each channel's scale: the declared override, else what the wiring can actually
+-- express. A channel with no usable sink resolves to 0 and is simply never commanded.
+for _, name in ipairs({ "fwd", "aft" }) do
+    local c = OUT.ch[name]
+    c.scale = SCALE[name] or c.cap
+end
+
 -- Spread an integer channel level across that channel's sinks, biggest weight first. The
 -- leftover is 0 for any level the wiring can express, and shown as ! when it is not -- a
 -- demand that cannot be made is a wiring fact worth seeing, not a rounding detail.
@@ -209,15 +236,22 @@ local function thrustLoop()
             and msg.thrust == msg.thrust then
             local f = clamp(THRUST_SIGN * msg.thrust, -1, 1)
             if math.abs(f) < DEADBAND then f = 0 end
+            -- The two channels can have different capacities, so the grid the demand is
+            -- quantised onto depends on WHICH WAY it is pointing. Pick the scale first, then
+            -- quantise. The sigma-delta accumulator is shared across the sign change and so
+            -- carries at most half a unit into the other channel's units on the tick the
+            -- demand crosses zero -- the same half-unit bound it always had, and far smaller
+            -- than the step it is smoothing.
+            local sc = (f >= 0) and OUT.ch.fwd.scale or OUT.ch.aft.scale
             local steps
             if DITHER then
-                steps = ditherT(f * SCALE, -SCALE, SCALE)
+                steps = ditherT(f * sc, -sc, sc)
             else
-                steps = clamp(round(f * SCALE), -SCALE, SCALE)
+                steps = clamp(round(f * sc), -sc, sc)
             end
             if mst then emitAll(steps) else cutEngines() end
             line(3, string.format("DEMAND %+7.4f  ->  %+3d / %d  (%+6.1f%%)",
-                f, steps, SCALE, 100 * steps / SCALE))
+                f, steps, sc, (sc > 0) and (100 * steps / sc) or 0))
             line(4, string.format("carry  %+7.3f   active: %s", carryT(), tostring(mst)))
             line(6, string.format("LINES  fwd[%3d%s]  aft[%3d%s]",
                 OUT.ch.fwd.level, OUT.ch.fwd.err ~= 0 and "!" or " ",
@@ -231,7 +265,8 @@ local function thrustLoop()
             line(6, "LINES  fwd[  0 ]  aft[  0 ]")
             line(9, "LINK: no thrust signal - engines cut", colours.orange)
         end
-        line(7, string.format("scale %d   %s", SCALE,
+        line(7, string.format("scale fwd %d / aft %d   %s",
+            OUT.ch.fwd.scale, OUT.ch.aft.scale,
             OUT.armed and "wiring: ARMED" or "wiring: INCOMPLETE"),
             OUT.armed and colours.green or colours.orange)
     end

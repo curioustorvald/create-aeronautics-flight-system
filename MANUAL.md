@@ -2,6 +2,14 @@
 
 > A quaternion fly-by-wire autopilot for a Create: Aeronautics VTOL, on CC: Tweaked computers.
 
+> **New in the 2026-11-18 release** — the one-computer hand-flying stick (§6.10), runway
+> departures (§6.11), published approaches and route references (§6.12), terrain avoidance and the
+> terrain server (§6.13), the HUD/GPWS (§6.14), ATC — transponders, radar and an automated
+> landing-facility controller (§6.15), the PFD tapes (§6.1), and the **altitude datum** every hull
+> must now measure (§5, step 0). **Upgrading from the August build?** Read the upgrade notes in
+> [`CHANGELOG.md`](CHANGELOG.md) first: several config knobs are new and required. The deep
+> reference for every subsystem is in [`docs/`](docs/README.md).
+
 ---
 
 ## 0. Introduction — what this is
@@ -44,26 +52,31 @@ Everything talks over `rednet`, so the airframe is just: a few "brain" computers
 
 **Blocks you'll place on the aircraft**
 
-- 12 computers (Advanced Computers recommended — the UIs use colour and touch): 3 brains, 3 relays, 6 cockpit panels/sticks. *(The last 3 — the nav stick — are optional if you only want autopilot flight.)*
-- 2 Advanced Monitors (for the FMS's HSI map and the Altitude Selector's attitude indicator). Any size ≥ ~3×3 blocks reads well.
-- A **wireless (NOT ender) modem** on every computer — the whole system is one rednet network.
+- 8 computers for the core (Advanced Computers recommended — the UIs use colour and touch): 3 brains, 3 relays, the engine-switch panel and the one-computer hand-flying stick (`mancon/`, with a **typewriter**). *(The older four-computer stick — VS-commander, two button relays and the MIC — still ships as the alternative to `mancon/`. Either is optional if you only want autopilot flight.)*
+- Optional extras on the aircraft: a HUD/GPWS computer (monitor + speaker), an ATC responder, a keyboard joystick (FIXEDWING), a fore/aft thrust controller.
+- 2 Advanced Monitors (for the FMS's HSI map and the Altitude Selector's PFD). Any size ≥ ~3×3 blocks reads well.
+- A **wireless modem** on every computer — the whole system is one rednet network. (The terrain data server, on the ground, wants an **ender** modem for range.)
 - Redstone links from the three relay computers to your thruster banks.
 - Cockpit redstone in:
-  - **5 switches/levers** — 3 engine cut-offs → engine-switch computer, 2 autopilot toggles → autopilot-switch computer.
-  - **1 analog lever** — the vertical-speed stick → the VS-commander computer (an Analog Lever / redstone-integrator gives its 0–14 range; a plain lever is fine for the on/off switches).
-  - **6 momentary buttons** for the nav stick — 4 (fore/aft/strafe-left/strafe-right) → the MANCON translation relay, 2 (yaw-left/right) → the MANCON rotation relay. Buttons/keys, not latching levers: hold to move, release to stop.
+  - **6 switches/levers** — 4 engine cut-offs (master / altitude / attitude / extra lift) → engine-switch computer; the AP-NAV toggle → the FMS computer's `front`; the AP-ALT toggle → the Altitude Selector's `front`.
+  - With `mancon/`: a **typewriter** beside it, and optionally a lever for the scramble.
+  - With the four-computer stick instead: **1 analog lever** — the vertical-speed stick → the VS-commander computer (an Analog Lever / redstone-integrator gives its 0–15 range; 15 is the scramble detent) — and **6 momentary buttons** for the nav stick — 4 (fore/aft/strafe-left/strafe-right) → the MANCON translation relay, 2 (yaw-left/right) → the MANCON rotation relay. Buttons/keys, not latching levers: hold to move, release to stop.
+  - Optionally a **landing-gear contact** (the squat switch) into the MANCON rotation relay's `back`. The FMS and GPWS read it as ground truth for a touchdown, and the vertical channel holds the craft down on its gear once it is made.
+
+**Optional ground stations** (one per world, not on any aircraft): a nav data server (monitor + keyboard), a terrain data server (disk drive + ender modem, fed by the offline `terrainbuild` tool), a radar tower (monitor) and an ATC controller (monitor).
 
 ---
 
 ## 2. How it's put together
 
-Twelve computers on the aircraft: three read sensors and think ("brains"), three copy rednet numbers onto redstone ("relays"), and six read the cockpit and broadcast it ("panels/sticks", three of those being the nav stick). Two optional extras sit outside that core: a **keyboard joystick** (another way to hand-fly) and a **nav data server**, which is not on the aircraft at all but on the ground, feeding waypoints to a whole fleet.
+The core aircraft: three computers read sensors and think ("brains"), three copy rednet numbers onto redstone ("relays"), and the rest read the cockpit and broadcast it ("panels/sticks"). The diagram shows the four-computer hand-flying stick; the one-computer `mancon/` (§6.10) broadcasts the same two channels — `mancon` and `mancon_nav` — straight to the UAC. Outside that core sit the optional extras: a **keyboard joystick** (another way to hand-fly), a **HUD/GPWS** and an **ATC responder** on the aircraft, and on the ground a **nav data server**, a **terrain data server**, **radar** and an **ATC controller**, shared by a whole fleet.
 
 ```
   COCKPIT PANELS / STICKS (read switches & keys, broadcast state)
-    engine-switch     ─ engineswitch {master,altitude,attitude} ─►  the 3 RELAYS  (hardware enable)
-    autopilot-switch  ─ apswitch {nav, altitude} ────────────────►  the UAC       (flight mode)
-    VS-commander      ─ mancon {vs}  (wanted climb rate, m/s) ─────►  the UAC       (manual altitude)
+    engine-switch     ─ engineswitch {master,altitude,attitude,extra_lift} ─► the RELAYS (hardware enable)
+    AP-NAV toggle → FMS      ─ apswitch_1 {nav} ──────────────────►  the UAC       (flight mode)
+    AP-ALT toggle → ALT-AP   ─ apswitch_2 {altitude} ─────────────►  the UAC       (flight mode)
+    VS-commander      ─ mancon {vs, scramble} (wanted climb rate) ─►  the UAC       (manual altitude)
     NAV STICK: 2 relays ─ mancon_translational / mancon_rotational ─► MIC
                  MIC ─ mancon_nav {fwd, strafe (m/s), yaw (rad/s)} ──►  the UAC     (manual position + heading)
 
@@ -91,28 +104,39 @@ Twelve computers on the aircraft: three read sensors and think ("brains"), three
 | `altap` | ALT-AP → UAC | selected altitude `{alti}` |
 | `autoland` | FMS → UAC (+ ALT-AP listens) | vertical cmd: `hold` / `descend`+vs / `landed` / `release` / `cancel` / `off` |
 | `altoverride` | ALT-AP → FMS | "pilot tapped a panel mid-landing, wants ALT-AP" |
-| `apswitch` | AP panel → UAC | `{autopilot_nav, autopilot_altitude}` booleans — the flight mode (§6.6) |
-| `engineswitch` | Engine panel → relays | `{master, altitude, attitude}` booleans — hardware thruster enables |
-| `mancon` | VS-commander → UAC | `{vs}` — pilot's wanted climb rate (m/s), flown when altitude-hold is off |
-| `mancon_translational` | translation relay → MIC | `{fore, aft, sleft, sright}` booleans — the pilot's fore/aft/strafe keys |
-| `mancon_rotational` | rotation relay → MIC | `{yleft, yright}` booleans — the pilot's yaw keys |
-| `mancon_nav` | MIC → UAC | `{fwd, strafe (m/s), yaw (rad/s), active}` — wanted body velocity, flown when nav is off |
+| `apswitch_1` | FMS → UAC, relays, MANCON, GPWS | `{autopilot_nav}` — the AP-NAV toggle, wired into the **FMS** and re-announced every 0.1 s (§6.6) |
+| `apswitch_2` | ALT-AP → UAC, relays, GPWS | `{autopilot_altitude}` — the AP-ALT toggle, wired into the **Altitude Selector** |
+| `apswitch` | autopilot-switch → older relays | the two merged into one message; only the relays' status lines read it |
+| `engineswitch` | Engine panel → relays | `{master, altitude, attitude, extra_lift}` booleans — hardware thruster enables |
+| `mancon` | MANCON / VS-commander → UAC, GPWS | `{vs, scramble}` — pilot's wanted climb rate (m/s), flown when altitude-hold is off, and the scramble flag |
+| `mancon_nav` | MANCON / MIC → UAC | `{fwd, strafe (m/s), yaw (rad/s), active}` — wanted body velocity, flown when nav is off |
+| `mancon_translational` | translation relay → MIC | `{fore, aft, sleft, sright}` booleans — four-computer stick only |
+| `mancon_rotational` | rotation relay → MIC | `{yleft, yright}` booleans — four-computer stick only |
 | `kbdjoy` | keyboard joystick → UAC | `{pitch, roll (rad), throttle 0..1, active}` — the hand-flying stick (§6.8) |
-| `touchdown_detection` | rotation relay → FMS | `{touchedDown}` — the gear's squat switch, ground truth for a landing |
-| `apswitch_1` | FMS → AP panel | the FMS re-announces its own AP-NAV switch input, so the panel and the UAC agree |
-| `stab` | UAC → relay | `{left,right,front,back}` — pitch/roll |
-| `navcontrol` | UAC → relays | `{thrust_forward,thrust_backward,yaw_left,yaw_right,strafe_left,strafe_right}` |
-| `alt` | UAC → relay | `{up, down}` — up/down lift thrusters, 0..15, 7/7 = balanced hover |
+| `touchdown_detection` | rotation relay → FMS, GPWS | `{touchedDown}` — the gear's squat switch, ground truth for a landing |
+| `stab` | UAC → relay | `{pitch, roll}` — signed floats, ±1 = one full redstone line |
+| `navcontrol` | UAC → relays | `{thrust, yaw, strafe}` — signed floats |
+| `alt` | UAC → relay | `{up, down, cut}` — the two lift lines, each 0..1, already split either side of the hover trim; `cut` = lift engine off |
+| `thrustf` | UAC → fore/aft thrust controller | `{thrust}` — the fore/aft demand as one float, for a multi-line bank |
 
-One protocol is deliberately **not** prefixed, because it is shared by a whole fleet rather than
-owned by one aeroplane: **`aer_navdata`**, the nav data server's broadcast (§6.9).
+The UAC states every demand as a **float**; each relay quantises it onto its own redstone lines
+with a sigma-delta accumulator, so fractions of a step are paid out over the next few ticks
+instead of being thrown away. Every relay still accepts the older whole-step message shapes, which
+is what makes **relays first, UAC last** the safe order to update an aircraft in.
+
+Four protocols are deliberately **not** prefixed, because they are shared by a whole fleet rather
+than owned by one aeroplane: **`aer_navdata`** (the nav data server, §6.9), **`atc_broadcast`**
+(every responder, §6.15), **`aer_terrain`** (the terrain server, §6.13) and **`aer_atc`** (the ATC
+controller, §6.15). The full wire reference — every field, rate and what happens when a channel
+goes silent — is [`docs/01-protocols.md`](docs/01-protocols.md).
 
 > **Flying more than one aeroplane?** The prefix is what keeps them apart. Change it in
-> `pid/uacconf.lua` and `flight-management-system/apconf.lua` (and in the relay/panel programs,
+> `pid/uacconf.lua`, `flight-management-system/apconf.lua`, `mancon/manconconf.lua` and
+> `gpws-hud/gpwsconf.lua` (and in the relay/panel programs and `altcom.lua`/`responder.lua`,
 > where the names are written out) so each airframe has its own — otherwise one FMS commands
-> both aircraft. `aer_navdata` is the exception and should stay the same on all of them.
+> both aircraft. The four fleet-wide protocols are the exception and stay the same on all of them.
 
-All thruster values are **0–15** redstone steps. The lift channel is now **two lines** — an up-firing and a down-firing thruster group, balanced at **7/7** for hover (climb raises `up` and backs off `down`, descent the reverse); every other channel is a one-directional pair (one side or the other, 0 at rest). *(An earlier build sent a single 0..14 `alt` value that an external redstone contraption split into up/down — that box is gone; the UAC drives the two lines directly.)*
+Every thruster line is driven **0–15**. The lift channel is **two lines** — an up-firing and a down-firing thruster group, balanced around the hover trim (`CFG.ALT_NEUTRAL`; climb raises `up` and backs off `down`, descent the reverse); every other channel is a one-directional pair (one side or the other, 0 at rest).
 
 **Two layers of switch — don't confuse them.** The **engine** switches are hardware cut-offs read by the *relays*: with `master` off nothing moves at all; `attitude` powers the pitch/roll bank; `altitude` powers the lift bank. The **autopilot** switches are read by the *UAC* and choose how it flies (navigate vs. hand-off; hold-altitude vs. manual stick). For normal autopilot flight you want the engine switches **on** (thrusters live) *and* the autopilot switches set to the mode you want.
 
@@ -120,28 +144,36 @@ All thruster values are **0–15** redstone steps. The lift channel is now **two
 
 ## 3. Installation
 
-For each of the folders in this package, put its contents on one computer (its own `startup.lua` auto-launches it on boot). It doesn't matter what computer *IDs* Minecraft gives them — only that they all share one rednet network and have the right peripherals. *(The three `mancon-*` folders are the optional nav stick; `keyboard-joystick/` and `nav-data-server/` are optional too. Skip any of them if you only want autopilot flight on a single aeroplane.)*
+For each of the folders in this package, put its contents on one computer (its own `startup.lua` auto-launches it on boot). It doesn't matter what computer *IDs* Minecraft gives them — only that they all share one rednet network and have the right peripherals. *(Hand-flying is either `mancon/` or the four-computer stick — `vertical-speed-commander/` + the three `mancon-*` folders — never both. Everything marked optional can be skipped if you only want autopilot flight on a single aeroplane.)*
 
 The quickest way to copy files onto a CC computer is `wget`/`pastebin`, or edit them in-game, or (on a server) drop them into the computer's folder under `world/computercraft/computer/<id>/`.
 
 | Put this folder's contents … | … on a computer that has |
 |---|---|
 | `attitude-controller/` (→ `startup.lua`, `pid/`) | modem; is part of the aircraft (Sable). No monitor needed. |
-| `flight-management-system/` | modem; a monitor; part of the aircraft; keep `apconf.lua` **and** `points.db`/`course.db`/`landing.db` alongside `autopilot.lua`. A second monitor is the HSI. |
-| `altitude-selector/` | modem; a monitor; part of the aircraft. |
-| `thruster-relay-stabiliser/` | modem on **top**; redstone to the pitch/roll thruster bank. |
-| `thruster-relay-yaw-thrust/` | modem on **top**; redstone to the yaw + fore/aft banks. |
-| `thruster-relay-strafe-altitude/` | modem on **top**; redstone to the strafe + up/down lift banks. |
-| `vertical-speed-commander/` | modem (any side, **not** `top` — the stick uses `top`); analog lever into `top`. |
-| `engine-switch/` | modem on **top**; 3 redstone switches into `front`/`right`/`left`. |
-| `autopilot-switch/` | modem on **top**; 2 redstone switches into `right`/`left`. |
-| `mancon-translation-relay/` | modem on **top**; 4 momentary buttons into `back`/`front`/`left`/`right` (fore/aft/strafe-L/strafe-R). |
-| `mancon-rotation-relay/` | modem on **top**; 2 momentary buttons into `left`/`right` (yaw-L/yaw-R). |
+| `flight-management-system/` | modem; a monitor; part of the aircraft; keep `apconf.lua` **and** `points.db`/`course.db`/`landing.db` alongside `autopilot.lua`. A second monitor is the HSI. **The AP-NAV toggle switch is wired into this computer** (`CFG.APSWITCH.SIDE`, `front` as shipped). |
+| `altitude-selector/` | modem on **`back`**; a monitor; part of the aircraft. **The AP-ALT toggle switch is wired into this computer's `front`.** Set `ALT_OFFSET` at the top of `altcom.lua` (§5). |
+| `thruster-relay-stabiliser/` | modem (any side); redstone to the pitch/roll thruster bank. |
+| `thruster-relay-yaw-thrust/` | modem (any side); redstone to the yaw + fore/aft banks. |
+| `thruster-relay-strafe-altitude/` | modem (any side); redstone to the strafe + up/down lift banks. |
+| `engine-switch/` | modem (any side); 4 redstone switches into `front`/`right`/`left`/`back` (master / altitude / attitude / extra lift). Part of the aircraft. |
+| `autopilot-switch/` *(optional)* | modem on **top**. No switches: it merges the FMS's and ALT-AP's announcements into one `apswitch` message for the relays' status lines. |
+| `mancon/` | modem (any side); a **typewriter** peripheral; optionally a scramble lever and a monitor (sides in `manconconf.lua`). §6.10. |
+| `vertical-speed-commander/` | modem (any side, **not** `front` — the lever uses `front`); analog lever into `front`. |
+| `mancon-translation-relay/` | modem (any side); 4 momentary buttons into `back`/`front`/`left`/`right` (fore/aft/strafe-L/strafe-R). |
+| `mancon-rotation-relay/` | modem (any side); 2 momentary buttons into `left`/`right` (yaw-L/yaw-R); the landing-gear squat contact into `back`; the extra-lift thruster bank on `front`. With `mancon/` instead of the button panel, set `YAW_RELAY_ENABLED = false` at its top and keep it for the other two jobs. |
 | `mancon-intention-controller/` | modem (any side). No redstone, no monitor — it just listens and re-broadcasts. |
 | `keyboard-joystick/` *(optional)* | modem (any side); a **typewriter** peripheral; a monitor if you want the stick display (a single 1×1 block is enough — the panel is drawn for 15×10 cells). |
-| `nav-data-server/` *(optional)* | modem, monitor, keyboard — **on the ground, one per fleet, NOT on an aircraft.** Keep its `points.db`/`course.db`/`landing.db`: these are the masters. |
+| `gpws-hud/` *(optional)* | modem; a monitor (the HUD); a speaker; a disk drive for the voice-pack floppy. Part of the aircraft. §6.14. |
+| `atc-responder/` *(optional)* | modem. Part of the aircraft. Set `CALLSIGN`, `CSG` and `ALT_OFFSET` at the top of `responder.lua`. §6.15. |
+| `fore-aft-thrust-controller/` *(optional)* | modem; redstone to a fore/aft bank wired across several lines (`WIRING` at the top of `thrustcon.lua`). |
+| `vectoring-engine-controller/` *(optional)* | one per nozzle, on a three-nozzle airframe only — see `uacconf-tri-section.lua` beside it. |
+| `nav-data-server/` *(optional)* | modem, monitor, keyboard — **on the ground, one per fleet, NOT on an aircraft.** Keep its `points.db`/`course.db`/`landing.db`/`sites.db`: these are the masters. |
+| `terrain-data-server/` *(optional)* | **ender** modem, a disk drive holding the survey, optionally a monitor — on the ground, in a loaded chunk. §6.13. |
+| `atc-radar/` *(optional)* | modem, monitor. A tower on the ground (`atcconf.lua`), or an AWACS scope on an aircraft (`atcconf.awacs.lua` renamed to `atcconf.lua`). §6.15. |
+| `atc-controller/` *(optional)* | modem, monitor — on the ground. §6.15. |
 
-Then **open the modem** on each machine (the code does `rednet.open(...)` on the side shown — the relays and switch panels expect the modem on `top`; the UAC, FMS and VS-commander auto-find any modem). Reboot each computer; the relays and panels print their titles/state and the brains their UIs.
+The programs find their modem themselves, except `autopilot-switch/` (`top`) and `altitude-selector/` (`back`). Reboot each computer; the relays and panels print their titles/state and the brains their UIs.
 
 > The `.db` files are **example** navigation data. You can edit waypoints/routes live from the FMS touch screen (Section 6), so a fresh install can start from these or you can clear them.
 
@@ -157,61 +189,68 @@ Then **open the modem** on each machine (the code does `rednet.open(...)` on the
 
 ## 4. Wiring the thrusters
 
-The three relay computers each `rednet.open("top")` and copy message fields onto their **own** redstone sides with `redstone.setAnalogOutput`. Wire those sides to the redstone inputs of the matching Create: Aeronautics thruster banks.
+The three relay computers each take the UAC's float demand, quantise it onto their **own** redstone sides with a sigma-delta accumulator per line (`DITHER = true` at the top of each; `false` falls back to plain rounding), and drive them with `redstone.setAnalogOutput`. Wire those sides to the redstone inputs of the matching Create: Aeronautics thruster banks. **Which side fires for which sign is a named constant at the top of each relay** — rewire there, not in the code below it. The shipped sides are:
 
-**Stabiliser relay** — listens `aertogekiss_stab`:
+**Stabiliser relay** (`msg_to_gas_output.lua`) — listens `aertogekiss_stab`:
 
-| message field | redstone side | drives |
+| constant | side | fires on |
 |---|---|---|
-| `left`  | left  | one pitch-or-roll direction |
-| `right` | right | the opposite |
-| `front` | front | the other axis, one direction |
-| `back`  | back  | the opposite |
+| `PITCH_POS_SIDE` | back  | +pitch |
+| `PITCH_NEG_SIDE` | front | −pitch |
+| `ROLL_POS_SIDE`  | left  | +roll |
+| `ROLL_NEG_SIDE`  | right | −roll |
 
-**Yaw + fore/aft relay** — listens `aertogekiss_navcontrol`:
+**Yaw + fore/aft relay** (`hdgcon.lua`) — listens `aertogekiss_navcontrol`:
 
-| field | side | drives |
+| constant | side | fires on |
 |---|---|---|
-| `yaw_left`        | left  | yaw |
-| `yaw_right`       | right | yaw |
-| `thrust_forward`  | front | fore/aft |
-| `thrust_backward` | back  | fore/aft |
+| `YAW_POS_SIDE`    | right | +yaw |
+| `YAW_NEG_SIDE`    | left  | −yaw |
+| `THRUST_POS_SIDE` | front | forward thrust |
+| `THRUST_NEG_SIDE` | back  | astern |
 
-**Strafe + altitude relay** — listens `aertogekiss_navcontrol` **and** `aertogekiss_alt`:
+**Strafe + altitude relay** (`strafecon.lua`) — listens `aertogekiss_navcontrol` **and** `aertogekiss_alt`:
 
-| field | side | drives |
+| constant | side | fires on |
 |---|---|---|
-| `strafe_left`  | left  | strafe |
-| `strafe_right` | right | strafe |
-| `up`           | front | **up-firing** lift thrusters (0..15) |
-| `down`         | back  | **down-firing** lift thrusters (0..15) |
+| `STRAFE_POS_SIDE` | right | +strafe |
+| `STRAFE_NEG_SIDE` | left  | −strafe |
+| `UP_SIDE`         | front | **up-firing** lift thrusters (0..15) |
+| `DOWN_SIDE`       | back  | **down-firing** lift thrusters (0..15) |
 
-The lift is two lines now, not one — `up` and `down` are `UP_SIDE`/`DOWN_SIDE` constants at the top of `strafecon.lua`; rewire there if your banks sit elsewhere. At hover both read ~7; a climb drives `up` toward 15 and `down` toward 0. (If you're migrating from the old single-line lift, delete the external splitter contraption — the relay does the split now.)
+The lift is two lines either side of the hover trim; a climb drives `up` higher and `down` lower. Each relay zeroes its outputs if the UAC goes quiet for a second (the lift relay parks at the hover trim instead) — silence is a deadman, which is why the UAC broadcasts every tick even when nothing has changed.
+
+**Optional: the fore/aft thrust controller** (`fore-aft-thrust-controller/thrustcon.lua`) spends the UAC's `aertogekiss_thrustf` demand across several weighted lines (e.g. one bank driven from two lines at weights 2:1, for 45 steps of resolution instead of 15). Declare the lines in its `WIRING` table. **Wire the fore/aft thrusters to it *or* to the yaw+thrust relay, not both** — they carry the same demand at two resolutions.
 
 You do **not** need to get the pitch-vs-roll or the forward-vs-backward assignment "right" physically — the calibration step (next) has sign/swap switches that sort out any mirrored wiring in software.
 
 ### 4.1 Cockpit inputs (switches & the vertical-speed stick)
 
-Three more computers read redstone *in* from the cockpit and broadcast it. These drive nothing directly.
+These computers read redstone *in* from the cockpit and broadcast it. They drive nothing directly (except the rotation relay's extra-lift bank).
 
-**Engine switches** (`engine-switch/`, modem on `top`) — three on/off levers, broadcast on `aertogekiss_engineswitch`. These are **hardware cut-offs the relays obey**: a relay only energises its thrusters when its switch (and the master) is on.
+**Engine switches** (`engine-switch/`) — four on/off levers, broadcast on `aertogekiss_engineswitch`. These are **hardware cut-offs the relays obey**: a relay only energises its thrusters when its switch (and the master) is on.
 
-| input side | switch | effect when off |
+| input side | switch | effect |
 |---|---|---|
-| `front` | **master** | all relays hold output — the whole craft is dead-stick |
-| `right` | **altitude** | the lift (up/down) relay output is cut |
-| `left`  | **attitude** | the stabiliser (pitch/roll) relay output is cut |
+| `front` | **master** | off: all relays hold output — the whole craft is dead-stick |
+| `right` | **altitude** | off: the lift (up/down) relay output is cut |
+| `left`  | **attitude** | off: the stabiliser (pitch/roll) relay output is cut |
+| `back`  | **extra lift** | on: the MANCON rotation relay repeats the UAC's up-thrust onto an extra lift bank (for a heavy hull) |
 
-**Autopilot switches** (`autopilot-switch/`, modem on `top`) — two on/off levers, broadcast on `aertogekiss_apswitch`. These pick the **UAC's flight mode** (§6.6); they do not gate hardware.
+**Autopilot toggles** — two on/off levers that pick the **UAC's flight mode** (§6.6); they do not gate hardware. Each is wired into one of the brains, which re-announces it every 0.1 s so a dropped packet can never disengage the autopilot:
 
-| input side | switch | on = |
-|---|---|---|
-| `right` | **altitude** | autopilot holds a selected altitude; off = fly the vertical stick by hand |
-| `left`  | **nav** | autopilot navigates to the target; off = position handed to the pilot |
+| switch | wired into | broadcast on | on = |
+|---|---|---|---|
+| **nav** | the FMS computer, `front` (`CFG.APSWITCH.SIDE` in `apconf.lua`) | `aertogekiss_apswitch_1` | autopilot navigates to the target; off = position handed to the pilot |
+| **altitude** | the Altitude Selector computer, `front` | `aertogekiss_apswitch_2` | autopilot holds a selected altitude; off = fly the vertical stick by hand |
 
-**Vertical-speed stick** (`vertical-speed-commander/`, modem on any side *except* `top`) — one **analog** input on `top` (0–14, 7 = hold), broadcast as a wanted climb rate on `aertogekiss_mancon`. Use an Analog Lever or a redstone integrator so you get the full 0–14 swing. It is only obeyed when the autopilot **altitude** switch is off. **Wire the stick so a cut/absent signal reads 7** (0 would command a full-rate descent).
+The optional `autopilot-switch/` computer reads no switches; it merges the two announcements into `aertogekiss_apswitch` for the relays' status lines.
 
-**Nav stick** (`mancon-translation-relay/` + `mancon-rotation-relay/` + `mancon-intention-controller/`) — the horizontal/yaw equivalent of the VS stick, built from three computers. The two relays each `rednet.open("top")` and read **momentary buttons** (hold to move, release to stop):
+**Hand-flying.** The one-computer `mancon/` is described in §6.10. The rest of this section is the four-computer alternative.
+
+**Vertical-speed stick** (`vertical-speed-commander/`) — one **analog** input on `front` (0–14 proportional, 7 = hold; **15 = scramble**, full lift at once), broadcast as a wanted climb rate on `aertogekiss_mancon`. Use an Analog Lever or a redstone integrator so you get the full swing. The rate is only obeyed when the autopilot **altitude** switch is off; the scramble overrides everything. **Wire the stick so a cut/absent signal reads 7** (0 would command a full-rate descent).
+
+**Nav stick** (`mancon-translation-relay/` + `mancon-rotation-relay/` + `mancon-intention-controller/`) — the horizontal/yaw equivalent of the VS stick, built from three computers. The two relays read **momentary buttons** (hold to move, release to stop):
 
 | relay | input side | key |
 |---|---|---|
@@ -224,6 +263,8 @@ Three more computers read redstone *in* from the cockpit and broadcast it. These
 
 The **MIC** (intention controller) listens to both relays, integrates the key-presses into a wanted body velocity — holding a key ramps that axis up, releasing fades it to 0 — and broadcasts it on `aertogekiss_mancon_nav`. The UAC flies it **whenever the autopilot nav switch is off**: with nav off you steer the aircraft directly, and with a key released the UAC holds heading and nulls drift. The two relays only transmit while the engine **master** is on *and* the autopilot **nav** switch is off, so the stick is silent (and the autopilot has full control) during automatic flight.
 
+**Squat switch** — the MANCON rotation relay also reads a landing-gear contact on `back` and broadcasts it on `aertogekiss_touchdown_detection`. The FMS and the GPWS treat it as ground truth for a touchdown, and once it is made the vertical channel stops holding an altitude and holds the craft down on its gear (§6.4). Without one the landing falls back to the altimeter. Keep this computer for the squat switch and the extra-lift bank even if you fly with `mancon/` — set `YAW_RELAY_ENABLED = false` at its top so it stops sending yaw keys nobody reads.
+
 ---
 
 ## 5. First boot & calibration (do this once, on the ground / tethered)
@@ -235,6 +276,19 @@ Every airframe is different, so a handful of **sign** switches must be set once.
 There is a throwaway helper, **`pid/probe.lua`**, you can `probe` (run) on the UAC computer first: it prints the quaternion API, the inertia-tensor shape, and lets you hand-rotate the craft to see the angular-velocity frame.
 
 Recommended order (all switches are in `CFG`):
+
+0. **Altitude datum — `ALT_OFFSET`.** Every altitude in the system is the world Y of the **bottom of the hull**, because everything it is compared with — `landing.db`'s pad and runway elevations, the terrain survey — is the world Y of a piece of ground. Sable reports the assembly's pose, which sits somewhere up inside the aeroplane, so every computer on the hull subtracts `ALT_OFFSET` the moment it reads the pose. **Measure it once**: set it to `0`, park the aircraft on ground of a known Y, read the altitude the UAC screen (or the PFD) shows, and take *(that reading) − (the ground's Y)*. Then put the **same number** in every place that carries it:
+
+   | file | where |
+   |---|---|
+   | `attitude-controller/pid/uacconf.lua` | `CFG.ALT_OFFSET` |
+   | `flight-management-system/apconf.lua` | `CFG.ALT_OFFSET` |
+   | `altitude-selector/altcom.lua` | `local ALT_OFFSET` at the top |
+   | `gpws-hud/gpwsconf.lua` | `CFG.SHIP.ALT_OFFSET` |
+   | `atc-responder/responder.lua` | `local ALT_OFFSET` at the top |
+   | `atc-radar/atcconf.lua` | `CFG.STATION.ALT_OFFSET` — **AWACS (dynamic) mode only**; a tower's `STATION.Y` is a surveyed elevation and takes none |
+
+   The shipped value is `9`, the *Aer Togekiss*'s. **No program defaults it** — 0 is a legal value (a display bench has no hull), so a missing one is a boot error rather than an aeroplane that reads 9 m high and lands into the pad.
 
 1. **Sensor frame** — `CFG.SENSOR_FRAME`. Leave `"body"` (correct for this airframe family). Symptom of wrong: levels fine near heading 0 but wanders once yawed ~90°.
 2. **Levelling** — hand-tilt the craft; it must right itself. If a nose-up disturbance is answered nose-*up* (it diverges), flip `CFG.PITCH_SIGN`; same for `CFG.ROLL_SIGN`. If a *pitch* command makes the craft *roll* (channels crossed), set `CFG.SWAP_PITCH_ROLL_CHANNELS = true`.
@@ -257,7 +311,9 @@ That's it — after this the aircraft flies. The tuning knobs (speed, damping, e
 
 Four altitude presets. **Tap the ALT button** under a panel to select that altitude — it goes red and the aircraft climbs/descends to it and holds. Type a new number on a panel's keypad and press **Ent** to change it. On boot **nothing is selected** (all green) and the craft simply **holds its current altitude** until you pick one.
 
-The external **monitor** on this computer is the **Attitude Indicator**: an artificial horizon (blue sky / brown ground, tilting with roll, shifting with pitch), with **GS** (ground speed), **ALT** (altitude) and **VS** (vertical speed) read out in the corners. Around it is a thin **bezel with a bank pointer** (orange) that rides a fixed scale (ticks at 0 / ±30 / ±60°) — like a real AI, it reads *roll only* and never moves with pitch, so bank stays readable even in a steep climb or dive when the horizon has slid off-screen.
+The external **monitor** on this computer is the **PFD** (primary flight display): an artificial horizon (sky over ground, tilting with roll, shifting with pitch) with a **pitch ladder**, a **bank scale** and a **flight-path marker** (a small ring offset by your actual drift, hidden below 5 m/s where it means nothing). All of it is drawn at 2×3 sub-character resolution using CC's teletext glyphs, so the horizon is a smooth line rather than a staircase of cells. Down the left edge is a scrolling **speed tape** (ground speed); down the right a scrolling **altitude tape** carrying the ALT-AP **bug**, and beside it a **VS scale** with a moving needle. On a monitor too narrow for the tapes it falls back to corner readouts of GS, ALT and VS.
+
+The tape spacing and the VS scale's full-scale value are named constants near the top of `altcom.lua` (`SPD_STEP`, `ALT_STEP`, `TAPE_GAP`, `VS_FULL`) — set `VS_FULL` a little above the fastest climb your aircraft is ever commanded to fly. The same file carries the **protocol names and `ALT_OFFSET`** at its top (it has no conf file): keep them matching the rest of the hull.
 
 ### 6.2 Flight Management System (FMS) — the touch screen
 
@@ -271,7 +327,7 @@ This is your navigator. From its screen you can:
 
 Everything the FMS can be retuned or rewired with — protocol names, database filenames, the heading sign convention, cruise speeds, the path planner's physics, the landing profiles, the instrument scales — lives in **`apconf.lua`** beside `autopilot.lua`, not in the program (§7.1).
 
-The external **monitor** on this computer is the **HSI**, and it has **two modes**:
+The external **monitor** on this computer is the **HSI**. In normal flight it has two views — the VOR/HSI below and the **PLAN view** (the flight course drawn as a line over a terrain-hazard map, with obstacles and traffic; §6.13) — and it switches to the landing map once a landing engages:
 
 - **While navigating a course / direct-to** it's the classic **VOR / HSI**: a heading-up compass rose (the "squarised circle"), a **course line**, a green/yellow **course-deviation needle**, and the **heading number** — plus DTK (desired track), XTK (cross-track metres, L/R) and distance-to-go. The course line is drawn as a **two-tone compass needle**: the tip pointing at the waypoint is lit, the tip pointing the opposite way is dark, so you can read **TO** or **FROM** off the instrument the way you would a physical compass. It flips as the fix goes abeam, and within a few degrees of abeam — where the question has no meaningful answer — both tips go grey. The same reading is spelled out as `TO` / `FR` / `--` beside the DTK number. On a curved route the course line and needle follow the **flown curve** — DTK is the curve's *tangent* and XTK your deviation *from the curve* — so the needle centres when you're tracking the curve, not the straight leg. Top-left **CMD** reads the commanded speed and top-right **GS** your ground speed.
 - **Once a landing engages** (auto or manual) it switches to a **heading-up top-down map** for flying the approach or watching the autoland. Your aircraft sits fixed at the centre as a nose-up `^` while the compass card and the **landing site** rotate under it (dead ahead is the top). A pad is an `H` with a short line marking its approach heading; a **runway** is drawn as the strip itself — threshold `+`, a lime cell at the touchdown aim point, and a line running down to the far end. The scale auto-ranges (shown as `R__m`) so the pad creeps in as you close. The **top row is a heading-error bar** — a bright marker shows how far the pad's landing heading is off your nose, green when aligned. The **bottom row** shows the landing numbers: phase / AGL / VS / position error / heading error — or, on a runway approach, phase / AGL / **glidepath deviation** / cross-track / runway still to run. A runway approach also gets a **glideslope pointer** up the right-hand edge: like the course needle it marks *where the glidepath is*, so fly toward it — high on the approach puts it below the centre tick.
@@ -368,7 +424,11 @@ Two banks of physical switches, plus one stick, sit between you and the autopilo
 
 Flipping the **altitude** switch on grabs the *current* altitude to hold (a live ALT-AP panel selection then takes over within a second); flipping it off hands the vertical to the VS stick. Flipping the **nav** switch off hands the horizontal position and heading to the **nav stick** — with no key pressed the UAC just holds the current heading and station. An **automatic landing in progress overrides both switches** — it owns the craft until it finishes or you abort.
 
-**Vertical-speed stick** — active whenever the autopilot **altitude** switch is off. Centre (7) holds level; push up to climb, down to descend, proportionally, up to `VS_MAX_CMD`. The UAC executes the rate through the *same* inner loop it uses for altitude-hold, so it's attitude-aware (it still lifts you straight up even nose-high) and it learns the hover trim as you fly. The stick only *asks* for a rate; the UAC clamps it to what the airframe can actually do (`CLIMB_MAX`/`DESCEND_MAX`).
+*Below, "VS stick" and "nav stick" mean either shape of hand-flying: the one-computer `mancon/` (SPACE/Z and WER/SDF, §6.10) or the four-computer lever and button panel. They feed the UAC the same two channels.*
+
+**Vertical-speed stick** — active whenever the autopilot **altitude** switch is off. Centre (7) holds level; push up to climb, down to descend, proportionally, up to `VS_MAX_CMD`. The UAC executes the rate through the *same* inner loop it uses for altitude-hold, so it's attitude-aware (it still lifts you straight up even nose-high) and it learns the hover trim as you fly. The stick only *asks* for a rate; the UAC clamps it to its **manual** envelope (`MANCON_CLIMB_MAX`/`MANCON_DESCEND_MAX`), which may be wider than the autopilot's `CLIMB_MAX`/`DESCEND_MAX`.
+
+**Scramble** — the stick's top detent (VS lever at 15; `V` or the scramble lever on `mancon/`). Not a rate: the UAC opens the lift fully, bypassing the rate loop, and it **overrides ALT-AP and an autoland** for as long as it is held. It is the "get us up now" control, and works in every autopilot mode.
 
 **Nav stick** — active whenever the autopilot **nav** switch is off. The fore/aft/strafe/yaw keys command a *body velocity*: hold a key and the aircraft accelerates that way (up to the MIC's per-axis limit), release and it fades to a stop; with everything released the UAC holds heading and nulls drift, so it station-keeps. Because the keys are fed as a velocity into the UAC's own loops it flies steady and attitude-aware like the autopilot, and since it runs independently it's also your quick manual course-change override any time nav is off.
 
@@ -426,6 +486,126 @@ Its display is drawn for a **single 1×1 monitor** (15×10 cells): a stick box, 
 - **Its roster is the point of it.** Each aircraft appears with its label, the revision it holds and its state: `IN SYNC`, `HELD <screen>` (the pilot is on a screen where swapping the database under them would be unsafe — it will apply as soon as they leave it), a fault, `UPDATING`, or `SILENT`. This is how you confirm an edit actually reached an aeroplane rather than assuming it.
 - **An update can never move a flight already under way.** The flown plan is a snapshot taken when it was confirmed, so a refresh that moves, renames or deletes a waypoint you are currently flying to changes nothing until the *next* plan.
 - The server refuses to send a points file that has stopped looking like one, so a corrupt master cannot wipe the fleet's databases from the air. Coordinates must be **whole numbers**, or the aircraft will silently drop the point.
+- It **re-reads its `.db` files from disk before every send**, so a file edited by hand (or by another program) goes out on the next broadcast without restarting anything.
+- It also carries **`sites.db`** to the ATC controller (§6.15). The HUD/GPWS, the radar scopes and the ATC controller are clients too, so every map in the world is drawn from the one database the aircraft fly.
+
+### 6.10 MANCON — the whole hand-flying stick on one computer
+
+*`mancon/`, replacing the four-computer stack.* One computer reads a **typewriter** peripheral and broadcasts both manual channels the UAC flies: `aertogekiss_mancon` (the vertical, and the scramble flag) and `aertogekiss_mancon_nav` (fore/aft, strafe, yaw). Everything it needs to know — protocol names, key codes, rates, limits, sides — is in **`manconconf.lua`** beside it.
+
+```
+    W  strafe left     E  fore      R  strafe right
+    S  yaw left        D  aft       F  yaw right
+
+    SPACE climb    Z descend    A boost    V scramble
+```
+
+- **Every axis is spring-loaded.** Hold a key and that axis ramps toward its ceiling; let go and it falls back to zero — the aircraft brakes to a hover and holds heading, or stops climbing and holds height. Opposing keys held together cancel.
+- **A is a boost**, not a command: held with any other key it raises that axis's ceiling (`NAV.BOOST_*`, `VS.BOOST_MAX_CMD`). The vertical boost only works up to the UAC's **manual** envelope, `CFG.MANCON_CLIMB_MAX`/`MANCON_DESCEND_MAX` — keep the two files in agreement.
+- **V is the scramble**: full lift at once, bypassing the rate loop, overriding ALT-AP and an autoland. A **digital redstone lever** (`CFG.VS.SIDE`, `front` as shipped) is a second, keyboard-independent path to the same scramble. `CFG.IN_SCRAMBLE` can name a third — a protocol another computer sends `true` on (an automatic pull-up, say). All three are ORed here and leave as **one** flag, because two senders on one protocol fight.
+- The horizontal keys read as released while AP-NAV is on or the engine master is off (`LOCK_ON_APNAV`, `LOCK_ON_MASTER`). The vertical is gated by neither: the UAC itself ignores it while ALT-AP is on.
+- An optional monitor (`CFG.MONITOR_SIDE`) shows the stick positions, the boost and any lockout.
+
+`get_keycodes.lua` prints the code of any key you press, if you want to remap the cluster. **Do not run `mancon/` alongside the VS-commander or the MIC** — they broadcast the same two protocols.
+
+### 6.11 Runway departures
+
+*Configured in `apconf.lua`'s `CFG.DEP`. New in this release and exercised under a simulator only — every number in `CFG.DEP` is an estimate until you fly it.*
+
+Commit a plan (DIRECT, ROUTE, or the auto-router) while the aircraft **stands on a published runway** — near-stationary, on the strip, within `GROUND_AGL` of its surveyed elevation, and not reported airborne by the squat switch — and the FMS flies it off the runway, in any flight mode:
+
+```
+READY ──(AP-NAV on)──▶ ALIGN ──▶ LINEUP ──▶ ROLL ──(VR)──▶ CLIMB ──(CLIMB_AGL)──▶ the route
+```
+
+It turns onto the runway heading and the centreline (backtracking down the strip if it is standing past the best start point), rolls with the lift cut, rotates at `VR`, climbs straight out past the far end, and only then turns for the first fix — instead of rising off the strip and turning across it. **Departures are flown only in a direction `landing.db` publishes**: a strip used both ways must publish both ends. Anywhere else — airborne, on a pad — a commit behaves exactly as before. Tapping a panel on the Altitude Selector gives the take-off up and flies the plan as an ordinary one from wherever the aircraft is.
+
+### 6.12 Published approaches, go-around circuits and route references
+
+`landing.db` holds four kinds of record (full syntax in [`docs/09-navigation-database.md`](docs/09-navigation-database.md)):
+
+| record | shape | what it is |
+|---|---|---|
+| landing site | `NAME=heli\|rwy,dir,alt,length` | a pad or a runway threshold (§6.3) |
+| go-around leg | `id=goaround,sx,sz,ex,ez,alt` | the older straight-leg missed-approach shape (§6.3) |
+| **go-around circuit** | `id=goaround-wp,minAlt,FIX,FIX,…` | **preferred.** The whole pattern drawn fix by fix, starting *and* ending at the runway it serves. It is flown like any route and descends by extending the glidepath back along it — no geometry to get right |
+| **published approach** | `id=appr,minAlt,FIX,FIX,…,SITE` | **how an aircraft arrives.** Publish one per direction a field can be arrived from; it must end at the site |
+
+When a plan is prepared for a landing, the FMS **chooses the published approach that suits the aircraft's current position and heading**, splices its fixes in, and flies its minimum altitude and its field's missed-approach circuit. An approach is never flown backwards.
+
+`course.db` routes may now use **references** as tokens:
+
+```
+WAX-TMU=WAX,WAU-TMU                  <- "WAX, then whatever the route WAU-TMU flies"
+TMU-TMV=TMU,TAIMU,PDRNT,TMV_APPR4    <- "...then arrive by the published approach TMV_APPR4"
+```
+
+A route that names its approach is flown with that one rather than leaving the FMS to choose. References may nest (`CFG.COURSE_MAX_REF` deep).
+
+> **Known limitation:** an exact 180° reversal in a point list (a procedure turn) is dropped from the plan rather than flown, because the corner solver cannot build it. The aircraft flies straight on past the apex.
+
+### 6.13 Terrain: the terrain server, terrain avoidance and the HSI map
+
+*Create: Aeronautics* gives an aircraft its own pose, but nothing gives it the shape of the world. **`terrain-data-server/`** fills that in: a ground computer serving a terrain survey fleet-wide on `aer_terrain`. The survey is built **outside the game** by `terrainbuild` — a Java program (source in `terrain-data-server/terrainbuild/`, `build.sh` builds the jar, JDK 17+) that reads the world's region files directly and writes one tile per region onto a CC disk. Put the jar beside your server launcher, run `java -jar terrainbuild.jar build` once with the server stopped, then `terrain-update.sh` from cron to keep it current around the aircraft. Everything about the format, the heights and the builder's options is in [`terrain-data-server/TERRAIN.md`](terrain-data-server/TERRAIN.md).
+
+The survey is **one height per 16×16 m chunk, per 8 m of Y, and errs high on purpose** — it reports the top of the highest ground in each chunk, so clearance reads low and warnings come early.
+
+With a terrain server running, three things wake up:
+
+- **Terrain avoidance** in the FMS (`CFG.TAVOID`): an automatic altitude floor. It looks along the track to the next waypoint, and if the aircraft is below the highest charted ground plus `CLEAR_M` it takes the vertical channel and **climbs** to clear it, ratcheting up as taller ground slides into view. It never descends you — ALT-AP or you do that — and it only runs with AP-NAV on, never during a landing or go-around. Tapping an ALT-AP panel releases it for 30 s.
+- **The HSI's terrain overlay** (`CFG.TERR`) and its **PLAN view**: a second normal-flight face showing the flight course as a line over a terrain-hazard map, with obstacles and traffic.
+- **The GPWS terrain modes** (§6.14).
+
+If the server goes quiet, every one of them stands down and changes nothing — a terrain hold in force stays where it is until you release it.
+
+### 6.14 HUD / GPWS
+
+*`gpws-hud/`, configured in `gpwsconf.lua`.* A head-up display and a ground-proximity warning system. **It controls nothing** — every link is receive-only and nothing it does can move a thruster.
+
+The HUD is laid out for a monitor mounted **above the pilot's eye line**, so its most important rows are at the *bottom*: reading upward, the alert banner, speed / height / sink, the heading scale, annunciators (AP-NAV / AP-ALT / engines / squat / mode), the attitude field, and the route.
+
+The alerts, each with its own envelope and inhibits in `gpwsconf.lua`:
+
+| alert | when |
+|---|---|
+| SINK RATE / PULL UP | excessive descent rate for the height (Mode 1) |
+| TERRAIN / TERRAIN TERRAIN PULL UP | terrain closing fast (Mode 2) — needs the terrain server |
+| TERRAIN AHEAD / OBSTACLE AHEAD | the forward-looking survey, cut at the FMS's next waypoint — needs the terrain server |
+| DON'T SINK | height lost after take-off (Mode 3) |
+| TOO LOW TERRAIN | unsafe clearance away from a landing (Mode 4) |
+| BANK ANGLE | an excessive bank |
+| DECISION HEIGHT | passing decision height on a final approach (Mode 6) |
+| AUTOPILOT DISCONNECTED | an AP switch going off, or an engaged autopilot's channel going silent |
+
+Its height datum is the best it has: the published elevation of a nearby `landing.db` field on approach, else the terrain survey, else nothing — and every mode that needs a datum is disarmed when there is none. An approach the FMS is flying at a rate it would itself command is an arrival, not a mistake, and is not warned about.
+
+**The voice** plays from a **voice-pack floppy** in an attached disk drive, found by a manifest file on it (`CFG.VOICE.MARKER`). Clips are raw PCM — mono, unsigned 8-bit, 48 kHz — named `<lang>_<word>.bin`; `gpwsconf.lua` explains how to encode them with `ffmpeg`. **No clips ship with this package**: commercial GPWS voice recordings are copyrighted. Without a pack the HUD still shows every alert.
+
+### 6.15 ATC — responders, radar and the automated controller
+
+Three cooperating pieces, all optional.
+
+**Responders** (`atc-responder/`, one per aircraft) are transponders: 20 times a second each broadcasts its aircraft's position, altitude, ground and vertical speed, velocity vector, heading, callsign and IFR flag (AP-NAV on) on the fleet-wide `atc_broadcast`. Set `CALLSIGN`, the three-letter `CSG` and `ALT_OFFSET` at the top of `responder.lua`. Every FMS listens too, and draws the traffic on the HSI's PLAN view.
+
+**Radar** (`atc-radar/`) paints that traffic over the nav database. It is the same program in two modes, chosen by `CFG.STATION.MODE` in `atcconf.lua`:
+
+- `static` — a **tower**, centred on `STATION.X/Z` at surveyed elevation `STATION.Y`, oriented north (or any compass direction). This is what `atcconf.lua` ships as.
+- `dynamic` — an **AWACS scope** on an aircraft, centred on itself off Sable and turned heading-up or track-up (the `[NUP]` button forces north-up). It needs the hull's `HEADING_SIGN`/`HEADING_OFFSET` and `ALT_OFFSET`, and `OWN_CALLSIGN` so its own responder is not drawn on top of itself. `atcconf.awacs.lua` is a ready example — rename it to `atcconf.lua`.
+
+The scope transmits nothing to any aircraft: pilots fly themselves; it shows whoever is in the tower what is out there.
+
+**The automated controller** (`atc-controller/`, one per world) allocates **landing facilities**. You group the pads and runways of an aerodrome into a *site* in **`sites.db`** (edited on the nav data server, which carries it):
+
+```
+SITE=FACILITY,FACILITY(remark),...
+TMU=TMU,TMA(narrow),TMN(narrow)
+```
+
+An FMS inbound to a facility asks on `aer_atc` once it is within reach, and is told **cleared**, **divert** to another facility of the same site (offered in the order written), **hold** (hover or, for a FIXEDWING, orbit short of the field), or **uncontrolled** (the facility is in no site). The only remark today is `narrow`, which refuses an aircraft whose `apconf.lua` says `CFG.ATC.WIDE = true`; an unknown remark closes the facility rather than being ignored. Occupancy comes **only from responders**, so an aircraft without one is invisible to it; aircraft that fall silent while parked are remembered on disk (`parked.db`). It allocates ground only — no headings, altitudes or separation in the air.
+
+**Fail silent, both ways:** with no controller, every FMS lands where its plan says. A hold in force stays in force if the controller stops answering — the pilot's way out is **RELEASE ATC** on the FMS status screen, or any new plan. The client is switched per airframe with `CFG.ATC.ENABLE`.
+
+*The controller has run in the author's world but not yet through a complete flight test.*
 
 ---
 
@@ -452,6 +632,15 @@ All optional once the signs (Section 5) are right. Numbers are the shipped defau
 | `MANCON_STALE_AFTER` | manual-stick timeout — if the VS-commander goes quiet, the vertical falls back to a neutral hover. |
 | `MANNAV_*` | the manual **nav** stick: `MANNAV_ENABLE`; `MANNAV_YAW_SIGN` (flip if a manual yaw command turns the wrong way); `MANNAV_STALE_AFTER` (nav-stick timeout → hold heading/station). |
 | `ENABLE_ATTITUDE/TRANSLATION/ALTITUDE` | bring channels up one at a time during first setup (source-level debug isolators, independent of the AP switches). |
+| `ALT_OFFSET` | the altitude datum (§5 step 0). Must match every other computer on the hull. |
+| `MANCON_CLIMB_MAX` / `MANCON_DESCEND_MAX` | the **manual** vertical envelope — what the VS stick (and `mancon/`'s boost) may command. Separate from `CLIMB_MAX`/`DESCEND_MAX` so the stick can reach past what ALT-AP and the autoland fly without loosening those. Keep ≤ `CLIMB_AT_FULL`. |
+| `MANCON_SCRAMBLE` / `MANCON_SCRAMBLE_OVERRIDE` | what the scramble flag does, and whether it overrides ALT-AP and an autoland. |
+| `LOOP_PERIOD` | the control loop's target period, s (`0.05`). The loop is **deadline-paced**: a tick that has already run long yields instead of sleeping another whole period. Never nil, never 0. |
+| `SLOW_POLL_PERIOD` | s between reads of the inertia tensor and mass, which change only when the airframe does — two fewer blocking calls per tick. |
+| `DISPLAY_PERIOD` | s between redraws of the UAC's own screen. |
+| `LOG_ENABLE` (+ `LOG_FILE`, `LOG_DELAY`, `LOG_SECONDS`, `LOG_EVERY`) | the **flight data recorder**: one CSV row per tick to `LOG_FILE`, for reading a fault off a record instead of a memory. Off by default. |
+
+> **Why the loop rate matters.** On a server, a CC computer's calls into the game (Sable reads, rednet broadcasts, `sleep`) are served on the main thread, a whole game tick at a time — so a loop that asks for 20 Hz may get 4. Every gain in the shipped `uacconf.lua` was tuned against the rate the loop really achieves. `tools/tickprobe.lua` measures what your server gives a computer; `pid/uacprof.lua` measures what each class of call costs the UAC in ticks. Run them before blaming a gain.
 
 > The vertical-speed stick's full-scale rate is `VS_MAX_CMD` in **`vertical-speed-commander/vspdpid.lua`** (in m/s). Keep it at or just below the UAC's `CLIMB_MAX`, or the top of the stick travel just saturates against the UAC's cap.
 >
@@ -461,7 +650,7 @@ All optional once the signs (Section 5) are right. Numbers are the shipped defau
 
 `apconf.lua` is to the FMS what `uacconf.lua` is to the attitude controller: **all** of its configuration, and none of its logic. It returns one `CFG` table holding the rednet protocol names, the `.db` filenames, the heading sign/offset (which **must** match the UAC's), the FULL/SLOW cruise presets, the waypoint pass radii (`RAD`), the path planner (`DC`), the landing profiles (`LG`), the instrument scales and both colour palettes. `autopilot.lua` keeps no fallback copy of any of it, so a missing or half-saved file stops the computer at boot naming the missing knob.
 
-The two tables you are most likely to touch are `DC` (below) and `LG` (§7.2).
+The two tables you are most likely to touch are `DC` (below) and `LG` (§7.2). Four more were added in this release, each with an `ENABLE` and its reasoning written beside every value: **`DEP`** (runway departures, §6.11), **`TAVOID`** (terrain avoidance, §6.13), **`TERR`** (the HSI terrain overlay and PLAN view, §6.13) and **`ATC`** (the ATC client, §6.15 — including `WIDE`, whether this airframe is too wide for strips marked `narrow`). `CFG.ALT_OFFSET` is the altitude datum (§5 step 0); `CFG.COURSE_MAX_REF` caps how deep route references may nest (§6.12). [`docs/02-fms-autopilot.md`](docs/02-fms-autopilot.md) §12 maps every section.
 
 **`DC` — trajectory.** How the FMS plans its **path** and its **speed**. The path is built **once**, when you confirm a plan — not re-evaluated every tick. Each interior waypoint gets an explicit `straight → clothoid → arc → clothoid → straight` fly-by transition, and a solver iterates geometry against speed until both agree. All optional; the defaults suit the *Aer Togekiss*.
 
@@ -573,6 +762,13 @@ The two tables you are most likely to touch are `DC` (below) and `LG` (§7.2).
 | HSI heading/map reads rotated or mirrored | the compass conversion is the one `toCompass()` in autopilot.lua (shared by both HSI modes). Course mode: the **CDI needle** deflection is a one-character sign flip in `drawCourseHSI`. Landing mode: the heading-bar turn direction is the sign on `err` in `drawLandingHSI`. |
 | AI bank pointer moves the **wrong way** | flip the roll sign on the pointer in `drawAI` (altcom.lua) — it's the one marked bank switch. |
 | Two computers fight over the thrusters | only **one** controller may own `aertogekiss_navcontrol`/`stab`/`alt`. Don't run the retired `navcom`/`control` alongside the UAC. |
+| Manual climb or scramble **flickers on and off** | two computers are broadcasting `aertogekiss_mancon` — e.g. `mancon/` *and* the VS-commander. One protocol, one sender: run one stick or the other. |
+| A computer **stops at boot naming `ALT_OFFSET`** (or `LOOP_PERIOD`, `DEP`, `TAVOID`…) | its conf file predates this release. See the upgrade notes in `CHANGELOG.md`. |
+| Lands **into the pad** / reads several metres high on the ground | `ALT_OFFSET` not measured, or not the same on every computer of the hull (§5 step 0). |
+| Runway **take-off never starts** (sits at READY) | it waits for AP-NAV on. If it never engages at all, the aircraft was not on a published runway end: check `landing.db` publishes the direction you want to depart in, and that the squat switch is not reporting airborne. |
+| FMS holds short of a field saying **HOLD** | the ATC controller has the facility occupied. The status screen names why; **RELEASE ATC** flies on unmanaged. |
+| GPWS/HUD shows alerts but **says nothing** | no voice-pack floppy is found (the computer's own screen says so), or no speaker is attached. |
+| Terrain avoidance / GPWS terrain modes **never arm** | the terrain server is not heard (it wants an ender modem and a loaded chunk), or its disk holds no survey — see `terrain-data-server/TERRAIN.md`. |
 
 ---
 

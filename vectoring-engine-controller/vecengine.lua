@@ -13,15 +13,20 @@
 -- the allocation upstream assumes it does not. Keep them in step, exactly as 44/atc.lua and
 -- 64/atc.lua are kept in step. **Never hand-edit vecconf.lua by copying it between computers.**
 --
--- WHY THE DITHERING IS HERE AND NOT IN THE UAC. Every other relay on this fleet is handed
--- whole redstone steps, because the UAC knows exactly what the relay will do with them: one
--- line, 0..15. That is not true here. This engine's output allocation is not a single line
--- -- see WIRING below -- so the grid the demand has to be quantised ONTO is known only at
--- this end. The UAC therefore sends the demand as its control law computed it (a float,
--- clamped to the band but not rounded) and the sigma-delta quantiser lives here, where it
--- can be aimed at the real grid. Anything finer than one step is carried in an accumulator
--- and paid out a frame or two later; the airframe, far slower than 20 Hz, integrates it back
--- into the value that was asked for.
+-- WHY THE DITHERING IS HERE AND NOT IN THE UAC. This engine's output allocation is not a
+-- single redstone line -- see WIRING below -- so the grid the demand has to be quantised
+-- ONTO is known only at this end. The UAC therefore sends the demand as its control law
+-- computed it (a float, clamped to the band but not rounded) and the sigma-delta quantiser
+-- lives here, where it can be aimed at the real grid. Anything finer than one step is carried
+-- in an accumulator and paid out a frame or two later; the airframe, far slower than 20 Hz,
+-- integrates it back into the value that was asked for.
+--
+-- That used to make this file the exception on the fleet -- every other relay was handed
+-- whole steps, because the UAC assumed it knew what each one would do with them. On
+-- 2026-08-26 the assumption was dropped and the argument above was applied everywhere: the
+-- stabiliser, yaw/thrust and strafe/altitude relays all quantise their own now, and the UAC
+-- broadcasts floats to all of them. Nothing changed on THIS path; it just stopped being
+-- unusual.
 
 -- PER-COMPUTER CONFIGURATION lives in vecconf.lua beside this file: which engine this is, and
 -- what its outputs are plugged into. It is a separate file for one reason -- **dropping in a
@@ -54,8 +59,8 @@ ENGINE, ENGINE_NAME = VC.ENGINE, VC.ENGINE_NAME
 WIRING              = VC.WIRING
 SCALE_X, SCALE_Y, SCALE_T = VC.SCALE_X, VC.SCALE_Y, VC.SCALE_T
 
-PROTOCOL               = 'scout_vector'         -- in: UAC -> all three engines, one message
-PROTOCOL_ENGINE_SWITCH = 'scout_engineswitch'   -- in: master/altitude/attitude switch (#71)
+PROTOCOL               = 'aertogekiss_vector'         -- in: UAC -> all three engines, one message
+PROTOCOL_ENGINE_SWITCH = 'aertogekiss_engineswitch' -- in: master/altitude/attitude switch panel
 
 -- The bands the UAC clamps its demand to. MUST MATCH CFG.TRI_VEC_MAX and CFG.TRI_T_MAX in
 -- 72/pid/uacconf.lua -- they are the definition of "full deflection" and "full thrust", and

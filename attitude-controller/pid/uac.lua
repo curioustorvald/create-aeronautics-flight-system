@@ -70,6 +70,14 @@ do
             -- bank washout in controlLoop, the float-thrust protocol in sendNav), so a uacconf
             -- predating them must fail HERE and not mid-turn.
             "BANK_HDG_KD_WASHOUT", "THRUSTF_PROTOCOL",
+            -- Same rule again (2026-08-28, the loop-rate fork). Both are read UNCONDITIONALLY
+            -- on every tick -- LOOP_PERIOD by the pacing at the bottom of controlLoop,
+            -- SLOW_POLL_PERIOD by the inertia/mass poll at the top -- and a nil in either is a
+            -- first-tick arithmetic crash, so a uacconf predating the fork must fail HERE.
+            -- LOOP_PERIOD in particular must not be allowed to read nil and be treated as 0:
+            -- that would turn the pacing into a yield-only busy loop with no sleep in it at
+            -- all, which is the one failure mode of this change that would be hard to see.
+            "LOOP_PERIOD", "SLOW_POLL_PERIOD",
             -- Same rule again (2026-08-20): the horizontal channel now scales off a measured
             -- authority the way the vertical one does, and these are read on every navigating
             -- tick. A uacconf predating them must fail HERE, not as a nil-arithmetic crash the
@@ -85,7 +93,22 @@ do
             -- precisely the failure this knob exists to end (the detent used to be sent as
             -- `vs = 100`, a command this file then silently clamped away to CLIMB_MAX), so a
             -- missing one has to fail LOUDLY at boot rather than fail invisibly in the air.
-            "MANCON_SCRAMBLE" }) do
+            "MANCON_SCRAMBLE",
+            -- MANCON_CLIMB_MAX / MANCON_DESCEND_MAX (2026-09-08): the MANUAL vertical's own
+            -- rate envelope, separate from CLIMB_MAX / DESCEND_MAX so that mancon.lua's boost
+            -- key can reach past the autopilot's handling limit without loosening it for the
+            -- autoland and ALT-AP as well. Read unconditionally in the manual branch below, so
+            -- a uacconf predating them is a nil-arithmetic crash the first time ALT-AP is
+            -- switched off in flight -- i.e. airborne, hand-flying. They fail HERE instead.
+            "MANCON_CLIMB_MAX", "MANCON_DESCEND_MAX",
+            -- Same rule again (2026-08-29), and it is the one on this list where a WRONG
+            -- answer is worse than a missing one. CFG.ALT_OFFSET is how far the reported pose
+            -- sits above the bottom of the hull; it is subtracted on the first line of every
+            -- tick, so a uacconf predating it is a nil-arithmetic crash on tick one. It must
+            -- fail HERE, and it must not be given a default of 0 anywhere: 0 is a legitimate
+            -- value (the display bench), so a defaulted 0 would quietly restore the old
+            -- over-reading altimetry on a real airframe and look exactly like a working one.
+            "ALT_OFFSET" }) do
         if res[k] == nil then
             error("pid/uacconf.lua is missing CFG." .. k .. " -- the file looks incomplete.", 0)
         end
@@ -185,21 +208,18 @@ local function euler(orientation)
     if type(a) == "number" then return a, b, c end
     return a.x, a.y, a.z
 end
-local function getYaw(orientation)
-    local _, y = euler(orientation)
-    return y
-end
+-- getYaw() was here. It is gone (2026-08-28): its only caller was controlLoop's heading, which
+-- now takes the yaw out of the one euler() the tick already does for the display. A wrapper
+-- that decomposes a quaternion to keep one of three angles is exactly the call this fork
+-- exists to stop making, and an unused top-level local still counts against Cobalt's 200.
 
--- Sigma-delta quantiser; one accumulator per channel, they must not share.
-local function makeDither()
-    local acc = 0
-    return function(value, lo, hi)
-        local want = value + acc
-        local q = clamp(math.floor(want + 0.5), lo, hi)
-        acc = clamp(want - q, -0.5, 0.5)
-        return q
-    end
-end
+-- THE REDSTONE SCALE. Not an authority limit and not a calibration -- it is what one
+-- redstone line is worth in Minecraft, and it is the denominator every output in this file
+-- normalises on. CFG.STAB_MAX and friends are the authority limits and are applied FIRST, as
+-- a clamp in step units, so an airframe that grants less than full authority still gets less
+-- than full authority at the far end (normalising on *_MAX instead would hand the limit
+-- straight back when the relay multiplied by 15 again).
+local RS_MAX = 15
 -- PITCH SMITH PREDICTOR (2026-08-14) -- dead-time compensation for the pitch rate loop.
 -- WHY IT IS NEEDED, measured not assumed: the actuator dead time is ~1 s (pilot timed a 60 deg
 -- step), and the old +/-4 deg limit cycle ran at 4 s = 1.5 rad/s, where 1 s of delay is 86 deg of
@@ -220,14 +240,6 @@ local smithBuf, smithIdx, smithSum = {}, 1, 0
 local smithN = (CFG.PITCH_SMITH_ENABLE and CFG.PITCH_SMITH_TD and CFG.PITCH_SMITH_TD > 0)
     and math.max(1, math.floor(CFG.PITCH_SMITH_TD / 0.05 + 0.5)) or 0
 for i = 1, smithN do smithBuf[i] = 0 end
-local ditherPitch  = makeDither()
-local ditherRoll   = makeDither()
-local ditherYaw    = makeDither()
-local ditherThrust = makeDither()
-local ditherStrafe = makeDither()
-local ditherAltUp   = makeDither()   -- up-firing thruster line
-local ditherAltDown = makeDither()   -- down-firing thruster line
-
 -- Resolve, once, how to BUILD a wings-level quaternion facing a given raw yaw
 -- (a rotation about world-up Y only => zero pitch/roll). probe.lua tells you which
 -- of these your build actually has; we auto-detect so this file runs regardless.
@@ -256,23 +268,68 @@ do
     end
 end
 
--- mat3x3 * vec3, tolerating the tensor's unknown shape (nested [i][j], flat 9,
--- or {m11=..}). Only used in INERTIA mode. Returns three numbers.
-local function matVec(M, x, y, z)
-    if type(M) ~= "table" then return x, y, z end
-    local m = {}
-    if type(M[1]) == "table" then                    -- nested M[i][j]
-        m = { M[1][1], M[1][2], M[1][3], M[2][1], M[2][2], M[2][3], M[3][1], M[3][2], M[3][3] }
+-- SLOW-POLLED PHYSICAL PROPERTIES (2026-08-28, the loop-rate fork -- see the pacing note at
+-- the bottom of controlLoop for the measurement this all comes from).
+--
+-- The inertia tensor and the mass are the two things this loop read at 20 Hz that DO NOT
+-- CHANGE at 20 Hz. They are properties of the assembly, and they move only when the assembly
+-- does -- a block added, a block broken, cargo loaded. Reading them every tick cost two
+-- blocking round trips to the server's main thread, out of the ten this loop makes, for two
+-- numbers that were the same as last tick's ~99.9% of the time.
+--
+-- So they are polled on CFG.SLOW_POLL_PERIOD instead and cached here. What that costs, stated
+-- plainly so nobody has to re-derive it: a mass change is noticed up to SLOW_POLL_PERIOD late,
+-- which delays the CFG.TRIM_BOOST_TIME kick by that much. CFG.TRIM_BOOST_TIME is measured in
+-- seconds and the boost exists to re-learn a hover trim over the seconds AFTER a mass step, so
+-- a fraction of a second of notice is immaterial. Nothing else reads either value.
+--
+-- ONE TABLE, not six top-level locals, for the reason the CFG table itself exists: Cobalt caps
+-- a function at 200 locals and counts the main chunk's live locals against every nested
+-- function, and this file has hit that ceiling once already.
+local SLOW = {
+    m11 = 1, m12 = 0, m13 = 0,      -- the tensor, unpacked ONCE per poll into nine numbers
+    m21 = 0, m22 = 1, m23 = 0,
+    m31 = 0, m32 = 0, m33 = 1,
+    Ix = 1, Iy = 1, Iz = 1,         -- ...and its body-frame diagonal, which is all the
+                                    -- DECOUPLED path ever wanted out of it
+    mass = 0,
+    next = -1,                      -- os.clock() of the next poll; -1 = poll on the first tick
+}
+
+-- Unpack the tensor's unknown shape (nested [i][j], flat 9, or {m11=..}) into SLOW's nine
+-- fields. Called ONLY from the slow poll, so the shape sniffing and -- more to the point --
+-- the two throwaway tables the old matVec built on EVERY call now happen once a second
+-- instead of three times a tick. Also derives the body-frame diagonal: Ix/Iy/Iz are the
+-- tensor's quadratic form on the three body unit axes, i.e. simply m11/m22/m33, which is what
+-- the DECOUPLED branch was spending three matVec calls to rediscover every tick.
+local function unpackTensor(M)
+    if type(M) ~= "table" then
+        SLOW.m11, SLOW.m12, SLOW.m13 = 1, 0, 0
+        SLOW.m21, SLOW.m22, SLOW.m23 = 0, 1, 0
+        SLOW.m31, SLOW.m32, SLOW.m33 = 0, 0, 1
+    elseif type(M[1]) == "table" then                -- nested M[i][j]
+        SLOW.m11, SLOW.m12, SLOW.m13 = M[1][1], M[1][2], M[1][3]
+        SLOW.m21, SLOW.m22, SLOW.m23 = M[2][1], M[2][2], M[2][3]
+        SLOW.m31, SLOW.m32, SLOW.m33 = M[3][1], M[3][2], M[3][3]
     elseif type(M[1]) == "number" then               -- flat row-major 9
-        m = { M[1], M[2], M[3], M[4], M[5], M[6], M[7], M[8], M[9] }
+        SLOW.m11, SLOW.m12, SLOW.m13 = M[1], M[2], M[3]
+        SLOW.m21, SLOW.m22, SLOW.m23 = M[4], M[5], M[6]
+        SLOW.m31, SLOW.m32, SLOW.m33 = M[7], M[8], M[9]
     else                                             -- named fields m11.. or c0..
-        m = { M.m11 or M[0] or 1, M.m12 or 0, M.m13 or 0,
-              M.m21 or 0, M.m22 or 1, M.m23 or 0,
-              M.m31 or 0, M.m32 or 0, M.m33 or 1 }
+        SLOW.m11, SLOW.m12, SLOW.m13 = M.m11 or M[0] or 1, M.m12 or 0, M.m13 or 0
+        SLOW.m21, SLOW.m22, SLOW.m23 = M.m21 or 0, M.m22 or 1, M.m23 or 0
+        SLOW.m31, SLOW.m32, SLOW.m33 = M.m31 or 0, M.m32 or 0, M.m33 or 1
     end
-    return m[1]*x + m[2]*y + m[3]*z,
-           m[4]*x + m[5]*y + m[6]*z,
-           m[7]*x + m[8]*y + m[9]*z
+    SLOW.Ix, SLOW.Iy, SLOW.Iz = SLOW.m11, SLOW.m22, SLOW.m33
+end
+
+-- mat3x3 * vec3 against the cached tensor. Only used in INERTIA mode, and only on the
+-- SENSOR_FRAME == "world" path now (the body path reads SLOW.Ix/Iy/Iz directly). Allocates
+-- nothing: it reads the nine numbers unpackTensor already sniffed out.
+local function matVec(x, y, z)
+    return SLOW.m11*x + SLOW.m12*y + SLOW.m13*z,
+           SLOW.m21*x + SLOW.m22*y + SLOW.m23*z,
+           SLOW.m31*x + SLOW.m32*y + SLOW.m33*z
 end
 
 -- Rotate vector (x,y,z) by the UNIT quaternion q, PRESERVING its magnitude.
@@ -341,6 +398,12 @@ local navGlide  = false             -- the FMS is flying a RUNWAY GLIDESLOPE (ms
                                     -- FIXEDWING approach would have no lateral control at all
                                     -- (no strafe, and banking switched off by alState). See the
                                     -- LG.RWY_* block in 8/autopilot.lua.
+local navAlign  = false             -- the FMS is holding cruiseCap at 0 for its route-start
+                                    -- ALIGN (msg.align, NAV.aligning): nose swinging onto a
+                                    -- fresh bearing, most commonly after cancelling and
+                                    -- re-committing to a new destination mid-flight. See
+                                    -- `alignStop` below for why this routes through the
+                                    -- velocity-vector law on VTOL/HYBRID but not FIXEDWING.
 local apLastMsg = nil
 
 -- Pilot autopilot mode (from #12) and manual vertical (from #6). Held between
@@ -420,91 +483,126 @@ local function setTarget(alt)
 end
 
 -- OUTPUT ----------------------------------------------------------------------
-local outStab   = { front = 0, back = 0, left = 0, right = 0 }
+-- THIS FILE NO LONGER QUANTISES ANYTHING. Every output leaves here as a FLOAT in [-1, 1] --
+-- the demand as the control law computed it, expressed as a fraction of one full redstone
+-- line -- and the relay at the far end is what turns it into a whole 0..15 level.
+--
+-- WHY THE SIGMA-DELTA MOVED (2026-08-26). It used to live here: seven accumulators, one per
+-- channel, rounding to whole steps before broadcast. That was only ever right while the UAC
+-- knew what its relay would do with the number, and it stopped being true the moment relays
+-- started spending a demand on something other than one 0..15 line. #69 already does: it
+-- splits fore/aft over TWO bundles at 45 A-units of resolution, and it had to be handed the
+-- raw float on a protocol of its own (THRUSTF) to get it, because the NAVCTRL message had
+-- already thrown 2/3 of the resolution away. Scout's nozzle computers are the same case and
+-- said so outright in sendVector's header. Rounding at this end destroys resolution the
+-- receiver may well have and can never get back; rounding at the far end costs nothing and
+-- needs no second protocol. So the rule is now uniform across every output in this file:
+-- the UAC states the demand, the relay decides how to spend it.
+--
+-- WHAT DID *NOT* MOVE: the authority limits. CFG.STAB_MAX / YAW_MAX / THRUST_MAX /
+-- STRAFE_MAX / ALT_MIN / ALT_MAX are still applied HERE, as a clamp in step units before the
+-- division by RS_MAX, because they are this airframe's calibration and belong with the rest
+-- of it. A relay never widens what it is sent.
+--
+-- THE ONE BEHAVIOURAL CHANGE, and it is an improvement: the accumulator is now fed the
+-- CLAMPED command, where before it was fed the raw one. Bench-diffed against the pre-refactor
+-- build the two chains are step-for-step identical over 200 ticks on all five airframes and
+-- over 60k fuzzed in-band commands -- they part company only when a command SATURATES. The
+-- old sigma-delta went on integrating the part of the demand the actuator could never
+-- deliver, and paid that phantom debt out over the frames after the command came back into
+-- band (81 of 200 frames off by a step, on a fuzz that saturates then releases). That is
+-- integrator wind-up, not sub-step recovery. Clamping first is the standard cure.
+--
+-- The out* tables below are the DISPLAY copies and now hold the same floats as the wire.
+local outStab   = { pitch = 0, roll = 0 }
 local outNav    = { thrust = 0, yaw = 0, strafe = 0, thrustF = 0 }
-local outAlt    = { up = CFG.ALT_NEUTRAL, down = CFG.ALT_NEUTRAL }
+local outAlt    = { up = CFG.ALT_NEUTRAL / RS_MAX, down = CFG.ALT_NEUTRAL / RS_MAX }
 
--- pitch/roll are signed steps [-15,15]. front/back carry pitch, left/right roll
--- (control.lua's mapping; flip via CFG.SWAP_PITCH_ROLL_CHANNELS / *_SIGN if wrong).
+-- pitch/roll arrive as signed STEPS and go out as signed FLOATS [-1,1]. Which physical
+-- thruster bank each ends up on -- front/back for pitch, left/right for roll -- is the
+-- relay's business now; CFG.SWAP_PITCH_ROLL_CHANNELS stays here because it is a statement
+-- about how THIS airframe is wired, and the relay has no conf file to hold it in.
 local function sendStab(pitch, roll)
-    if CFG.DITHER then
-        pitch = ditherPitch(pitch, -CFG.STAB_MAX, CFG.STAB_MAX)
-        roll  = ditherRoll(roll,  -CFG.STAB_MAX, CFG.STAB_MAX)
-    else
-        pitch = clamp(round(pitch), -CFG.STAB_MAX, CFG.STAB_MAX)
-        roll  = clamp(round(roll),  -CFG.STAB_MAX, CFG.STAB_MAX)
-    end
-    local pCh, rCh = pitch, roll
-    if CFG.SWAP_PITCH_ROLL_CHANNELS then pCh, rCh = roll, pitch end
-    local front, back, left, right = 0, 0, 0, 0
-    if pCh >= 0 then front = pCh else back = -pCh end
-    if rCh >= 0 then right = rCh else left = -rCh end
-    rednet.broadcast({ left = left, right = right, front = front, back = back }, CFG.STAB_PROTOCOL)
-    outStab = { front = front, back = back, left = left, right = right }
+    local p = clamp(pitch, -CFG.STAB_MAX, CFG.STAB_MAX) / RS_MAX
+    local r = clamp(roll,  -CFG.STAB_MAX, CFG.STAB_MAX) / RS_MAX
+    if CFG.SWAP_PITCH_ROLL_CHANNELS then p, r = r, p end
+    rednet.broadcast({ pitch = p, roll = r }, CFG.STAB_PROTOCOL)
+    outStab = { pitch = p, roll = r }
 end
 
--- thrust +fwd/-back, yaw +right/-left, strafe +right/-left; all [-15,15].
+-- thrust +fwd/-back, yaw +right/-left, strafe +right/-left; all signed floats [-1,1].
 local function sendNav(thrust, yaw, strafe)
-    -- ANALOGUE fore/aft demand, captured BEFORE the dither/round below quantises it away.
-    -- Normalised on CFG.THRUST_MAX so the wire units are a plain [-1, 1] regardless of what
-    -- the redstone encoding happens to be worth on this airframe (+1 = full forward).
+    -- Fore/aft on its own protocol, and normalised on CFG.THRUST_MAX rather than on RS_MAX:
+    -- THRUSTF's +1 means FULL FORWARD AUTHORITY, whatever redstone encoding the receiver
+    -- happens to use, and #69 spends it on 45 A-units rather than on 15 steps. The two
+    -- denominators coincide on every airframe in the fleet today (THRUST_MAX is 15
+    -- everywhere) -- they are written differently because they MEAN differently.
     local thrustF = (CFG.THRUST_MAX > 0) and clamp(thrust / CFG.THRUST_MAX, -1, 1) or 0
-    if CFG.DITHER then
-        thrust = ditherThrust(thrust, -CFG.THRUST_MAX, CFG.THRUST_MAX)
-        yaw    = ditherYaw(yaw,       -CFG.YAW_MAX,    CFG.YAW_MAX)
-        strafe = ditherStrafe(strafe, -CFG.STRAFE_MAX, CFG.STRAFE_MAX)
-    else
-        thrust = clamp(round(thrust), -CFG.THRUST_MAX, CFG.THRUST_MAX)
-        yaw    = clamp(round(yaw),    -CFG.YAW_MAX,    CFG.YAW_MAX)
-        strafe = clamp(round(strafe), -CFG.STRAFE_MAX, CFG.STRAFE_MAX)
-    end
-    local fwd, back = 0, 0;      if thrust >= 0 then fwd = thrust else back = -thrust end
-    local yawL, yawR = 0, 0;     if yaw >= 0 then yawR = yaw else yawL = -yaw end
-    local strL, strR = 0, 0;     if strafe >= 0 then strR = strafe else strL = -strafe end
+    local t = clamp(thrust, -CFG.THRUST_MAX, CFG.THRUST_MAX) / RS_MAX
+    local y = clamp(yaw,    -CFG.YAW_MAX,    CFG.YAW_MAX)    / RS_MAX
+    local s = clamp(strafe, -CFG.STRAFE_MAX, CFG.STRAFE_MAX) / RS_MAX
     -- VECTOR-NOZZLE AIRFRAME (CFG.TRI_ENABLE): yaw and strafe are not thruster banks here --
     -- the three nozzles make both, and sendVector has already spent them. The NAVCTRL message
-    -- still goes out because the fore/aft bank IS real and IS on it (#79), but those four
-    -- lines are pinned to zero so a relay wired to them later cannot double-command an axis
-    -- the nozzles are already flying. outNav below keeps the TRUE commands: they are what the
+    -- still goes out because the fore/aft bank IS real and IS on it (#79), but those two axes
+    -- are pinned to zero so a relay wired to them later cannot double-command an axis the
+    -- nozzles are already flying. outNav below keeps the TRUE commands: they are what the
     -- display reads, and zeroing them there would hide the yaw the craft is actually making.
-    if CFG.TRI_ENABLE then yawL, yawR, strL, strR = 0, 0, 0, 0 end
-    rednet.broadcast({
-        thrust_forward = fwd, thrust_backward = back,
-        yaw_left = yawL, yaw_right = yawR,
-        strafe_left = strL, strafe_right = strR,
-    }, CFG.NAVCTRL_PROTOCOL)
-    -- ...and the same fore/aft command again as ONE signed float, on its own protocol. Purely
-    -- ADDITIVE: the integer NAVCTRL message above is untouched, so every existing relay keeps
-    -- working exactly as before and nothing is required to subscribe to this. What it buys is
-    -- the sub-step resolution the 0-15 redstone lines throw away -- the demand as the control
-    -- law actually computed it, before dither/round -- for anything that can act on an
-    -- analogue value (a proportional drive, a recorder, a gauge).
+    local yw, sw = y, s
+    if CFG.TRI_ENABLE then yw, sw = 0, 0 end
+    rednet.broadcast({ thrust = t, yaw = yw, strafe = sw }, CFG.NAVCTRL_PROTOCOL)
     rednet.broadcast({ thrust = thrustF }, CFG.THRUSTF_PROTOCOL)
-    outNav = { thrust = thrust, yaw = yaw, strafe = strafe, thrustF = thrustF }
+    outNav = { thrust = t, yaw = y, strafe = s, thrustF = thrustF }
 end
 
 -- Split the signed vertical command into independent up- and down-thruster levels
 -- (replacing the external splitter box). steps 0 -> both at ALT_NEUTRAL (balanced
 -- hover); +steps drives the up line and backs off the down line, -steps the reverse.
--- Each line is dithered on its own accumulator and clamped to the full 0..15 range.
+--
+-- THE SPLIT STAYS HERE, THE QUANTISATION DOES NOT. CFG.ALT_NEUTRAL is the balanced-hover
+-- burn this hull needs to sit still, which is airframe calibration of the first order and
+-- has no business on a relay with no conf file; so this function still does NEUTRAL +/- steps
+-- and still clamps to the ALT_MIN..ALT_MAX authority. What goes on the wire is the pair of
+-- line levels as FRACTIONS of a full line, [0,1], and each relay line dithers its own.
+--
 -- `cut` is the one thing steps cannot say: BOTH LINES TO A FLAT ZERO, i.e. the lift engine
 -- switched OFF. steps 0 is not that -- it is a balanced hover, still burning on both lines --
--- and on the ground that is exactly what has to stop (see CFG.AL_GROUND_CUT). The dither
--- accumulators are bypassed rather than fed: they hold at most half a step, so nothing is owed
--- when the engine comes back.
-local function sendAlt(steps, cut)
-    local wantUp, wantDown = CFG.ALT_NEUTRAL + steps, CFG.ALT_NEUTRAL - steps
+-- and on the ground that is exactly what has to stop (see CFG.AL_GROUND_CUT). It travels as
+-- its own flag rather than as a pair of zeroes, so the relay can bypass its accumulators
+-- instead of feeding them: they hold at most half a step, and nothing should be owed when
+-- the engine comes back.
+--
+-- `openThrottle` IS THE SCRAMBLE (CFG.MANCON_SCRAMBLE), and it changes the SPLIT, not the
+-- magnitude and not the sign. NEUTRAL +/- steps is the right split for a RATE command: the
+-- two banks are a differential about a balanced hover, and the down line backing off is half
+-- of what buys a climb. It is the wrong split for an OPEN THROTTLE, and that is the bug this
+-- flag fixes -- "the scramble is nullified by the alt-down thrusters", 2026-08-29.
+--
+-- WHY IT WAS NULLIFIED. A scramble asks for CFG.ALT_SWING outright, but the tilt allocation
+-- routes it by attitude before it gets here, so what arrives is ALT_SWING * (world-up .
+-- body-up). The down line only reaches ALT_MIN while that product is >= ALT_NEUTRAL -- with
+-- the fleet's 8 and 7 that is cos(tilt) >= 0.875, i.e. within ~29 deg of level. Past that the
+-- RETRO bank lights up and burns against the scramble: at 60 deg it is up 11 / down 3, and
+-- the net across the pair (up - down = 2*steps) is barely half of what the detent asked for.
+-- And a scramble is precisely the command reached for when the craft is NOT level -- a dive
+-- recovery, a terrain escape, a hand-flown go-around.
+--
+-- So on this flag the OPPOSING bank goes to ALT_MIN and the helping one carries
+-- NEUTRAL + |steps|. The attitude routing is deliberately left alone: the SIGN of `steps`
+-- still chooses which bank is the helping one, so an inverted craft still scrambles on the
+-- down bank, and at level the pair is 15/0 -- exactly what it already was.
+local function sendAlt(steps, cut, openThrottle)
     local up, down
     if cut then
         up, down = 0, 0
-    elseif CFG.DITHER then
-        up   = ditherAltUp(wantUp,     CFG.ALT_MIN, CFG.ALT_MAX)
-        down = ditherAltDown(wantDown, CFG.ALT_MIN, CFG.ALT_MAX)
+    elseif openThrottle then
+        local burn = clamp(CFG.ALT_NEUTRAL + math.abs(steps), CFG.ALT_MIN, CFG.ALT_MAX) / RS_MAX
+        local off  = CFG.ALT_MIN / RS_MAX
+        if steps < 0 then up, down = off, burn else up, down = burn, off end
     else
-        up   = clamp(round(wantUp),   CFG.ALT_MIN, CFG.ALT_MAX)
-        down = clamp(round(wantDown), CFG.ALT_MIN, CFG.ALT_MAX)
+        up   = clamp(CFG.ALT_NEUTRAL + steps, CFG.ALT_MIN, CFG.ALT_MAX) / RS_MAX
+        down = clamp(CFG.ALT_NEUTRAL - steps, CFG.ALT_MIN, CFG.ALT_MAX) / RS_MAX
     end
-    rednet.broadcast({ up = up, down = down }, CFG.ALT_PROTOCOL)
+    rednet.broadcast({ up = up, down = down, cut = cut or false }, CFG.ALT_PROTOCOL)
     outAlt = { up = up, down = down }
     return up, down
 end
@@ -566,16 +664,19 @@ end
 -- loop then sees the shortfall as a disturbance and answers it on the next tick, which is the
 -- correct behaviour and the reason this code does not try to be cleverer about it.
 --
--- WHAT GOES ON THE WIRE IS A FLOAT, AND IS NOT ROUNDED HERE. Every other output in this file
--- dithers to whole redstone steps before broadcasting, because it knows exactly what its
--- relay will do with the number: one line, 0..15. This one does not know that. The three
--- engine computers drive their thrusters through an output allocation that is theirs to
--- choose -- more than one line per axis, peripheral-side relays, whatever the airframe turned
--- out to need -- so the grid the demand must be quantised ONTO is only known at the far end.
--- Rounding here would throw away resolution the receiver may well have, and it could never be
--- got back. So the sigma-delta lives in the engine computers (77/78/80 vecengine.lua) and
--- this file sends the demand as the allocation computed it. CFG.DITHER does not apply to this
--- path; it still governs sendStab/sendNav/sendAlt, which do know their relays.
+-- WHAT GOES ON THE WIRE IS A FLOAT, AND IS NOT ROUNDED HERE. The three engine computers
+-- drive their thrusters through an output allocation that is theirs to choose -- more than
+-- one line per axis, peripheral-side relays, whatever the airframe turned out to need -- so
+-- the grid the demand must be quantised ONTO is only known at the far end. Rounding here
+-- would throw away resolution the receiver may well have, and it could never be got back.
+-- So the sigma-delta lives in the engine computers (77/78/80 vecengine.lua) and this file
+-- sends the demand as the allocation computed it.
+--
+-- That was once the exception; since 2026-08-26 it is the rule, and sendStab/sendNav/sendAlt
+-- work the same way (see the OUTPUT header). This path differs only in its UNITS: the axis
+-- outputs are normalised to [-1, 1] because a relay knows nothing of engine geometry,
+-- whereas these stay in engine-units (0..CFG.TRI_T_MAX, +/-CFG.TRI_VEC_MAX) because the
+-- allocation and the engine computer already agree on what an engine-unit is.
 --
 -- CALIBRATION IS EMPIRICAL, like everything else in this file. Do the TRI_*_SIGN knobs first,
 -- one axis at a time on the ground, watching WHICH ENGINE SPOOLS UP; then the *_PER_STEP
@@ -793,9 +894,57 @@ end
 --
 -- Everything here is off unless CFG.LOG_ENABLE is set, and no other airframe's uacconf has it.
 local LOG = { state = "off", t0 = nil, tRec = nil, n = 0, fh = nil, skip = 0, why = nil }
+-- scram and velInt are APPENDED, not inserted, so every column index a previous record
+-- was read with still points at the same field.
+--   scram   ui.scramble as the CONTROLLER saw it, not as the stick sent it. This is the
+--           column that separates "deaf" from "working against it": the MANCON's own panel
+--           can show SCRM while this reads 0, and then the fault is between the two -- a
+--           protocol name, a stale packet, or a gate in the scramble expression. If it reads
+--           1 and the aeroplane does not climb, the flag arrived and the fault is downstream.
+--   velInt  the vertical PID's integral -- the HOVER TRIM the loop has learnt, in alt steps.
+--           This is what says whether a scramble had anything left to give: the detent
+--           commands ALT_SWING, so what it ADDS over the hover is (ALT_SWING - velInt). A
+--           hull sitting at velInt = 7 out of a swing of 8 is already at 14 of its 15 line
+--           levels to stay up, and no software can make the detent worth more than one step.
 LOG.HEAD = "t,pitch,roll,wx,wz,errP,errR,rotRaw,pStep,rStep,yStep,integP,integR,"
     .. "posY,velY,desVelY,vertEff,altSteps,tiltUp,thrCmd,strCmd,"
-    .. "L,sat,cone,hot,fcx,fcy,fct,blx,bly,blt,brx,bry,brt,idle,apN,apA,phase"
+    .. "L,sat,cone,hot,fcx,fcy,fct,blx,bly,blt,brx,bry,brt,idle,apN,apA,phase,"
+    .. "scram,velInt,"
+    -- navCap, appended 2026-09-01 for "something is still making thrust in the align phase",
+    -- and appended for the same reason the yaw and scramble blocks were: every earlier
+    -- uaclog.csv still parses. It is the FMS's SCHEDULED SPEED as the controller received it
+    -- (msg.cruiseCap when msg.schedSpeed is set, else -1 for "the FMS is not scheduling and
+    -- this law draws its own"). It is the column that settles an align-phase argument without
+    -- anybody having to watch the HSI: read it beside thrCmd and phase.
+    --   navCap 0, thrCmd 0            the hold is being honoured -- this is the fix landing.
+    --   navCap 0, thrCmd NONZERO      something downstream of the schedule is still spending
+    --                                 authority. That was the breakaway floor (see the
+    --                                 commanded-zero note in the velocity-vector law) and
+    --                                 before it the ENROUTE speed integral; a third would be
+    --                                 a new fault, so log which phase it appears in.
+    --   navCap -1 in ENROUTE          the FMS is not scheduling at all -- DC.DYNAMIC_CRUISE
+    --                                 is off on that airframe, and no cap of ANY value is
+    --                                 reaching this controller. Fix that before reading on.
+    .. "navCap,"
+    -- ARRIVAL BLOCK, appended 2026-09-02 for "DIRECT TO does not slow down and circles the
+    -- point". All three are already on `ui` for the status screen; the recorder simply could
+    -- not see them, which is why the arrival profile has never once been checked against what
+    -- the airframe actually does. Appended at the end, as every block here is.
+    --   gs       horizontal ground speed. Its slope IS the achieved deceleration -- take
+    --            d(gs)/dt over the braking run and compare it with DC.ARRIVE_DECEL in apconf,
+    --            which is a CLAIM about the airframe's stopping power that nothing has ever
+    --            measured. If the slope is shallower, the arrival sweep is allocating less
+    --            distance than the craft needs and it will always arrive hot: lower the knob
+    --            to the measured figure. On Scout expect it to be: the aft bank is wired
+    --            across 15 units against forward's 45 (see 86/thrustcon.lua).
+    --   closing  velocity component TOWARD the target. The overshoot signature is closing
+    --            going NEGATIVE while gs stays high -- that is the craft flying away from a
+    --            fix it has passed, and in the ENROUTE law it is what commanded full forward
+    --            thrust to chase it round. In APPROACH/TERMINAL the velocity-vector law nulls
+    --            the tangential component instead, so closing should come back through zero
+    --            once and stay there.
+    --   dist     range to the target the controller is steering to, for the x-axis of both.
+    .. "gs,closing,dist"
 
 -- Called at the END of every control tick, once ui is published and the commands are final.
 -- Takes the four values that are controlLoop locals (and so are not on ui) as arguments
@@ -826,7 +975,7 @@ function LOG.tick(now, pStep, rStep, yStep, altSteps)
     local okw = pcall(LOG.fh.writeLine, string.format(
         "%.2f,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%.0f,%.3f,%.3f,%.3f,%.4f,%.4f,"
         .. "%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
-        .. "%.2f,%.3f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%s",
+        .. "%.2f,%.3f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%s,%d,%.3f,%.1f,%.2f,%.2f,%.1f",
         now - LOG.tRec,
         math.deg(ui.pitch or 0), math.deg(ui.roll or 0), ui.wx or 0, ui.wz or 0,
         ui.errPitch or 0, ui.errRoll or 0, ui.rotRaw or 0,
@@ -838,7 +987,9 @@ function LOG.tick(now, pStep, rStep, yStep, altSteps)
         o2 and o2.x or 0, o2 and o2.y or 0, o2 and o2.thrust or 0,
         o3 and o3.x or 0, o3 and o3.y or 0, o3 and o3.thrust or 0,
         ui.idle and 1 or 0, ui.apNav and 1 or 0, ui.apAlt and 1 or 0,
-        (tostring(ui.phase or "-"):gsub(",", ";"))))
+        (tostring(ui.phase or "-"):gsub(",", ";")),
+        ui.scramble and 1 or 0, ui.velInt or 0, ui.navCap or -1,
+        ui.gs or 0, ui.closing or 0, ui.dist or 0))
     if not okw then
         -- A failed write is almost always the disk quota. Close what we have rather than
         -- retrying every tick: a partial log is still readable, and a controller that spends
@@ -869,15 +1020,14 @@ end
 -- override the pitch overlay's sign -- needed because PITCH_ALT_SIGN is 0 (climb-pitch
 -- overlay off), which would otherwise multiply the joystick's pitch by zero. See
 -- CFG.KJOY_PITCH_SIGN.
-local function attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitchCmd, idle, yawBrake, manYawRate, bankYawRate, pitchCmdSign)
+-- q_inv IS PASSED IN, not recomputed (2026-08-28). controlLoop already needs it for the
+-- attitude-aware vertical allocation, so the shipped build called q_cur:inverse() twice a
+-- tick for the same value. The tensor argument is gone with it: it is slow-polled into SLOW
+-- now (see unpackTensor), so there is nothing left for a caller to hand over.
+local function attitude(q_cur, q_inv, w, heading, desiredHeading, dt, bankCmd, pitchCmd, idle, yawBrake, manYawRate, bankYawRate, pitchCmdSign)
     bankCmd  = bankCmd  or 0   -- commanded roll  overlay (rad), HYBRID/FIXEDWING; 0 = level
     pitchCmd = pitchCmd or 0   -- commanded pitch overlay (rad), HYBRID/FIXEDWING; 0 = level
     -- idle: craft parked/engine-off (see the IDLE block). Freezes + bleeds the trim integral.
-    local q_inv = q_cur:inverse()
-    -- Desired level attitude facing desiredHeading. Invert navcom's heading chain
-    -- so the yaw we build lives in the raw-quaternion frame q_cur reads back in.
-    local rawYawDes = (desiredHeading - CFG.HEADING_OFFSET) / CFG.HEADING_SIGN
-    local q_des = makeYawQuat(rawYawDes)
 
     -- BODY-frame attitude error as a rotation vector (x=pitch, y=yaw, z=roll).
     local ex, ey, ez
@@ -902,6 +1052,16 @@ local function attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitch
         -- COMBINED quaternion error (fallback): one shortest-path rotation from the
         -- components (a >= 0 = short way; atan2 finite through identity). Elegant, but a
         -- ~180 deg total rotation has an ill-defined axis -> the Bug-1 pitch kick.
+        --
+        -- q_des IS BUILT HERE, INSIDE THIS BRANCH (2026-08-28). It used to be built at the top
+        -- of the function, unconditionally -- but the DECOMPOSED path above never reads it: it
+        -- derives the tilt error from the up vectors and the yaw error from wrapPi, and touches
+        -- no desired quaternion at all. Every airframe on the fleet sets YAW_TILT_DECOMP, so
+        -- that was one quaternion and one vector constructed and thrown away, every tick,
+        -- on every aircraft.
+        -- Desired level attitude facing desiredHeading. Invert navcom's heading chain
+        -- so the yaw we build lives in the raw-quaternion frame q_cur reads back in.
+        local q_des = makeYawQuat((desiredHeading - CFG.HEADING_OFFSET) / CFG.HEADING_SIGN)
         local eq = q_inv * q_des
         local ea, vx, vy, vz = eq.a, eq.v.x, eq.v.y, eq.v.z
         if ea < 0 then ea, vx, vy, vz = -ea, -vx, -vy, -vz end
@@ -974,13 +1134,14 @@ local function attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitch
     local px, py, pz   -- body-frame command (pitch, yaw, roll), pre-sign/clamp
     if CFG.ATT_MODE == "INERTIA" then
         -- I * (body vector) -> body vector, from whatever frame the tensor is in.
+        -- Reads the SLOW-polled tensor; see unpackTensor for why it is not fetched here.
         local function inertiaMul(a, b, c)
             if CFG.SENSOR_FRAME == "world" then
                 local wa, wb, wc = rotateVec(q_cur, a, b, c)   -- body -> world
-                local ia, ib, ic = matVec(I, wa, wb, wc)       -- world-frame tensor
+                local ia, ib, ic = matVec(wa, wb, wc)          -- world-frame tensor
                 return rotateVec(q_inv, ia, ib, ic)            -- world -> body
             end
-            return matVec(I, a, b, c)
+            return matVec(a, b, c)
         end
 
         -- Desired body angular acceleration. Outer loop: a decel-limited motion
@@ -1034,9 +1195,23 @@ local function attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitch
         else
             -- Decoupled: body-diagonal moments only, so each axis is independent
             -- (Ix/Iy/Iz are the tensor's quadratic form on each body unit axis).
-            local Ix       = inertiaMul(1, 0, 0)   -- first component = I_body_xx
-            local _,  Iy   = inertiaMul(0, 1, 0)   -- second        = I_body_yy
-            local _, _, Iz = inertiaMul(0, 0, 1)   -- third         = I_body_zz
+            --
+            -- SENSOR_FRAME == "body" (every airframe on the fleet) reads them straight off
+            -- the slow poll: the quadratic form on the body unit axes is just the tensor's
+            -- own diagonal, it does not depend on the attitude, and unpackTensor has already
+            -- taken it. The three inertiaMul calls this replaces were six throwaway tables a
+            -- tick to read three numbers that had not changed since the aircraft was built.
+            -- The "world" tensor DOES rotate with the attitude, so that path still recomputes
+            -- per tick -- correctness first, and no fleet airframe pays for it.
+            local Ix, Iy, Iz
+            if CFG.SENSOR_FRAME == "world" then
+                Ix              = inertiaMul(1, 0, 0)   -- first component = I_body_xx
+                local _,  Iy2   = inertiaMul(0, 1, 0)   -- second        = I_body_yy
+                local _, _, Iz2 = inertiaMul(0, 0, 1)   -- third         = I_body_zz
+                Iy, Iz = Iy2, Iz2
+            else
+                Ix, Iy, Iz = SLOW.Ix, SLOW.Iy, SLOW.Iz
+            end
             ui.Ix, ui.Iy, ui.Iz = Ix, Iy, Iz       -- for display (intermediate-axis check)
             tpx = Ix*ax
             tpy = Iy*ay
@@ -1129,17 +1304,39 @@ local function controlLoop()
         local dt  = math.max(now - lastTime, 0.001)
         lastTime  = now
 
+        -- THE THREE READS THAT GENUINELY CHANGE AT 20 Hz. Pose, linear velocity and angular
+        -- velocity are the loop's sensors and every one of them is fetched every tick.
+        -- The inertia tensor and the mass are NOT here any more -- they are properties of the
+        -- assembly, not of its motion, and they are slow-polled below. See SLOW/unpackTensor.
         local pose   = sublevel.getLogicalPose()
         local pos    = pose.position
         local q_cur  = pose.orientation
-        local q_inv  = q_cur:inverse()   -- for the attitude-aware vertical allocation
+        local q_inv  = q_cur:inverse()   -- for the attitude-aware vertical allocation, and
+                                         -- handed to attitude(), which used to take its own
         local vel    = sublevel.getLinearVelocity()
         local w      = sublevel.getAngularVelocity()
-        local I      = (CFG.ATT_MODE == "INERTIA") and sublevel.getInertiaTensor() or nil
-        local mass   = sublevel.getMass()
 
-        latestPosY = pos.y
-        if TARGET_ALT == nil then setTarget(pos.y) end   -- boot: hold where we are
+        -- ---- slow poll: the assembly's physical properties ----
+        -- Two fewer blocking main-thread round trips per tick, out of ten. The measurement
+        -- that says round trips (and not arithmetic) are what this loop is spending its time
+        -- on is written up at the bottom of the loop, beside the pacing.
+        if now >= SLOW.next then
+            SLOW.next = now + CFG.SLOW_POLL_PERIOD
+            if CFG.ATT_MODE == "INERTIA" then unpackTensor(sublevel.getInertiaTensor()) end
+            SLOW.mass = sublevel.getMass()
+        end
+        local mass = SLOW.mass
+
+        -- ALTITUDE DATUM (2026-08-29). `pos.y` is the ASSEMBLY's reported pose, and that
+        -- sits CFG.ALT_OFFSET metres above the bottom of the hull -- 9 m on Aer Togekiss,
+        -- which is why it read 73 parked on a Y=63 airstrip. latestPosY is the Y of the
+        -- BOTTOM, and from here down it is the only altitude this file is allowed to see:
+        -- every altitude the aircraft compares itself against (landing.db's pad and runway
+        -- elevations, the terrain survey, an ALT-AP pick) is the world Y of a piece of
+        -- GROUND, so the aeroplane's own number has to be the world Y of the part that
+        -- touches it. See CFG.ALT_OFFSET in uacconf for how to measure it.
+        latestPosY = pos.y - CFG.ALT_OFFSET
+        if TARGET_ALT == nil then setTarget(latestPosY) end   -- boot: hold where we are
 
         -- ---- pilot autopilot mode (from the #12 toggle switches) ----
         -- Attitude/levelling always runs (below). navActive gates navigation; else
@@ -1154,7 +1351,16 @@ local function controlLoop()
         if useAltCascade and not altCascadePrev and latestPosY then setTarget(latestPosY) end
         altCascadePrev = useAltCascade
 
-        local heading = CFG.HEADING_SIGN * getYaw(q_cur) + CFG.HEADING_OFFSET
+        -- ONE toEuler PER TICK (2026-08-28). The shipped build called it three times: once
+        -- through getYaw for the heading, and twice more in the publish block --
+        -- `select(1, euler(q_cur))` and `select(3, euler(q_cur))` -- each of which decomposed
+        -- the whole quaternion and then threw two of the three angles away. All three wanted
+        -- the same decomposition of the same q_cur. Landed on `ui` rather than three new
+        -- locals for the usual Cobalt 200-locals reason, and the publish block downstream now
+        -- reads these instead of recomputing them. Same tick, same q_cur, so the display
+        -- snapshot stays exactly as coherent as it was.
+        ui.pitch, ui.eulerYaw, ui.roll = euler(q_cur)
+        local heading = CFG.HEADING_SIGN * ui.eulerYaw + CFG.HEADING_OFFSET
 
         -- ---- nav geometry (from the current leg) ----
         local tx, tz = navTarget[1], navTarget[2]
@@ -1196,6 +1402,23 @@ local function controlLoop()
         -- the tangential component too. APPROACH still seeks the bearing (desiredHeading, above).
         local approachVec = (navPhase == "APPROACH")
         local headingHold = (navPhase == "LANDING" and type(navHoldHeading) == "number")
+        -- ALIGN HOLD, VTOL/HYBRID ONLY (2026-09-04). navCruiseCap is already forced to 0 for
+        -- the FMS's route-start ALIGN (msg.align, NAV.aligning -- nose swinging onto a fresh
+        -- bearing, most commonly right after cancelling and re-committing to a new destination
+        -- mid-flight), but on its own that only zeroes the ENROUTE law's ALONG-TRACK term
+        -- (closing, the velocity component TOWARD the target). It says nothing about any OTHER
+        -- component of whatever the aircraft was doing a moment ago: that is flown as a
+        -- cross-track POSITION hold against navPrev, which right after a fresh commit is the
+        -- UAC's own bogus leg from the old target to the new one (see the FMS's isApproachLeg
+        -- note) -- not a velocity brake, so the inherited momentum is never actually killed.
+        -- A FIXEDWING cannot come to a hover, so flying the ordinary forward-only ENROUTE law
+        -- through the hold -- bank onto the new bearing, thrust governed by closing rate -- is
+        -- exactly correct for it and must stay untouched (CFG.STRAFE_ENABLED gates it out).
+        -- A VTOL/HYBRID CAN hover, and the whole point of the hold is to stop before committing
+        -- to the new bearing, so route it through the velocity-vector law instead -- the same
+        -- law approachVec/navCarrot use below, which nulls the FULL velocity vector (toward
+        -- AND across the bogus leg alike), not just its along-track component.
+        local alignStop = navAlign and CFG.STRAFE_ENABLED
 
         -- Lateral-control policy for HYBRID/FIXEDWING. Pad phases = the close-in, precise
         -- ones where strafe does the pad alignment. bankSteer = "this tick the mode corrects
@@ -1215,7 +1438,7 @@ local function controlLoop()
         -- target (the carrot keeps that ~400 m in cruise, so cruise banking is unaffected). No
         -- target at all (parked, AP off) => there is no correction => fully eager, i.e. wings
         -- level: this is the "no mini-swaying on the ground" case.
-        local latErr = (hasLeg and not (translateOnly or approachVec or navCarrot))
+        local latErr = (hasLeg and not (translateOnly or approachVec or navCarrot or alignStop))
             and math.abs(xtk) or (hasTarget and dist or 0)
         local strEager = 1 - clamp((latErr - CFG.STRAFE_EAGER_NEAR)
             / math.max(CFG.STRAFE_EAGER_FAR - CFG.STRAFE_EAGER_NEAR, 1e-6), 0, 1)
@@ -1329,7 +1552,7 @@ local function controlLoop()
         -- readers (the coordinated-turn sim and the ui.gs readout).
         local speedH    = math.sqrt(vel.x*vel.x + vel.z*vel.z)
         local wmag      = math.sqrt(w.x*w.x + w.y*w.y + w.z*w.z)
-        local altActive = (TARGET_ALT ~= nil) and (math.abs(TARGET_ALT - pos.y) > CFG.IDLE_ALT_TOL)
+        local altActive = (TARGET_ALT ~= nil) and (math.abs(TARGET_ALT - latestPosY) > CFG.IDLE_ALT_TOL)
         local guiding   = (navActive and hasTarget) or (useAltCascade and altActive)
             or alState == "hold" or alState == "descend"
         local still     = (not guiding) and speedH < CFG.IDLE_SPEED
@@ -1657,7 +1880,7 @@ local function controlLoop()
             -- vertical-by-pitch carries its own sign for exactly the same reason -- and both
             -- describe the same physical thing ("+cmd = nose up"), so CFG.FW_PITCH_SIGN should
             -- track the in-flight-calibrated CFG.KJOY_PITCH_SIGN rather than be re-guessed.
-            pitchSteps, rollSteps, yawSteps = attitude(q_cur, w, heading, desiredHeading, I, dt, bankCmd, pitchCmd, idle, yawBrake, manYawRate, bankYawRate,
+            pitchSteps, rollSteps, yawSteps = attitude(q_cur, q_inv, w, heading, desiredHeading, dt, bankCmd, pitchCmd, idle, yawBrake, manYawRate, bankYawRate,
                 (kjPitch and CFG.KJOY_PITCH_SIGN) or (fwPitch and CFG.FW_PITCH_SIGN) or nil)
         end
 
@@ -1667,14 +1890,17 @@ local function controlLoop()
         -- the vertical command, not navigating).
         local thrustCmd, strafeCmd = 0, 0
         if CFG.ENABLE_TRANSLATION and navActive and hasTarget then
-            if translateOnly or approachVec or navCarrot then
+            if translateOnly or approachVec or navCarrot or alignStop then
                 -- Velocity-vector control toward the target. APPROACH and the en-route CARROT both
                 -- track the FMS's scheduled speed directly (single source of truth on the HSI); the
                 -- carrot is a moving point on the smoothed path, so pure-pursuing it gives smooth
                 -- bearing AND self-corrects cross-track (no separate leg hold). TERMINAL/ARRIVED/
                 -- LANDING draw their own decelerate-to-zero position hold to stop AT the point.
+                -- alignStop (VTOL/HYBRID route-start ALIGN) is the same law for the same reason:
+                -- navCruiseCap is pinned at 0 for the hold, so desiredSpeed below comes out 0 and
+                -- this is a full velocity-vector brake to a hover, not a pursuit of anything.
                 local desiredSpeed
-                if (approachVec or navCarrot) and navCruiseCapDynamic then
+                if (approachVec or navCarrot or alignStop) and navCruiseCapDynamic then
                     desiredSpeed = clamp(navCruiseCap, 0, CFG.CRUISE_SPEED)
                 else
                     local speedCap = (navPhase == "APPROACH") and CFG.APPROACH_SPEED or CFG.TERMINAL_MAX_SPEED
@@ -1728,7 +1954,40 @@ local function controlLoop()
                     floorCmd = math.sqrt((uf * CFG.TRANSLATE_MIN_CMD_FWD) ^ 2
                                        + (ul * CFG.TRANSLATE_MIN_CMD) ^ 2)
                 end
-                if dist > CFG.TRANSLATE_DEADZONE and mag > 1e-6 and mag < floorCmd then
+                --
+                -- (3) A COMMANDED ZERO IS A STOP, NOT A BREAKAWAY (2026-09-01). The floor is
+                -- gated on `desiredSpeed > 0` -- on A MOVEMENT BEING ASKED FOR -- and not, as
+                -- it was, on the range to the target and the closing rate alone. Neither of
+                -- those says anything about whether any speed was commanded, and during the
+                -- FMS's route-start ALIGN none is: it holds cruiseCap at 0 (NAV.aligning)
+                -- while the nose swings onto the first bearing, so desiredSpeed here is 0, the
+                -- feedforward vanishes, and the whole demand is the brake KP * (-vel).
+                --
+                -- A craft parked on a pad is never exactly still -- the hull sways, the lift
+                -- banks dither -- so `mag` was a few hundredths of a step while `dist` was the
+                -- 200 m carrot and `closing` ~ 0 (need = 1), and the floor multiplied that
+                -- residue up to the FULL breakaway, bang-bang about zero velocity, with the
+                -- HSI reading ALIGN / CMD 0. Nor does it fade with speed: the demand only
+                -- reaches the floor honestly at |velErr| = MIN_CMD/KP, so the boost stays hard
+                -- on for the whole of the hold. Per airframe, with KP = 0.75 on both axes
+                -- everywhere (TRANS_KP, and STRAFE_VEL_KP = 2.0 * STEPS_PER_MPS_LAT):
+                --   fore/aft  MIN_CMD_FWD 5.0 of THRUST_MAX 15 out to 6.7 m/s -- Scout,
+                --             Citation, Mantine, SS Argo. A THIRD of thrust authority.
+                --   fore/aft  MIN_CMD_FWD 0.5 of 15 out to 0.7 m/s -- Aer Togekiss alone,
+                --             because (1) above already tuned it down for the rocking. That
+                --             is why this shows up on Scout first and is mild on #1.
+                --   lateral   MIN_CMD 5.0 of STRAFE_MAX 15 out to 6.7 m/s -- ALL FIVE. The
+                --             strafe kick was never tuned down, so no airframe escaped it.
+                --
+                -- This is the same rule as the commanded-zero note in the ENROUTE law below,
+                -- one law over: that one was an integral with no operating point to trim, this
+                -- one is a floor with nothing to break away TO. A brake does not need a floor;
+                -- it needs to fade to nothing as the craft stops, which is what the bare P
+                -- term already does. Every use the floor exists for still has it -- the pad
+                -- creep, the en-route carrot and the runway rollout all command a positive
+                -- speed, and none of their behaviour moves by a bit.
+                if desiredSpeed > 0
+                        and dist > CFG.TRANSLATE_DEADZONE and mag > 1e-6 and mag < floorCmd then
                     local need = clamp((CFG.TRANSLATE_MIN_RATE - closing)
                         / math.max(CFG.TRANSLATE_MIN_RATE, 1e-6), 0, 1)
                     local k = 1 + (floorCmd / mag - 1) * need
@@ -1758,6 +2017,25 @@ local function controlLoop()
                 else
                     desiredClosing = clamp(CFG.APPROACH_KP * dist, 0, cap) * align
                 end
+                -- A COMMANDED ZERO IS A STOP, NOT A TRIM POINT (2026-08-29). This is the law that
+                -- runs when the FMS sends NO carrot -- i.e. the plan is being joined from off the
+                -- planned path, which is exactly what a mid-route RESUME does -- and it was the
+                -- only translation law that carried its integral through a commanded zero.
+                -- The FMS holds cruiseCap at 0 for its route-start ALIGN (NAV.aligning), so the
+                -- error here is 0 - closing: at a standstill that is 0, and the loop's ENTIRE
+                -- output is SPD_KI * integral. That integral is bounded at THRUST_MAX/SPD_KI, so
+                -- a trim wound up on the previous cruise -- and nothing unwinds it, because
+                -- AP-NAV off does not step this PID, it just stops stepping it -- commands up to
+                -- FULL FORWARD THRUST while the HSI reads CMD 0 and ALIGN. It does not clear
+                -- itself either: accelerating at 90 degrees to the target leaves closing ~ 0 and
+                -- the error at 0, and pointing AWAY from it makes closing negative and winds the
+                -- integral up further. That is "the autopilot accelerates during the align
+                -- phase", and why it shows up on a mid-route join and not on a route flown from
+                -- its first waypoint (which is on the path, takes the carrot law above, and that
+                -- law already zeroes both integrals every tick).
+                -- The P term still brakes a commanded zero, which is what is supposed to stop the
+                -- craft; an integral has no operating point to trim when the demand is zero.
+                if desiredClosing <= 0 then speedPID.integral = 0 end
                 speedPID.sp = desiredClosing
                 local ib = speedPID.integral
                 local thrustRaw = CFG.SPD_FF * desiredClosing + speedPID:step(closing, dt)
@@ -1821,6 +2099,16 @@ local function controlLoop()
             strafeCmd = CFG.STRAFE_SIGN * clamp(rightCmd, -CFG.STRAFE_MAX, CFG.STRAFE_MAX)
             speedPID.integral  = 0
             strafePID.integral = 0
+        else
+            -- NOTHING drives translation this tick: AP-NAV off with no MANCON, AP-NAV on but no
+            -- target yet, or translation disabled outright. Both integrals are FROZEN rather
+            -- than stepped for as long as that lasts, so without this they survive the
+            -- disengagement intact and are spent the instant navigation comes back -- before a
+            -- single tick of error has been measured. Every branch above already zeroes them for
+            -- exactly that reason; this is the case that had no branch. See the commanded-zero
+            -- note in the ENROUTE law above for what a stale speed integral is worth.
+            speedPID.integral  = 0
+            strafePID.integral = 0
         end
 
         -- ---- KEYBOARD JOYSTICK THROTTLE (#21) ----
@@ -1878,7 +2166,7 @@ local function controlLoop()
             and manScramble and manLastMsg and (now - manLastMsg) <= CFG.MANCON_STALE_AFTER
             and (CFG.MANCON_SCRAMBLE_OVERRIDE or not useAltCascade)) or false
         ui.altCut = CFG.AL_GROUND_CUT and alState == "landed" and not ui.scramble
-        local altUp, altDown = CFG.ALT_NEUTRAL, CFG.ALT_NEUTRAL
+        local altUp, altDown = CFG.ALT_NEUTRAL / RS_MAX, CFG.ALT_NEUTRAL / RS_MAX
         local desiredVelY, velY = 0, vel.y
         local vertEffort = 0   -- signed alt-thruster steps wanted (+ = climb)
         if CFG.ENABLE_ALTITUDE then
@@ -1912,13 +2200,25 @@ local function controlLoop()
                     -- through to the altimeter below, which is the best we then have.
                     desiredVelY = -CFG.AL_GROUND_VS
                 else
-                    desiredVelY = altPID:step(pos.y, dt)
+                    desiredVelY = altPID:step(latestPosY, dt)
                 end
             else
                 -- MANUAL: stale/absent stick -> hold (0 = hover). Clamp to the same rate
                 -- limits the cascade obeys so a full stick can't ask for the impossible.
+                -- ...clamped to the MANUAL envelope, which is deliberately not the autopilot
+                -- one. CFG.CLIMB_MAX / DESCEND_MAX is the rate the ALT-AP hold and the autoland
+                -- fly inside, and it is a handling decision made for THEM; the stick's boost key
+                -- (mancon.lua's CFG.KEYS.BOOST) has to be able to ask past it, and buying that by
+                -- raising CLIMB_MAX would have quietly steepened every automatic descent on the
+                -- aircraft to pay for one keystroke. So the manual branch, and only the manual
+                -- branch, clamps to CFG.MANCON_CLIMB_MAX / CFG.MANCON_DESCEND_MAX instead.
+                -- These must be >= the stick's own CFG.VS.BOOST_MAX_CMD in manconconf.lua or
+                -- the top of the boosted travel is thrown away here, and <= CLIMB_AT_FULL or it
+                -- is thrown away by the aeroplane instead -- the rate loop can only ask for
+                -- ALT_SWING steps, and CLIMB_AT_FULL is by definition what those buy.
                 local manFresh = manLastMsg and (now - manLastMsg) <= CFG.MANCON_STALE_AFTER
-                desiredVelY = manFresh and clamp(manVS, -CFG.DESCEND_MAX, CFG.CLIMB_MAX) or 0
+                desiredVelY = manFresh
+                    and clamp(manVS, -CFG.MANCON_DESCEND_MAX, CFG.MANCON_CLIMB_MAX) or 0
             end
 
             -- ---- inner climb-rate loop (shared): rate error -> alt-thruster steps ----
@@ -2004,6 +2304,28 @@ local function controlLoop()
             strafeCmd = strafeCmd
                 + vertEffort * ux * CFG.VERT_XFER_STR * (bankSteer and strEager or 1)
             ui.tiltUp = uy
+            -- A SCRAMBLE IS NOT SCALED BY TILT -- ONLY ITS SIGN IS ROUTED (2026-08-29).
+            -- Everything else on this channel is a RATE, and a rate must be scaled by uy: to
+            -- hold a world-up climb of 2 m/s from a banked craft you spend exactly the
+            -- body-up share and hand the rest to fore/aft and strafe. A scramble is not a
+            -- rate, it is the lift engine WIDE OPEN, and scaling it by uy quietly made it an
+            -- attitude-dependent command: 0.87 of full at 30 deg, half at 60, and at 90 deg
+            -- exactly ZERO -- both lines back at ALT_NEUTRAL, i.e. the detent doing nothing
+            -- at all in the one attitude a pilot is most likely to be holding it down in.
+            -- Inverted it did the arithmetic correctly and asked the DOWN bank for full, but
+            -- everywhere in between it asked for less lift the more the craft needed it.
+            --
+            -- So the magnitude is pinned at full authority and only the SIGN of uy is kept:
+            -- which bank is pointing away from the ground still decides which one burns, so
+            -- an inverted craft still scrambles on the down bank rather than flying itself
+            -- into the terrain. sendAlt's openThrottle then puts the opposing bank at
+            -- ALT_MIN, so the pair is ALT_MAX / ALT_MIN at EVERY attitude.
+            --
+            -- Near uy = 0 (knife-edge) the sign is not meaningful and will flip. That is
+            -- deliberately left alone rather than damped: at 90 deg of tilt BOTH banks fire
+            -- horizontally, so neither choice buys or costs any climb, and the attitude loop
+            -- is already rolling the craft out of it. Damping the flip would only add state.
+            if ui.scramble then altSteps = (uy < 0) and -vertEffort or vertEffort end
         end
         if CFG.TRI_ENABLE then
             -- VECTOR-NOZZLE AIRFRAME: the three nozzles ARE the lift engine, so there is no
@@ -2012,10 +2334,10 @@ local function controlLoop()
             -- well would put a confident-looking number on a protocol nothing on this craft
             -- listens to, which is exactly the sort of thing that gets believed a year later.
             -- The display's u/d pair is pinned at neutral and hidden (see displayLoop).
-            altUp, altDown = CFG.ALT_NEUTRAL, CFG.ALT_NEUTRAL
+            altUp, altDown = CFG.ALT_NEUTRAL / RS_MAX, CFG.ALT_NEUTRAL / RS_MAX
         else
             altUp, altDown = sendAlt((CFG.ENABLE_ALTITUDE and CFG.HAS_ALT_THRUSTER) and altSteps or 0,
-                ui.altCut)
+                ui.altCut, ui.scramble)
         end
 
         -- ---- OUTPUT ----
@@ -2043,14 +2365,19 @@ local function controlLoop()
         -- ---- publish for display ----
         local age = apLastMsg and (now - apLastMsg)
         ui.link = (not age) and "no link" or (age > CFG.AP_STALE_AFTER and string.format("STALE %ds", math.floor(age)) or "ok")
-        ui.posX, ui.posY, ui.posZ = pos.x, pos.y, pos.z
-        ui.pitch, ui.roll = select(1, euler(q_cur)), select(3, euler(q_cur))
+        ui.posX, ui.posY, ui.posZ = pos.x, latestPosY, pos.z
+        -- ui.pitch / ui.roll were set at the top of the tick, from the single toEuler; see
+        -- the note there. Two more toEuler calls used to live on this line.
         ui.headingDeg = math.deg(wrapPi(heading))
         ui.desHeadingDeg = math.deg(wrapPi(desiredHeading))
         ui.yawRate = w.y
         ui.phase = navActive and (hasTarget and navPhase or "NO TGT")
             or ((kjPitch or kjRoll) and (kj.active and "KJOY" or "KJOY-HLD"))
             or (manNavLive and (manNavActive and "MANUAL" or "MAN-HOLD") or "HANDOFF")
+        -- The scheduled speed exactly as it arrived, for the recorder: -1 means the FMS sent
+        -- no schedule this tick (no schedSpeed), which is a different thing from a scheduled
+        -- zero and must not be allowed to look like one in the log.
+        ui.navCap = navCruiseCapDynamic and navCruiseCap or -1
         ui.kj, ui.kjThr = (kjPitch or kjRoll), kj.thr
         ui.kjAxes = kjFresh and ((kjPitch and "P" or "-") .. (kjRoll and "R" or "-")
             .. (kjThr and "T" or "-")) or nil
@@ -2066,6 +2393,10 @@ local function controlLoop()
         ui.altUp, ui.altDown = altUp, altDown
         ui.pStep, ui.rStep, ui.yStep = outStab, outNav.yaw, nil
         ui.wx, ui.wz, ui.vertEff = w.x, w.z, vertEffort   -- for the flight data recorder
+        -- The learnt hover trim, in alt steps, published for the same recorder. It is the
+        -- other half of reading a scramble: the detent commands CFG.ALT_SWING outright, so
+        -- what it is WORTH over the hover the loop was already holding is ALT_SWING - this.
+        ui.velInt = velPID.integral
         -- MEASURED loop period. sleep(0.05) asks for 20 Hz; what the computer actually
         -- achieves is another matter, and every gain in uacconf assumes it got what it asked
         -- for. A slow tick is dead time, and dead time is what destabilises these loops -- so
@@ -2083,7 +2414,43 @@ local function controlLoop()
         -- coherent snapshot rather than a mix of this tick and the last.
         LOG.tick(now, pitchSteps, rollSteps, yawSteps, altSteps)
 
-        sleep(0.05)
+        -- ---- PACING: sleep to the DEADLINE, not for a fixed 0.05 on top of the work ----
+        --
+        -- THE MEASUREMENT THIS COMES FROM. Scout's flight recorder logged 660 consecutive
+        -- ticks. Every single measured period was an exact multiple of one game tick:
+        --     0.10 s 0.2% | 0.15 s 6.7% | 0.20 s 41.7% | 0.25 s 41.4% | 0.30 s 10.2%
+        -- and nothing in between, on any of three separate flights. That distribution is the
+        -- whole diagnosis. Lua arithmetic running long produces a CONTINUOUS spread of
+        -- periods; a spread with no fractional part anywhere is a loop that is not compute
+        -- bound at all but BLOCKING, a whole tick at a time. The things in here that can block
+        -- are the calls the server has to serve on its main thread -- and the shipped build
+        -- made ten per iteration: five `sublevel` reads, four `rednet.broadcast`es, and this
+        -- sleep. (pid/uacprof.lua measures what each one is worth in ticks. Run it before
+        -- reaching for any of this.)
+        --
+        -- Given that, an unconditional sleep(0.05) is a bug and not a pace. `sleep` cannot
+        -- return sooner than the NEXT tick boundary, so a loop that has already spent four
+        -- ticks blocking on its own calls asks for -- and gets -- a fifth. It was not waiting
+        -- to hit 20 Hz; it was already five times past 20 Hz and adding to the overrun. The
+        -- period slots at 0.20/0.25 above are that: four or five ticks of work, plus this.
+        --
+        -- So: sleep only if there is time left before the deadline, and if there is not,
+        -- yield through the event queue instead. os.queueEvent + os.pullEvent is a real yield
+        -- -- other coroutines run, the watchdog is satisfied -- but unlike a timer it can
+        -- resume within the SAME tick, so an already-late iteration starts the next one at
+        -- once instead of standing down for another 50 ms. When the loop is healthy and
+        -- finishes inside its budget this branch never runs and the behaviour is the old
+        -- behaviour exactly.
+        --
+        -- dt is measured, never assumed, everywhere in this file, so a period that varies
+        -- with load stays correct -- and the whole point is that it varies DOWNWARD.
+        local spent = os.clock() - now
+        if spent < CFG.LOOP_PERIOD then
+            sleep(CFG.LOOP_PERIOD - spent)
+        else
+            os.queueEvent("uac_tick")
+            os.pullEvent("uac_tick")
+        end
     end
 end
 
@@ -2098,6 +2465,7 @@ local function navReceiveLoop()
                 navHoldHeading, navCruiseCap = nil, CFG.CRUISE_SPEED
                 navCruiseCapDynamic = false
                 navCarrot, navGlide = false, false
+                navAlign = false
                 apLastMsg = os.clock()
             else
                 local x = tonumber(msg.x)
@@ -2116,6 +2484,7 @@ local function navReceiveLoop()
                     navCruiseCapDynamic = msg.schedSpeed and true or false
                     navCarrot = msg.carrot and true or false
                     navGlide  = msg.glide  and true or false
+                    navAlign  = msg.align  and true or false
                     apLastMsg = os.clock()
                 end
             end
@@ -2267,6 +2636,40 @@ end
 -- DISPLAY: 2D artificial horizon + readouts ("numbers whizzing by is not
 -- debuggable" -- draft). The horizon shows ACTUAL pitch/roll; the fixed centre
 -- crosshair is the aircraft, so level = horizon through the middle.
+-- THE HORIZON IS DRAWN IN RUNS, NOT IN CELLS (2026-08-28).
+--
+-- What it used to cost: one setCursorPos + one setBackgroundColour + one write PER CELL, so
+-- width x AH_HEIGHT triples -- 51 x 9 = 459 cells, ~1400 terminal calls, every frame. On Aer
+-- Togekiss, which had no CFG.DISPLAY_PERIOD and so ran the display at the full 20 Hz, that was
+-- ~27,500 terminal calls a second for a picture no eye can follow faster than about five.
+--
+-- What it costs now: two calls per ROW. Each row of this picture is at most three horizontal
+-- runs -- sky, the horizon cell(s) where the tilted line crosses, ground -- so it can be
+-- built with string.rep and pushed out in a single blit. That is 18 terminal calls a frame
+-- instead of 1400, and the arithmetic is unchanged (the same round(hy) per column, hoisted
+-- into AH.hr so it is done once per frame rather than once per cell).
+--
+-- Rows identical to last frame are skipped outright, which is most of them most of the time:
+-- straight and level, only the rows the horizon actually crosses change. Same technique, and
+-- the same reason, as the PFD's row skipping in altcom.lua -- see the pseudo-bitmap section
+-- of CLAUDE.md. This is a CELL-resolution picture, though, not a 2x3 subpixel one, so there
+-- is no SW/complement business here: a cell is one colour and the runs are exact.
+--
+-- One table, not seven top-level locals (Cobalt's 200-locals cap, as everywhere else here).
+local AH = { hr = {}, prev = {}, w = 0 }
+do
+    -- blit's colour digits are ordered BY BIT, so white is "0" and black is "f". Computed,
+    -- not typed and not taken from colours.toBlit, so the mapping cannot drift with the
+    -- installed CC version -- the house rule for every blit user in this tree.
+    local function digit(c)
+        local n, i = c, 0
+        while n > 1 do n = n / 2; i = i + 1 end
+        return ("0123456789abcdef"):sub(i + 1, i + 1)
+    end
+    AH.SKY, AH.GND, AH.HOR = digit(colours.blue), digit(colours.brown), digit(colours.white)
+    AH.BLK, AH.OVL = digit(colours.black), digit(colours.orange)
+end
+
 local function drawAH(pitch, roll)
     local W = term.getSize()
     local top, h = CFG.AH_TOP, CFG.AH_HEIGHT
@@ -2274,29 +2677,56 @@ local function drawAH(pitch, roll)
     local midX = math.floor(W / 2) + 1
     local slope = math.tan(clamp(roll, -1.2, 1.2))
     local pitchOff = clamp(pitch * CFG.PITCH_PIXELS_PER_RAD, -h, h)
+    -- A terminal resize invalidates every cached row: the strings are the wrong length.
+    if W ~= AH.w then AH.w, AH.prev = W, {} end
 
+    -- Where the horizon sits in each column. Once per frame -- this is the arithmetic the
+    -- old version repeated for every row of every column.
+    local hr = AH.hr
     for col = 1, W do
-        -- horizon row for this column: pitch shifts it, roll tilts it.
-        local hy = midY + pitchOff - (col - midX) * slope
-        local hrow = round(hy)
-        for row = top, top + h - 1 do
-            term.setCursorPos(col, row)
-            if row < hrow then
-                term.setBackgroundColour(colours.blue)      -- sky
-            elseif row > hrow then
-                term.setBackgroundColour(colours.brown)     -- ground
-            else
-                term.setBackgroundColour(colours.white)      -- horizon
+        hr[col] = round(midY + pitchOff - (col - midX) * slope)
+    end
+
+    local text = (" "):rep(W)
+    local fg   = AH.BLK:rep(W)
+    for row = top, top + h - 1 do
+        -- Walk the columns and emit a run wherever the band changes. At most three runs, so
+        -- this concatenates at most three pieces; the loop itself is pure arithmetic.
+        local parts, n, cls, start = {}, 0, nil, 1
+        for col = 1, W + 1 do
+            local c
+            if col <= W then
+                local hrow = hr[col]
+                c = (row < hrow and AH.SKY) or (row > hrow and AH.GND) or AH.HOR
             end
-            term.write(" ")
+            if c ~= cls then
+                if cls then n = n + 1; parts[n] = cls:rep(col - start) end
+                cls, start = c, col
+            end
+        end
+        local bg = table.concat(parts)
+        local tx, fgr = text, fg
+        if row == midY then
+            -- The fixed aircraft reference "-o-", patched into the row rather than written
+            -- over it afterwards: three more terminal calls a frame otherwise, and patching
+            -- keeps the cached string honest about what is actually on screen.
+            local function put(x, ch)
+                if x >= 1 and x <= W then
+                    tx  = tx:sub(1, x - 1)  .. ch     .. tx:sub(x + 1)
+                    fgr = fgr:sub(1, x - 1) .. AH.OVL .. fgr:sub(x + 1)
+                    bg  = bg:sub(1, x - 1)  .. AH.BLK .. bg:sub(x + 1)
+                end
+            end
+            put(midX - 2, "-"); put(midX, "o"); put(midX + 2, "-")
+        end
+        -- Skip the blit entirely if this row is byte-for-byte what is already on screen.
+        local key = tx .. fgr .. bg
+        if AH.prev[row] ~= key then
+            AH.prev[row] = key
+            term.setCursorPos(1, row)
+            term.blit(tx, fgr, bg)
         end
     end
-    -- fixed aircraft reference (a small "-o-" at centre)
-    term.setBackgroundColour(colours.black)
-    term.setTextColour(colours.orange)
-    term.setCursorPos(midX - 2, midY); term.write("-")
-    term.setCursorPos(midX,     midY); term.write("o")
-    term.setCursorPos(midX + 2, midY); term.write("-")
     term.setBackgroundColour(colours.black)
 end
 
@@ -2327,6 +2757,12 @@ local function displayLoop()
         -- row on this screen is spoken for; this costs the horizon one line of sky and only
         -- while CFG.LOG_ENABLE is set.
         if CFG.LOG_ENABLE then
+            -- This banner takes row CFG.AH_TOP away from the horizon, so drop that row from
+            -- drawAH's cache: without this the horizon row would be skipped as "unchanged"
+            -- while the banner is actually what is on screen, and the sky would never come
+            -- back if the recorder ever stopped drawing. Costs one blit a frame, and only
+            -- while CFG.LOG_ENABLE is set.
+            AH.prev[CFG.AH_TOP] = nil
             if LOG.state == "done" then
                 -- The whole point of the exercise: an unmissable, PERSISTENT "stop flying and
                 -- go and read it". Inverse video because a coloured line among coloured lines
@@ -2367,18 +2803,22 @@ local function displayLoop()
             local vt = (TRI.cut and "CUT")
                 or (TRI.sat < 0.999 and string.format("S%d%%", math.floor(TRI.sat * 100)))
                 or (TRI.hot > 0 and "MAX") or (TRI.cone > 0 and "CONE") or ""
-            -- Y is the COMMANDED yaw step, kept from the STAB line this replaces: the
+            -- Y is the COMMANDED yaw, kept from the STAB line this replaces: the
             -- nozzle X columns show yaw indirectly (front one way, back pair the other) but
             -- not how much was asked for, which is the half needed to tune it.
-            line(r + 2, string.format("%s%+3.0f%+3.0f/%2.0f %s%+3.0f%+3.0f/%2.0f %s%+3.0f%+3.0f/%2.0f Y%+3d %s",
+            line(r + 2, string.format("%s%+3.0f%+3.0f/%2.0f %s%+3.0f%+3.0f/%2.0f %s%+3.0f%+3.0f/%2.0f Y%+.2f %s",
                 TRI.eng[1].key, TRI.out[1].x, TRI.out[1].y, TRI.out[1].thrust,
                 TRI.eng[2].key, TRI.out[2].x, TRI.out[2].y, TRI.out[2].thrust,
                 TRI.eng[3].key, TRI.out[3].x, TRI.out[3].y, TRI.out[3].thrust,
                 ui.yaw or 0, vt))
         else
-            line(r + 2, string.format("STAB F%d B%d L%d R%d Y%+3d raw%.0f",
-                (ui.pStep or outStab).front, (ui.pStep or outStab).back,
-                (ui.pStep or outStab).left, (ui.pStep or outStab).right, ui.yaw or 0, ui.rotRaw or 0))
+            -- PITCH/ROLL/YAW as COMMANDED, in the units that now go on the wire: a fraction
+            -- of one full redstone line. The old F/B/L/R quartet is gone from this screen
+            -- because it is gone from this computer -- which bank a demand lands on, and what
+            -- whole step it rounds to, is the relay's answer to give (see the OUTPUT header).
+            line(r + 2, string.format("STAB P%+.2f R%+.2f Y%+.2f raw%.0f",
+                (ui.pStep or outStab).pitch or 0, (ui.pStep or outStab).roll or 0,
+                ui.yaw or 0, ui.rotRaw or 0))
         end
         line(r + 7, string.format("TRIM iP%+.2f iR%+.2f yS%.2f gy%.2f %s",
             ui.integP or 0, ui.integR or 0, ui.yawScale or 1, ui.gyroFade or 0,
@@ -2427,9 +2867,9 @@ local function displayLoop()
             ui.phase or "--", ui.dist or 0, ui.cmdCap or 0, ui.closing or 0, ui.gs or 0))
         term.setTextColour(colours.white)
         if ui.xtk then
-            line(r + 4, string.format("XTK %+5.1fm  THR %+3d  STR %+3d", ui.xtk, ui.thr or 0, ui.str or 0))
+            line(r + 4, string.format("XTK %+5.1fm  THR%+.2f  STR%+.2f", ui.xtk, ui.thr or 0, ui.str or 0))
         else
-            line(r + 4, string.format("XTK  ---     THR %+3d  STR %+3d", ui.thr or 0, ui.str or 0))
+            line(r + 4, string.format("XTK  ---     THR%+.2f  STR%+.2f", ui.thr or 0, ui.str or 0))
         end
         -- WHAT IS ACTUALLY CONTROLLING THE VERTICAL -- not just what TARGET_ALT happens to hold.
         -- The old version printed TARGET_ALT unconditionally, which is actively misleading in the
@@ -2459,9 +2899,10 @@ local function displayLoop()
             line(r + 5, string.format("ALT %6.1f -> %s  Vy%+5.2f L%2.0f t%+.2f",
                 ui.posY or 0, altTgt, ui.velY or 0, TRI.tot, ui.tiltUp or 1))
         elseif CFG.HAS_ALT_THRUSTER then
-            line(r + 5, string.format("ALT %6.1f -> %s  Vy%+5.2f u%2d d%2d t%+.2f",
-                ui.posY or 0, altTgt,
-                ui.velY or 0, ui.altUp or CFG.ALT_NEUTRAL, ui.altDown or CFG.ALT_NEUTRAL, ui.tiltUp or 1))
+            line(r + 5, string.format("ALT %6.1f -> %s  Vy%+5.2f u%.2f d%.2f t%+.2f",
+                ui.posY or 0, altTgt, ui.velY or 0,
+                ui.altUp or (CFG.ALT_NEUTRAL / RS_MAX), ui.altDown or (CFG.ALT_NEUTRAL / RS_MAX),
+                ui.tiltUp or 1))
         else
             -- No lift thruster: the up/down levels are pinned at neutral and the tilt share is
             -- meaningless. Show what actually flies the vertical instead -- ACHIEVED vs COMMANDED
@@ -2526,9 +2967,8 @@ end
 -- Kill outputs on exit; hold the learnt altitude trim rather than a blind neutral.
 local function shutdown()
     pcall(function()
-        rednet.broadcast({ left = 0, right = 0, front = 0, back = 0 }, CFG.STAB_PROTOCOL)
-        rednet.broadcast({ thrust_forward = 0, thrust_backward = 0, yaw_left = 0,
-            yaw_right = 0, strafe_left = 0, strafe_right = 0 }, CFG.NAVCTRL_PROTOCOL)
+        rednet.broadcast({ pitch = 0.0, roll = 0.0 }, CFG.STAB_PROTOCOL)
+        rednet.broadcast({ thrust = 0.0, yaw = 0.0, strafe = 0.0 }, CFG.NAVCTRL_PROTOCOL)
         rednet.broadcast({ thrust = 0.0 }, CFG.THRUSTF_PROTOCOL)
         -- Vector-nozzle airframe: kill the three engines outright and centre the nozzles.
         -- There is no hover trim to preserve on this side -- unlike the up/down pair below,
@@ -2544,9 +2984,18 @@ local function shutdown()
         -- the engines, and this one is a standing burn on a protocol nothing there listens to.
         if not CFG.TRI_ENABLE then
             local trimSteps = clamp(CFG.VEL_KI * velPID.integral, -CFG.ALT_SWING, CFG.ALT_SWING)
+            -- ROUNDED HERE, and this is the one place in the file that rounds anything.
+            -- A sigma-delta needs a STREAM to average back into the value asked for, and this
+            -- is the last frame there will ever be: the relay holds whatever it is handed
+            -- until something else commands it, so a fraction left mid-carry would park the
+            -- craft a whole step off its learnt hover trim and leave it there. The UAC
+            -- therefore picks the step itself and sends it as an exact multiple of one line,
+            -- which the relay's quantiser passes through unchanged. It is still a float on
+            -- the wire; it is just a float that lands on the grid.
             rednet.broadcast({
-                up   = clamp(round(CFG.ALT_NEUTRAL + trimSteps), CFG.ALT_MIN, CFG.ALT_MAX),
-                down = clamp(round(CFG.ALT_NEUTRAL - trimSteps), CFG.ALT_MIN, CFG.ALT_MAX),
+                up   = clamp(round(CFG.ALT_NEUTRAL + trimSteps), CFG.ALT_MIN, CFG.ALT_MAX) / RS_MAX,
+                down = clamp(round(CFG.ALT_NEUTRAL - trimSteps), CFG.ALT_MIN, CFG.ALT_MAX) / RS_MAX,
+                cut  = false,
             }, CFG.ALT_PROTOCOL)
         end
     end)
@@ -2554,6 +3003,15 @@ end
 
 term.setBackgroundColour(colours.black); term.clear()
 local ok, err = pcall(parallel.waitForAny,
+    -- The note that used to sit here read "this loop alone drops tick from 20 Hz to 3 Hz
+    -- (test env: all computers but this one has been shut down)". That observation was right
+    -- and its implied cause -- the loop is too big -- was wrong, which is worth keeping on the
+    -- record because it is the natural conclusion and it sends you the wrong way. Shutting the
+    -- rest of the fleet down did not help because the cost was never contention for the
+    -- server-wide budget: it was THIS loop's own ten blocking main-thread calls per iteration,
+    -- each of which can only be answered on a tick boundary. See the pacing block at the
+    -- bottom of controlLoop for the flight-recorder histogram that shows it, and
+    -- pid/uacprof.lua for the per-call measurement.
     controlLoop,
     navReceiveLoop, altReceiveLoop, autolandReceiveLoop,
     switchApnav, switchApalt, manConReceiveLoop, manNavReceiveLoop, kbdJoyReceiveLoop,

@@ -20,12 +20,25 @@
 -- message here.
 --
 -- PROTOCOL "aer_navdata"
---   server -> all   {t="sync", rev, stamp, points=<text>, courses=<text>, landing=<text>}
---                   broadcast every BROADCAST_INTERVAL s, and at once after any edit.
+--   server -> all   {t="sync", rev, stamp, points=<text>, courses=<text>, landing=<text>,
+--                    sites=<text>}
+--                   broadcast every BROADCAST_INTERVAL s, and at once after any edit;
+--                   the disk is re-read immediately before every one of them.
+--                   `sites` is sites.db, which only the ATC controller (#87) reads -- every
+--                   other client ignores the field, as an extra field is ignored anywhere on
+--                   this network. It is carried here rather than kept on #87 so that the
+--                   fleet's navigation data has ONE master, and it is hand-edited: this
+--                   program has no editor for it, only the re-read below.
 --   client -> all   {t="pull"}                 "I just booted, send me the set now"
 --                   answered with a targeted sync, so a fresh FMS need not wait 30 s.
 --   client -> srv   {t="ack", rev, stamp, who} "applied it" -- drives the CLIENTS roster
 --                   on the dashboard, which is how you confirm an edit actually landed.
+--
+-- THE DISK IS THE MASTER, NOT THIS PROGRAM'S COPY OF IT. Every send re-reads the three
+-- files first (refreshFromDisk, below), so a broadcast can never be older than the files it
+-- claims to be carrying. The files here are edited from outside this program as often as
+-- through its own editor -- in the world save, with the server left running -- and before
+-- this the fleet went on being told the boot-time contents until someone pressed R.
 --
 --   rev   -- monotonic counter, persisted in navdata.rev, bumped on every save. For
 --            display and ordering only.
@@ -54,29 +67,44 @@ local TOAST_TIME         = 5     -- s a status message stays on the bottom line
 local POINTS_FILE  = "points.db"
 local COURSE_FILE  = "course.db"
 local LANDING_FILE = "landing.db"
+local SITES_FILE   = "sites.db"     -- ATC sites (#87); hand-edited only -- see the header
 local REV_FILE     = "navdata.rev"
 
 -- Reproduced verbatim whenever landing.db is rewritten -- it is the only documentation of
 -- the field order and of Minecraft's compass/axis convention, and it belongs in the file
 -- rather than only in this program.
-local LANDING_HEADER = "; autolanding info\n"
-    .. "; aerodrome/poi = type (heli,rwy,goaround), direction (n, w, s, e; x for don't care), altitude, runway length in meters (ignored for heli)\n"
-    .. "; IF TYPE IS goaround, the format changes:\n"
-    .. "; random id = \"goaround\", starting point X, starting point Y, ending point X, ending point Y, altitude\n"
-    .. "; an FMS should be able to circle into the goaround route, fly straight, circle back to runway line, realign, and try landing again.\n"
-    .. "; random id = \"goaround-wp\", minimum altitude, waypoints (always starts AND ends at the runway it belongs to)\n"
-    .. "; the waypoint form is the preferred one: it says which runway it serves, and the whole circuit is drawn rather than inferred.\n"
-    .. "; where a runway publishes both, an FMS flies the waypoint one.\n"
-    .. "; Minecraft coord convention:\n"
-    .. "; North: Z-\n"
-    .. "; East: X+\n"
-    .. "; South: Z+\n"
-    .. "; West: X-\n"
-    .. "; Altitude: Y axis\n"
+local LANDING_HEADER = [[; autolanding info
+; aerodrome/poi = type (heli,rwy,goaround,appr), direction (n, w, s, e; x for don't care; integer/decimal number for heading), altitude, runway length in meters (ignored for heli)
+; IF TYPE IS goaround (goaround pattern), the format changes:
+; random id = "goaround", starting point X, starting point Y, ending point X, ending point Y, altitude
+; random id = "goaround-wp", minimum altitude, waypoints (always starts AND ends at the runway it belongs to)
+; an FMS should be able to circle into the goaround route, fly straight, circle back to runway line, realign, and try landing again.
+; IF TYPE IS appr (approach pattern), the format AND the interpretation changes:
+; interpretation, on preparation to the landing, the FMS MUST choose the most suitable approach pattern according to its current position and heading
+; random id = "appr", minimum altitude, waypoints
+; BOTH GOAROUND AND APPROACH PATTERN CAN REFERENCE EACH OTHERS PATTERN
+;   appr naming another appr  = continue as that pattern; its fixes are spliced in where the id stands
+;   appr naming a goaround    = that circuit is this approach's MISSED APPROACH, and names the runway it ends at
+; ALL AEROPLANES MUST ABIDE BY THE GOAROUND AND APPROACH PATTERNS
+; Minecraft coord convention:
+; North: Z-
+; East: X+
+; South: Z+
+; West: X-
+; Altitude: Y axis
+]]
 
 local POINTS_HEADER_POI = "; aerodromes and/or point-of-interests (always three letters)"
 local POINTS_HEADER_VOR = "; waypoints (VORs are always five letters long)"
-local COURSE_HEADER     = "; routes"
+-- Reproduced whenever course.db is rewritten, for the same reason LANDING_HEADER is: a route
+-- entry that is not a point is a REFERENCE, and the file should say so where it is read.
+local COURSE_HEADER     = [[; routes
+; ROUTE-NAME=N1,N2,...,Nn  -- at least two, name charset A-Z 0-9 -
+; a token may name another ROUTE instead of a point: its own waypoints are spliced in there
+; a token may name an "appr" pattern from landing.db: that published approach is flown in
+;   there, and the route then lands by it -- minimum altitude and missed approach included
+; a goaround id is NOT a route and is skipped: it is how you leave, not how you arrive
+; unknown names are skipped, and the route is silently shortened around them]]
 
 -- =====================================================================================
 -- DATA LAYER
@@ -91,9 +119,12 @@ local DB = {
     landing = {}, landOrder = {},   -- name -> a landing site {name, type, dir, alt, rwyLen},
                                     -- a go-around leg {name, type, x1, z1, x2, z2, alt} or a
                                     -- go-around circuit {name, type, alt, seq={names}}
-    body = {points = "", courses = "", landing = ""},
+    body = {points = "", courses = "", landing = "", sites = ""},
+    siteCount = 0,              -- SITE= lines in sites.db, for the dashboard
     rev = 0,
     stamp = "",
+    adopts = 0, lastAdopt = 0,  -- disk changes picked up by refreshFromDisk
+    diskFault = nil,            -- why the last re-read was refused, for the dashboard
 }
 
 local function readFile(path)
@@ -114,12 +145,18 @@ end
 
 local function trim(s) return (s:gsub("^%s*(.-)%s*$", "%1")) end
 
--- djb2 over the three payloads. There is no md5 in CC and none is needed -- this only has
+-- djb2 over the payloads. There is no md5 in CC and none is needed -- this only has
 -- to detect "the data changed", against an editor that changes it deliberately, not
 -- against an adversary. Formatted in 16-bit halves because Lua 5.1's %x on a value above
 -- 2^31 is not something to rely on.
-local function stampOf(a, b, c)
+--
+-- sites.db is folded in only when it has content, so a server with no sites stamps exactly
+-- what it always did -- and with some, a sites-only edit still changes the stamp, which is
+-- the only thing that tells #87 to reload. (Every other client re-applies its three
+-- unchanged files once when that happens: harmless, and the price of one stamp.)
+local function stampOf(a, b, c, d)
     local s = (a or "") .. "\30" .. (b or "") .. "\30" .. (c or "")
+    if d and d ~= "" then s = s .. "\30" .. d end
     local h = 5381
     for i = 1, #s do
         h = (h * 33 + s:byte(i)) % 4294967296
@@ -174,7 +211,7 @@ local function parseLanding(body)
     for line in (body or ""):gmatch("[^\r\n]+") do
         local t = trim(line)
         if t ~= "" and t:sub(1, 1) ~= ";" then
-            local name, ty, dir, alt, rwy = t:match("^(%a+)=(%a+),(%a+),(%-?%d+),(%-?%d+)$")
+            local name, ty, dir, alt, rwy = t:match("^(%a+)=(%a+),([%a%.%d]+),(%-?%d+),(%-?%d+)$")
             -- GO-AROUND routes are a SECOND record shape in the same file (see the header):
             -- an arbitrary id, then the two ends of a straight leg and the altitude to fly it
             -- at. They are not landing SITES -- they are not tied to a point and nothing here
@@ -190,6 +227,12 @@ local function parseLanding(body)
             -- that list. Same rule as above and for the same reason -- it is parsed here only
             -- so that it survives being re-serialised.
             local wid, walt, wseq = t:match("^([%w_]+)=goaround%-wp,(%-?%d+),(.+)$")
+            -- ...and a FOURTH: a published APPROACH -- how an aircraft ARRIVES, where the two
+            -- above are how it leaves again. Same list shape as the circuit, same reason for
+            -- parsing it here (so that it survives being re-serialised), and the same trap
+            -- avoided: an appr line matches none of the site patterns, so a version of this
+            -- program that did not know about it would rewrite the file without them.
+            local aid, aalt, aseq = t:match("^([%w_]+)=appr,(%-?%d+),(.+)$")
             if gid then
                 if not lnd[gid] then table.insert(order, gid) end
                 lnd[gid] = {
@@ -197,12 +240,14 @@ local function parseLanding(body)
                     x1 = tonumber(gx1), z1 = tonumber(gz1),
                     x2 = tonumber(gx2), z2 = tonumber(gz2), alt = tonumber(galt),
                 }
-            elseif wid then
+            elseif wid or aid then
+                local id, ty, altS, body =
+                    wid or aid, wid and "goaround-wp" or "appr", walt or aalt, wseq or aseq
                 local seq = {}
-                for p in wseq:gmatch("[^,]+") do table.insert(seq, trim(p)) end
-                if not lnd[wid] then table.insert(order, wid) end
-                lnd[wid] = {
-                    name = wid, type = "goaround-wp", alt = tonumber(walt), seq = seq,
+                for p in body:gmatch("[^,]+") do table.insert(seq, trim(p)) end
+                if not lnd[id] then table.insert(order, id) end
+                lnd[id] = {
+                    name = id, type = ty, alt = tonumber(altS), seq = seq,
                 }
             elseif name then
                 if not lnd[name] then table.insert(order, name) end
@@ -214,6 +259,18 @@ local function parseLanding(body)
         end
     end
     return lnd, order
+end
+
+-- sites.db is not parsed here beyond counting its SITE= lines for the dashboard: the ATC
+-- controller (#87) is its only reader and the authority on what a line means, and it shows
+-- every line it cannot use on its own board. Same line shape it accepts.
+local function countSites(body)
+    local n = 0
+    for line in (body or ""):gmatch("[^\r\n]+") do
+        local t = trim(line)
+        if t ~= "" and t:sub(1, 1) ~= ";" and t:match("^[%w_%-]+=.+$") then n = n + 1 end
+    end
+    return n
 end
 
 -- Serialisers. bodyPoints matches the FMS's own savePoints() layout exactly (POI block,
@@ -256,9 +313,10 @@ local function bodyLanding()
         if l and l.type == "goaround" then
             table.insert(out, string.format("%s=goaround,%d,%d,%d,%d,%d",
                 l.name, l.x1, l.z1, l.x2, l.z2, l.alt))
-        elseif l and l.type == "goaround-wp" then
-            table.insert(out, string.format("%s=goaround-wp,%d,%s",
-                l.name, l.alt, table.concat(l.seq, ",")))
+        elseif l and (l.type == "goaround-wp" or l.type == "appr") then
+            -- Both list shapes write out identically bar the keyword: id, altitude, fixes.
+            table.insert(out, string.format("%s=%s,%d,%s",
+                l.name, l.type, l.alt, table.concat(l.seq, ",")))
         elseif l then
             table.insert(out, string.format("%s=%s,%s,%d,%d", l.name, l.type, l.dir, l.alt, l.rwyLen))
         end
@@ -273,12 +331,73 @@ local function loadAll()
     local bp = readFile(POINTS_FILE)  or ""
     local bc = readFile(COURSE_FILE)  or ""
     local bl = readFile(LANDING_FILE) or ""
+    local bs = readFile(SITES_FILE)   or ""
     DB.points,  DB.pointOrder  = parsePoints(bp)
     DB.courses, DB.courseOrder = parseCourses(bc)
     DB.landing, DB.landOrder   = parseLanding(bl)
     DB.body.points, DB.body.courses, DB.body.landing = bp, bc, bl
-    DB.stamp = stampOf(bp, bc, bl)
+    DB.body.sites, DB.siteCount = bs, countSites(bs)
+    DB.stamp = stampOf(bp, bc, bl, bs)
     DB.rev = tonumber(trim(readFile(REV_FILE) or "")) or 1
+end
+
+-- Adopt whatever is on disk, if it differs from what is held in memory. NET.send calls this
+-- before every sync, so a file edited outside this program -- which is the normal way these
+-- three are edited, in the world save with the server left running -- reaches the fleet on
+-- the next broadcast instead of waiting for a reboot or for someone to press R.
+--
+-- Three small file reads every BROADCAST_INTERVAL cost nothing on a computer with no control
+-- loop, and the stamp comparison means the re-PARSE only happens when the content actually
+-- changed. It also makes the post-edit send from applied() a no-op by construction: commit()
+-- has just written exactly what is in memory, so disk and stamp agree.
+--
+-- IT REFUSES A PARTIAL DISK, WHERE loadAll() DOES NOT. loadAll reads a missing file as "",
+-- because at boot that is honestly "no database yet"; here the same coercion would broadcast
+-- an empty points.db over every aircraft's working copy the moment a file went unreadable or
+-- was caught mid-write. So a file that has gone missing, or that reads back empty while we
+-- hold a non-empty copy, keeps the copy already being served and raises a fault on the
+-- dashboard instead. (Clients would refuse an empty points payload anyway -- 01-protocols
+-- §7, the sanity rule -- but they would refuse the courses and landing that came with it
+-- too, and the server would sit there insisting.) R is the deliberate override: doReload
+-- goes through loadAll and adopts the disk whatever it says.
+--
+-- The revision is NOT bumped for an outside edit. rev counts saves made here and is for
+-- display and ordering; what a client compares is the stamp, and that does change.
+local function refreshFromDisk()
+    local bp, bc, bl = readFile(POINTS_FILE), readFile(COURSE_FILE), readFile(LANDING_FILE)
+    -- sites.db is OPTIONAL -- a fleet with no controlled sites has no file -- so its absence is
+    -- only a fault when a non-empty copy is being served, by the same rule as below: an
+    -- unreadable file mid-edit must not become "no sites" and drop every clearance.
+    local bs = readFile(SITES_FILE)
+    local bad = (not bp and POINTS_FILE) or (not bc and COURSE_FILE) or (not bl and LANDING_FILE)
+             or (not bs and DB.body.sites ~= "" and SITES_FILE)
+    if bad then
+        DB.diskFault = bad .. " unreadable - serving the last good copy"
+        return false
+    end
+    bs = bs or ""
+    bad = (bp == "" and DB.body.points  ~= "" and POINTS_FILE)
+       or (bc == "" and DB.body.courses ~= "" and COURSE_FILE)
+       or (bl == "" and DB.body.landing ~= "" and LANDING_FILE)
+       or (bs == "" and DB.body.sites   ~= "" and SITES_FILE)
+    if bad then
+        DB.diskFault = bad .. " read back empty - serving the last good copy"
+        return false
+    end
+    DB.diskFault = nil
+
+    local stamp = stampOf(bp, bc, bl, bs)
+    if stamp == DB.stamp then return false end
+
+    DB.points,  DB.pointOrder  = parsePoints(bp)
+    DB.courses, DB.courseOrder = parseCourses(bc)
+    DB.landing, DB.landOrder   = parseLanding(bl)
+    DB.body.points, DB.body.courses, DB.body.landing = bp, bc, bl
+    DB.body.sites, DB.siteCount = bs, countSites(bs)
+    DB.stamp     = stamp
+    DB.adopts    = DB.adopts + 1
+    DB.lastAdopt = os.clock()
+    return true
 end
 
 -- Re-serialise, write to disk, bump the revision, re-stamp. Every mutation funnels through
@@ -291,7 +410,7 @@ local function commit()
     writeFile(COURSE_FILE,  DB.body.courses)
     writeFile(LANDING_FILE, DB.body.landing)
     DB.rev = DB.rev + 1
-    DB.stamp = stampOf(DB.body.points, DB.body.courses, DB.body.landing)
+    DB.stamp = stampOf(DB.body.points, DB.body.courses, DB.body.landing, DB.body.sites)
     writeFile(REV_FILE, tostring(DB.rev))
 end
 
@@ -316,15 +435,17 @@ end
 -- Waypoints a course names that do not exist. The FMS skips unknown names when it builds a
 -- plan, so this is a silently-shortened route in the making -- flagged in the course list
 -- and blocked at save time.
--- ...and which go-around circuits name it. Same question as pointUsedBy, asked of the other
--- file: a `goaround-wp` record is a waypoint list too, so deleting or renaming a point out from
--- under one silently shortens the circuit an aircraft flies on a missed approach -- and unlike
--- a course, nobody is looking at it until the day it is needed.
+-- ...and which PATTERNS name it. Same question as pointUsedBy, asked of the other file: a
+-- `goaround-wp` circuit and an `appr` approach are both waypoint lists, so deleting or renaming
+-- a point out from under one silently shortens a procedure an aircraft is required to fly -- and
+-- unlike a course, nobody is looking at it until the day it is needed. Tested on the presence of
+-- a fix list rather than on the keyword, so a fifth list-shaped record is covered the day it is
+-- added rather than the day someone remembers this function exists.
 local function pointUsedByGa(name)
     local used = {}
     for _, lname in ipairs(DB.landOrder) do
         local l = DB.landing[lname]
-        if l and l.type == "goaround-wp" then
+        if l and l.seq then
             for _, p in ipairs(l.seq) do
                 if p == name then table.insert(used, lname); break end
             end
@@ -333,10 +454,42 @@ local function pointUsedByGa(name)
     return used
 end
 
+-- What a name in a course's waypoint list is, if it is not a point: course.db lets a route
+-- continue as another route, and lets it name a published APPROACH from landing.db -- see
+-- autopilot.lua's expandCourseSeq, which actually flies both.
+--   "course" -- `WAX-TMU=WAX,WAU-TMU` is "WAX, then fly WAU-TMU"
+--   "appr"   -- `AGS-TMV=AGS,...,TMV_APPR4` is "...then arrive by TMV_APPR4"
+-- A go-around id is deliberately NOT one of them: a missed-approach procedure is not a route,
+-- and splicing one into an arrival would fly a lap of the aerodrome on the way in.
+-- nil for anything else, which is a genuinely broken reference.
+local function courseRefKind(name)
+    if DB.courses[name] then return "course" end
+    local l = DB.landing[name]
+    if l and l.type == "appr" then return "appr" end
+    return nil
+end
+
+-- Waypoints a course names that are neither a point nor one of the references above. Those
+-- references are references, not broken waypoints, so flagging them BAD (which a points-only
+-- check would) would paint every route built out of another red on this screen. Same shape as
+-- patternUnknowns below, for landing.db's pattern-to-pattern references.
 local function courseUnknowns(seq)
     local bad = {}
     for _, p in ipairs(seq) do
-        if not DB.points[p] then table.insert(bad, p) end
+        if not DB.points[p] and not courseRefKind(p) then table.insert(bad, p) end
+    end
+    return bad
+end
+
+-- The same question for a PATTERN's fix list, where a name may legitimately be another
+-- pattern's id: landing.db lets an approach continue as another approach, and name a go-around
+-- as its missed approach, by writing that pattern's id in the list. Those are references, not
+-- broken fixes, so flagging them BAD (which courseUnknowns would) would paint every published
+-- approach red on this screen. A reference to something that exists as NEITHER is still bad.
+local function patternUnknowns(seq)
+    local bad = {}
+    for _, p in ipairs(seq) do
+        if not DB.points[p] and not DB.landing[p] then table.insert(bad, p) end
     end
     return bad
 end
@@ -373,13 +526,13 @@ local function savePoint(oldName, name, xs, zs)
                 if p == oldName then c.seq[i] = name end
             end
         end
-        -- ... and through any go-around circuit that names it, which includes the runway ids at
-        -- both ends of one: that is how a circuit is matched to the runway it serves, so a
-        -- rename that skipped them would leave the aerodrome with a go-around belonging to
-        -- nothing.
+        -- ... and through any PATTERN that names it -- go-around circuit or published approach --
+        -- which includes the runway ids at the ends of one: that is how a procedure is matched to
+        -- the runway it serves, so a rename that skipped them would leave the aerodrome with a
+        -- go-around, or an arrival, belonging to nothing.
         for _, lname in ipairs(DB.landOrder) do
             local l = DB.landing[lname]
-            if l and l.type == "goaround-wp" then
+            if l and l.seq then
                 for i, p in ipairs(l.seq) do
                     if p == oldName then l.seq[i] = name end
                 end
@@ -411,7 +564,7 @@ local function deletePoint(name)
     end
     local usedGa = pointUsedByGa(name)
     if #usedGa > 0 then
-        return false, "In use by go-around " .. table.concat(usedGa, ", ")
+        return false, "In use by pattern " .. table.concat(usedGa, ", ")
     end
     if DB.landing[name] then return false, "Delete its LANDING entry first" end
     DB.points[name] = nil
@@ -510,13 +663,18 @@ function NET.message()
         points  = DB.body.points,
         courses = DB.body.courses,
         landing = DB.body.landing,
+        sites   = DB.body.sites,
         server  = os.getComputerLabel() or ("computer " .. os.getComputerID()),
     }
 end
 
 -- target=nil broadcasts and re-arms the periodic timer; a targeted reply to a pull does
 -- not, so one aircraft rebooting cannot drag the fleet-wide cadence around.
+--
+-- The disk is re-read FIRST, on every send, pull replies included: what goes on the wire is
+-- what is on this computer's disk at the moment it is sent, never a copy of it from earlier.
 function NET.send(target)
+    refreshFromDisk()
     local m = NET.message()
     if target then
         rednet.send(target, m, NAVDATA_PROTOCOL)
@@ -739,6 +897,7 @@ local function drawField(x, y, w, f, focused, id)
     term.setCursorPos(bx, y)
     term.write(string.rep(" ", w))
     local shown = f.value
+    if type(shown) == 'number' then shown = tostring(shown) end
     if #shown > w - 1 then shown = shown:sub(#shown - w + 2) end
     put(bx, y, shown, colours.lime, bg)
     if focused then
@@ -805,11 +964,12 @@ end
 
 local function openLandForm(name)
     local l = name and DB.landing[name]
-    -- A go-around route has no direction/length to edit and its own record shape; opening it
-    -- in this form and saving would rewrite it as an ordinary site and lose the leg. They are
-    -- hand-maintained in the file.
-    if l and l.type:sub(1, 8) == "goaround" then
-        toast("Go-around routes are edited in landing.db, not on this screen", colours.orange)
+    -- A PATTERN -- a go-around leg, a go-around circuit or a published approach -- has no
+    -- direction/length to edit and its own record shape; opening it in this form and saving
+    -- would rewrite it as an ordinary site and lose the procedure. They are hand-maintained in
+    -- the file. Keyword-tested, because that is the only thing all three share.
+    if l and (l.type == "goaround" or l.type == "goaround-wp" or l.type == "appr") then
+        toast("Patterns are edited in landing.db, not on this screen", colours.orange)
         return   -- UI.screen unchanged, so the browser stays put
     end
     FORM.kind, FORM.editing, FORM.focus = "landing", name, 1
@@ -834,11 +994,26 @@ local function openCourse(name)
     UI.screen = "course"
 end
 
+-- Points first, then the REFERENCES a course entry may also be (courseRefKind): the other
+-- courses, then the published approaches. Points lead because that is what almost every entry
+-- is; the references are at the bottom of an unfiltered list and one keystroke of FIND away.
+-- Offering them here at all is what makes `TMU-TMV=...,TMV_APPR4` authorable on the master
+-- rather than only by hand-editing course.db and rebooting this computer.
 local function pickItems()
     local out = {}
     local f = PICK.filter:upper()
-    for _, name in ipairs(DB.pointOrder) do
+    local function offer(name)
         if f == "" or name:upper():find(f, 1, true) then table.insert(out, name) end
+    end
+    for _, name in ipairs(DB.pointOrder) do offer(name) end
+    for _, name in ipairs(DB.courseOrder) do
+        -- ...but never the course being edited: a course referencing itself expands to nothing
+        -- (the FMS skips a name already on its reference stack), so it is a silent way to
+        -- shorten your own route.
+        if name ~= CRS.editing then offer(name) end
+    end
+    for _, name in ipairs(DB.landOrder) do
+        if DB.landing[name].type == "appr" then offer(name) end
     end
     return out
 end
@@ -867,10 +1042,20 @@ local function drawHome()
     put(2, 4, string.format("POINTS %3d", #DB.pointOrder))
     put(16, 4, string.format("COURSES %3d", #DB.courseOrder))
     put(32, 4, string.format("LANDING %3d", #DB.landOrder))
+    put(45, 4, string.format("SITES%2d", DB.siteCount))
 
     local due = math.max(0, math.ceil(NET.nextTx - os.clock()))
     put(2, 5, string.format("broadcast in %2ds  (every %ds, %d sent)",
         due, BROADCAST_INTERVAL, NET.txCount), colours.brown)
+
+    -- Whether the disk is being picked up matters more than how often: a fault here means
+    -- the fleet is being served a copy older than the files sitting next to this program.
+    if DB.diskFault then
+        put(2, 6, DB.diskFault:sub(1, w - 2), colours.red)
+    else
+        put(2, 6, string.format("disk re-read each broadcast  (%d outside edit%s adopted)",
+            DB.adopts, DB.adopts == 1 and "" or "s"), colours.brown)
+    end
 
     put(2, 7, "CLIENTS", colours.orange)
     local roster = NET.roster()
@@ -949,17 +1134,27 @@ local function drawBrowseRow(y, name, selected)
                 put(11, y, l.type, colours.cyan, bg)
                 put(20, y, string.format("%d,%d > %d,%d", l.x1, l.z1, l.x2, l.z2), colours.white, bg)
                 put(43, y, "alt " .. l.alt, colours.white, bg)
-            elseif l.type == "goaround-wp" then
-                -- The runway a circuit serves is the last name in its list (it starts and ends
-                -- there), and that is the field worth showing: it is what an FMS matches on.
-                put(11, y, l.type, colours.cyan, bg)
+            elseif l.type == "goaround-wp" or l.type == "appr" then
+                -- The site a procedure serves is the LAST name in its list -- a circuit starts
+                -- and ends at its runway, an approach ends at the site it arrives into -- and
+                -- that is the field worth showing: it is what an FMS matches on. An approach is
+                -- drawn in the arrival colour so the two are not read as the same thing at a
+                -- glance; the last name of an approach may itself be a reference, in which case
+                -- the site is whatever that pattern ends at and only the FMS resolves it.
+                local isAppr = (l.type == "appr")
+                put(11, y, l.type, isAppr and colours.lime or colours.cyan, bg)
                 put(23, y, string.format("%2d wpt", #l.seq), colours.lime, bg)
-                put(30, y, "rwy " .. tostring(l.seq[#l.seq]), colours.white, bg)
+                put(30, y, (isAppr and "to  " or "rwy ") .. tostring(l.seq[#l.seq]),
+                    colours.white, bg)
                 put(41, y, "min " .. l.alt, colours.white, bg)
-                if #courseUnknowns(l.seq) > 0 then put(47, y, "BAD", colours.red, bg) end
+                if #patternUnknowns(l.seq) > 0 then put(47, y, "BAD", colours.red, bg) end
             else
                 put(11, y, l.type, colours.lime, bg)
-                put(18, y, "dir " .. l.dir, colours.white, bg)
+                if tonumber(l.dir) then
+                    put(18, y, l.dir, colours.white, bg)
+                else
+                    put(18, y, "dir " .. l.dir, colours.white, bg)
+                end
                 put(27, y, "alt " .. l.alt, colours.white, bg)
                 if l.type == "rwy" then put(36, y, l.rwyLen .. "m", colours.white, bg) end
                 if not DB.points[name] then put(43, y, "NO PT", colours.red, bg) end
@@ -1082,13 +1277,23 @@ local function drawCourse()
             put(2, y, selected and ">" or " ", colours.orange, bg)
             put(4, y, string.format("%2d", idx), colours.brown, bg)
             local known = DB.points[name]
-            put(8, y, name, known and colours.white or colours.red, bg)
+            -- ...or a REFERENCE, which is a legal entry and not a broken one (courseRefKind).
+            -- Painting one "unknown point" in red is how a hand-written `WAU-TMU` or
+            -- `TMV_APPR4` gets "fixed" out of a route by someone tidying this screen up.
+            local ref = not known and courseRefKind(name)
+            put(8, y, name, (known and colours.white) or (ref and colours.orange) or colours.red, bg)
             if known then
                 put(15, y, string.format("%6d,%6d", known.x, known.z), colours.lime, bg)
                 put(30, y, known.kind == "vor" and "VOR" or "POI", colours.brown, bg)
                 if DB.landing[name] then
                     put(35, y, "<" .. DB.landing[name].type .. ">", colours.orange, bg)
                 end
+            elseif ref == "course" then
+                local n = #(DB.courses[name].seq or {})
+                put(15, y, string.format("course, %d fixes", n), colours.orange, bg)
+            elseif ref == "appr" then
+                local l = DB.landing[name]
+                put(15, y, string.format("approach, min %d", l.alt or 0), colours.orange, bg)
             else
                 put(15, y, "unknown point", colours.red, bg)
             end
@@ -1133,10 +1338,18 @@ local function drawPick()
             local bg = selected and colours.grey or colours.black
             fillRow(y, w, bg)
             put(2, y, selected and ">" or " ", colours.orange, bg)
-            put(4, y, name, colours.white, bg)
-            put(11, y, string.format("%6d,%6d", p.x, p.z), colours.lime, bg)
-            put(26, y, p.kind == "vor" and "VOR" or "POI", colours.brown, bg)
-            if DB.landing[name] then put(31, y, "<" .. DB.landing[name].type .. ">", colours.orange, bg) end
+            put(4, y, name, p and colours.white or colours.orange, bg)
+            if p then
+                put(14, y, string.format("%6d,%6d", p.x, p.z), colours.lime, bg)
+                put(29, y, p.kind == "vor" and "VOR" or "POI", colours.brown, bg)
+                if DB.landing[name] then put(34, y, "<" .. DB.landing[name].type .. ">", colours.orange, bg) end
+            elseif DB.courses[name] then
+                put(14, y, string.format("course, %d fixes", #(DB.courses[name].seq or {})),
+                    colours.brown, bg)
+            else
+                put(14, y, string.format("approach, min %d", DB.landing[name].alt or 0),
+                    colours.brown, bg)
+            end
             addHit(1, y, w, y, "ROW:" .. name)
         end
     end
@@ -1144,6 +1357,7 @@ local function drawPick()
 
     put(2, h - 2, "just type to narrow    \24\25 select", colours.brown)
     put(2, h - 1, "ENTER = add it         BACKSPACE = back", colours.brown)
+    put(30, h - 1, "orange = a reference, not a fix", colours.brown)
 end
 
 local drawFns = {

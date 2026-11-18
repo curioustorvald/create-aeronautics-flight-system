@@ -2,7 +2,11 @@
 -- MANCON and MST -> MANCON Intention Controller
 -- where MIC converts intention to PID-controlled fore/aft/strafe thruster output
 
-rednet.open("top")
+if not sublevel then error("No sublevel API - is the Sable mod present?") end
+
+local modem = peripheral.find("modem")
+if not modem then error("No modem attached") end
+rednet.open(peripheral.getName(modem))
 term.clear()
 
 local function displayLine(row, text)

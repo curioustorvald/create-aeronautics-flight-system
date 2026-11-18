@@ -1,0 +1,7 @@
+; Define sites and their facility (helipad, runways)
+; Facility's remarks are parenthesised, using standard vocab.
+; Site remarks Vocab:
+; - narrow: "wide" airframes (e.g. Togekiss) cannot land
+TMU=TMU,TMA(narrow),TMV(narrow)
+NUK=NUK,NUS,NUN
+AGS=AGS,AGC(narrow)
